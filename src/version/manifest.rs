@@ -11,6 +11,13 @@ use crate::sst::TableRoot;
 pub enum ManifestRecord {
     AddFile(AddFile),
     DeleteFile(DeleteFile),
+    VersionEdit(VersionEdit),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VersionEdit {
+    pub adds: Vec<AddFile>,
+    pub deletes: Vec<DeleteFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +121,20 @@ fn apply_record(state: &mut ManifestState, record: ManifestRecord) {
         ManifestRecord::DeleteFile(del) => {
             if let Some(level) = state.levels.get_mut(&del.level) {
                 level.remove(&del.file_id);
+            }
+        }
+        ManifestRecord::VersionEdit(edit) => {
+            for add in edit.adds {
+                state
+                    .levels
+                    .entry(add.level)
+                    .or_default()
+                    .insert(add.file_id, add);
+            }
+            for del in edit.deletes {
+                if let Some(level) = state.levels.get_mut(&del.level) {
+                    level.remove(&del.file_id);
+                }
             }
         }
     }

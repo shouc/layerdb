@@ -11,7 +11,7 @@ use crate::db::snapshot::SnapshotTracker;
 use crate::db::{DbOptions, OpKind, Range, Value};
 use crate::internal_key::{InternalKey, KeyKind};
 use crate::sst::{SstProperties, SstReader};
-use crate::version::manifest::{AddFile, Manifest, ManifestRecord};
+use crate::version::manifest::{AddFile, DeleteFile, Manifest, ManifestRecord, VersionEdit};
 
 /// Placeholder for version set + manifest.
 #[derive(Debug)]
@@ -19,31 +19,47 @@ pub struct VersionSet {
     dir: PathBuf,
     snapshots: Arc<SnapshotTracker>,
     next_file_id: AtomicU64,
-    files: parking_lot::RwLock<Vec<AddFile>>, // v1: L0 only
+    levels: parking_lot::RwLock<Levels>,
     manifest: parking_lot::Mutex<Manifest>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct Levels {
+    /// L0 is searched newest-first and may overlap.
+    l0: Vec<AddFile>,
+    /// L1 is non-overlapping and sorted by user key range.
+    l1: Vec<AddFile>,
 }
 
 impl VersionSet {
     pub fn recover(dir: &Path, _options: &DbOptions) -> anyhow::Result<Self> {
         let (manifest, state) = Manifest::open(dir)?;
-        let mut files = Vec::new();
+        let mut l0 = Vec::new();
+        let mut l1 = Vec::new();
         let mut max_file_id = 0u64;
         let mut max_seqno = 0u64;
         for (_level, level_files) in state.levels {
             for (_id, add) in level_files {
                 max_file_id = max_file_id.max(add.file_id);
                 max_seqno = max_seqno.max(add.max_seqno);
-                files.push(add);
+                match add.level {
+                    0 => l0.push(add),
+                    1 => l1.push(add),
+                    _ => {
+                        // v1: ignore unknown levels.
+                    }
+                }
             }
         }
-        files.sort_by(|a, b| a.file_id.cmp(&b.file_id));
+        l0.sort_by(|a, b| a.file_id.cmp(&b.file_id));
+        l1.sort_by(|a, b| a.smallest_user_key.cmp(&b.smallest_user_key));
         let snapshots = Arc::new(SnapshotTracker::new());
         snapshots.set_latest_seqno(max_seqno);
         Ok(Self {
             dir: dir.to_path_buf(),
             snapshots,
             next_file_id: AtomicU64::new(max_file_id.saturating_add(1).max(1)),
-            files: parking_lot::RwLock::new(files),
+            levels: parking_lot::RwLock::new(Levels { l0, l1 }),
             manifest: parking_lot::Mutex::new(manifest),
         })
     }
@@ -65,9 +81,10 @@ impl VersionSet {
     }
 
     pub fn get(&self, key: &[u8], snapshot_seqno: u64) -> anyhow::Result<Option<Option<Value>>> {
-        // v1: L0 files only, searched newest-first.
-        let files = self.files.read();
-        for add in files.iter().rev() {
+        let levels = self.levels.read();
+
+        // L0: searched newest-first; may overlap.
+        for add in levels.l0.iter().rev() {
             if !range_contains(
                 &(
                     std::ops::Bound::Included(add.smallest_user_key.clone()),
@@ -82,7 +99,22 @@ impl VersionSet {
                 .join("sst")
                 .join(format!("sst_{:016x}.sst", add.file_id));
             if !path.exists() {
-                continue;
+                anyhow::bail!("manifest references missing sst: {path:?}");
+            }
+            let reader = SstReader::open(&path)?;
+            if let Some(v) = reader.get(key, snapshot_seqno)? {
+                return Ok(Some(v));
+            }
+        }
+
+        // L1: non-overlapping; binary search by key range.
+        if let Some(add) = find_l1_file(&levels.l1, key) {
+            let path = self
+                .dir
+                .join("sst")
+                .join(format!("sst_{:016x}.sst", add.file_id));
+            if !path.exists() {
+                anyhow::bail!("manifest references missing sst: {path:?}");
             }
             let reader = SstReader::open(&path)?;
             if let Some(v) = reader.get(key, snapshot_seqno)? {
@@ -93,12 +125,81 @@ impl VersionSet {
     }
 
     pub fn iter(&self, range: Range, snapshot_seqno: u64) -> anyhow::Result<SstIter> {
-        let files = self.files.read().clone();
+        let guard = self.levels.read();
+        let mut files = Vec::with_capacity(guard.l0.len() + guard.l1.len());
+        files.extend(guard.l0.clone());
+        files.extend(guard.l1.clone());
         SstIter::new(self.dir.clone(), files, snapshot_seqno, range)
     }
 
     pub fn compact_l0_to_l1(&self, _options: &DbOptions) -> anyhow::Result<()> {
-        // v1: implement conservative L0->L1 compaction.
+        let (l0, l1) = {
+            let guard = self.levels.read();
+            if guard.l0.is_empty() {
+                return Ok(());
+            }
+            (guard.l0.clone(), guard.l1.clone())
+        };
+
+        let mut smallest: Option<Bytes> = None;
+        let mut largest: Option<Bytes> = None;
+        for file in &l0 {
+            smallest = Some(match smallest {
+                None => file.smallest_user_key.clone(),
+                Some(s) => std::cmp::min(s, file.smallest_user_key.clone()),
+            });
+            largest = Some(match largest {
+                None => file.largest_user_key.clone(),
+                Some(l) => std::cmp::max(l, file.largest_user_key.clone()),
+            });
+        }
+        let smallest = smallest.unwrap_or_else(Bytes::new);
+        let largest = largest.unwrap_or_else(Bytes::new);
+
+        let mut compact_inputs = Vec::new();
+        compact_inputs.extend(l0.clone());
+        for file in &l1 {
+            if overlaps(&smallest, &largest, &file.smallest_user_key, &file.largest_user_key) {
+                compact_inputs.push(file.clone());
+            }
+        }
+
+        let mut entries = Vec::new();
+        for file in &compact_inputs {
+            let path = self
+                .dir
+                .join("sst")
+                .join(format!("sst_{:016x}.sst", file.file_id));
+            if !path.exists() {
+                anyhow::bail!("manifest references missing sst: {path:?}");
+            }
+            let reader = SstReader::open(&path)?;
+            let mut iter = reader.iter(u64::MAX)?;
+            iter.seek_to_first();
+            while let Some(next) = iter.next() {
+                let (user_key, seqno, kind, value) = next?;
+                let key_kind = match kind {
+                    OpKind::Put => KeyKind::Put,
+                    OpKind::Del => KeyKind::Del,
+                };
+                entries.push((InternalKey::new(user_key, seqno, key_kind), value));
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let out_entries = entries;
+        if out_entries.is_empty() {
+            return Ok(());
+        }
+
+        let out_file_id = self.allocate_file_id();
+        let sst_dir = self.dir.join("sst");
+        let mut builder = crate::sst::SstBuilder::create(&sst_dir, out_file_id, 64 * 1024)?;
+        for (key, value) in &out_entries {
+            builder.add(key, value.as_ref())?;
+        }
+        let props = builder.finish()?;
+        self.apply_compaction_edit(compact_inputs, vec![(out_file_id, props)])?;
         Ok(())
     }
 
@@ -117,9 +218,100 @@ impl VersionSet {
             manifest.append(&ManifestRecord::AddFile(add.clone()), true)?;
             manifest.sync_dir()?;
         }
-        self.files.write().push(add);
+        self.levels.write().l0.push(add);
         Ok(())
     }
+
+    fn apply_compaction_edit(
+        &self,
+        inputs: Vec<AddFile>,
+        outputs: Vec<(u64, SstProperties)>,
+    ) -> anyhow::Result<()> {
+        let mut adds = Vec::new();
+        for (file_id, props) in outputs {
+            adds.push(AddFile {
+                file_id,
+                level: 1,
+                smallest_user_key: props.smallest_user_key.clone(),
+                largest_user_key: props.largest_user_key.clone(),
+                max_seqno: props.max_seqno,
+                table_root: props.table_root,
+                size_bytes: props.data_bytes + props.index_bytes,
+            });
+        }
+
+        let mut deletes = Vec::new();
+        for input in &inputs {
+            deletes.push(DeleteFile {
+                file_id: input.file_id,
+                level: input.level,
+            });
+        }
+
+        {
+            let mut manifest = self.manifest.lock();
+            manifest.append(
+                &ManifestRecord::VersionEdit(VersionEdit {
+                    adds: adds.clone(),
+                    deletes: deletes.clone(),
+                }),
+                true,
+            )?;
+            manifest.sync_dir()?;
+        }
+
+        {
+            let mut guard = self.levels.write();
+            // Remove deleted inputs.
+            for del in &deletes {
+                match del.level {
+                    0 => guard.l0.retain(|f| f.file_id != del.file_id),
+                    1 => guard.l1.retain(|f| f.file_id != del.file_id),
+                    _ => {}
+                }
+            }
+
+            // Add compaction outputs to L1.
+            guard.l1.extend(adds);
+            guard.l1.sort_by(|a, b| a.smallest_user_key.cmp(&b.smallest_user_key));
+        }
+
+        // Once manifest deletions are durable, remove old files from disk.
+        for input in &inputs {
+            let path = self
+                .dir
+                .join("sst")
+                .join(format!("sst_{:016x}.sst", input.file_id));
+            let _ = std::fs::remove_file(path);
+        }
+        Ok(())
+    }
+}
+
+fn find_l1_file<'a>(l1: &'a [AddFile], key: &[u8]) -> Option<&'a AddFile> {
+    let mut lo = 0usize;
+    let mut hi = l1.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let f = &l1[mid];
+        if key < f.smallest_user_key.as_ref() {
+            hi = mid;
+        } else if key > f.largest_user_key.as_ref() {
+            lo = mid + 1;
+        } else {
+            return Some(f);
+        }
+    }
+    None
+}
+
+fn overlaps(
+    a_smallest: &[u8],
+    a_largest: &[u8],
+    b_smallest: &[u8],
+    b_largest: &[u8],
+) -> bool {
+    !(a_largest < b_smallest || b_largest < a_smallest)
 }
 
 pub struct SstIter {
@@ -148,10 +340,7 @@ impl SstIter {
             let path = dir
                 .join("sst")
                 .join(format!("sst_{:016x}.sst", file.file_id));
-            let reader = match SstReader::open(&path) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+            let reader = SstReader::open(&path)?;
             let mut iter = reader.iter(snapshot_seqno)?;
             iter.seek_to_first();
             while let Some(next) = iter.next() {

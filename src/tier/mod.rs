@@ -1,7 +1,8 @@
 //! Tier routing and local tier abstractions.
 //!
-//! Milestone 4 introduces local NVMe/HDD tier routing. Remote S3 is kept as a
-//! planned surface with a conservative placeholder.
+//! Milestone 4 introduced local NVMe/HDD tier routing.
+//! Milestone 5 adds S3 object-key naming and supports frozen-level workflows
+//! coordinated by `version::VersionSet` (freeze/thaw/gc + read-through cache).
 
 use std::path::{Path, PathBuf};
 

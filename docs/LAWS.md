@@ -16,6 +16,9 @@ Implementation details may evolve, but these invariants must remain true.
 - `checkout(branch)` (optional)
 - `compact_range(optional range)` (manual trigger)
 - `ingest_sst(sst_path)` (optional)
+- `freeze_level_to_s3(level, max_files)` (optional)
+- `thaw_level_from_s3(level, max_files)` (optional)
+- `gc_orphaned_s3_files()` (optional)
 
 ### v2 extension in-progress
 
@@ -27,6 +30,9 @@ Implementation details may evolve, but these invariants must remain true.
 - `compact_range(Some(range))` compacts only overlapping L0 inputs.
 - `ingest_sst` installs an external SST with manifest durability ordering and
   raises WAL sequence floor above ingested `max_seqno`.
+- Frozen S3-tier reads use read-through local caching (`sst_cache/`) and keep
+  manifest-tier semantics intact.
+- S3-tier lifecycle includes freeze, thaw, and orphan GC operations.
 
 ## Semantics
 
@@ -88,3 +94,9 @@ Kinds:
 1. Append `DeleteFile` to manifest + sync
 2. Unlink old files (or move to trash)
 3. (Optional) `fsync(dir_fd)`
+
+
+## Integrity operations
+
+- Manual scrub: `Db::scrub_integrity()` and `layerdb scrub` verify all readable SST blocks.
+- Background scrubber: `Db::spawn_background_scrubber(interval)` runs periodic integrity scans and reports latest status.

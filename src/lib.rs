@@ -13,6 +13,7 @@
 pub mod cache;
 pub mod compaction;
 pub mod db;
+pub mod internal_key;
 pub mod integrity;
 pub mod io;
 pub mod memtable;
@@ -23,4 +24,3 @@ pub mod wal;
 
 pub use db::{Db, DbOptions, ReadOptions, SnapshotId, WriteOptions};
 pub use db::{Op, Range, Value};
-

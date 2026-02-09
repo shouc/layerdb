@@ -99,6 +99,8 @@ enum Command {
         name: String,
         #[arg(long)]
         from_branch: Option<String>,
+        #[arg(long)]
+        from_seqno: Option<u64>,
     },
     Branches {
         #[arg(long)]
@@ -209,7 +211,8 @@ fn main() -> anyhow::Result<()> {
             db,
             name,
             from_branch,
-        } => create_branch(&db, &name, from_branch.as_deref()),
+            from_seqno,
+        } => create_branch(&db, &name, from_branch.as_deref(), from_seqno),
         Command::Branches { db } => branches(&db),
         Command::FrozenObjects { db } => frozen_objects(&db),
         Command::Get { db, key, branch } => get_cmd(&db, &key, branch.as_deref()),
@@ -666,16 +669,32 @@ fn drop_branch(db: &Path, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn create_branch(db: &Path, name: &str, from_branch: Option<&str>) -> anyhow::Result<()> {
-    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
-    if let Some(source_branch) = from_branch {
-        db.checkout(source_branch)?;
+fn create_branch(
+    db: &Path,
+    name: &str,
+    from_branch: Option<&str>,
+    from_seqno: Option<u64>,
+) -> anyhow::Result<()> {
+    if from_branch.is_some() && from_seqno.is_some() {
+        anyhow::bail!("--from-branch and --from-seqno are mutually exclusive");
     }
-    db.create_branch(name, None)?;
-    if let Some(source_branch) = from_branch {
-        println!("create_branch name={name} from_branch={source_branch}");
-    } else {
-        println!("create_branch name={name}");
+
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    match (from_branch, from_seqno) {
+        (Some(source_branch), None) => {
+            db.checkout(source_branch)?;
+            db.create_branch(name, None)?;
+            println!("create_branch name={name} from_branch={source_branch}");
+        }
+        (None, Some(seqno)) => {
+            db.create_branch_at_seqno(name, seqno)?;
+            println!("create_branch name={name} from_seqno={seqno}");
+        }
+        (None, None) => {
+            db.create_branch(name, None)?;
+            println!("create_branch name={name}");
+        }
+        (Some(_), Some(_)) => unreachable!("validated mutually exclusive options"),
     }
     Ok(())
 }

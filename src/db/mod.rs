@@ -185,6 +185,18 @@ impl Db {
         self.inner.versions.create_branch(name.as_ref(), seqno)
     }
 
+    pub fn create_branch_at_seqno(
+        &self,
+        name: impl AsRef<str>,
+        seqno: u64,
+    ) -> anyhow::Result<()> {
+        let latest = self.inner.versions.latest_seqno();
+        if seqno > latest {
+            anyhow::bail!("branch seqno {seqno} is ahead of latest {latest}");
+        }
+        self.inner.versions.create_branch(name.as_ref(), seqno)
+    }
+
     pub fn checkout(&self, branch: impl AsRef<str>) -> anyhow::Result<()> {
         let seqno = self.inner.versions.checkout_branch(branch.as_ref())?;
         self.read_snapshot.store(seqno, Ordering::Relaxed);

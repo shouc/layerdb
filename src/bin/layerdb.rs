@@ -849,6 +849,23 @@ fn parse_batch_op(spec: &str) -> anyhow::Result<layerdb::Op> {
         return Ok(layerdb::Op::delete(key.to_string()));
     }
 
+    if let Some(rest) = spec.strip_prefix("rdel:") {
+        let mut parts = rest.splitn(2, ':');
+        let start = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid --op spec: {spec}"))?;
+        let end = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid --op spec: {spec}"))?;
+        if start.is_empty() || end.is_empty() || start >= end {
+            anyhow::bail!("invalid --op spec: {spec}");
+        }
+        return Ok(layerdb::Op::delete_range(
+            start.to_string(),
+            end.to_string(),
+        ));
+    }
+
     anyhow::bail!("invalid --op spec: {spec}")
 }
 

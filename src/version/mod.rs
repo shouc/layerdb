@@ -146,6 +146,15 @@ impl VersionSet {
         self.current_branch.read().clone()
     }
 
+    pub fn current_branch_seqno(&self) -> u64 {
+        let name = self.current_branch();
+        self.branches
+            .read()
+            .get(&name)
+            .copied()
+            .unwrap_or_else(|| self.latest_seqno())
+    }
+
     pub fn advance_current_branch(&self, seqno: u64) -> anyhow::Result<()> {
         let branch_name = self.current_branch();
         let current_head = self
@@ -509,6 +518,7 @@ impl VersionSet {
             .with_context(|| format!("sync sst dir {}", sst_dir.display()))?;
 
         self.install_sst(file_id, &props)?;
+        self.advance_current_branch(props.max_seqno)?;
         Ok(file_id)
     }
 

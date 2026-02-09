@@ -124,3 +124,36 @@ fn branch_head_advances_with_writes_and_persists() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn reopen_defaults_to_main_branch_head() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+
+    {
+        let db = Db::open(dir.path(), options())?;
+        db.put(&b"k"[..], &b"v1"[..], WriteOptions { sync: true })?;
+        let snap_v1 = db.create_snapshot()?;
+        db.create_branch("feature", Some(snap_v1))?;
+
+        db.checkout("feature")?;
+        db.put(&b"k"[..], &b"v2"[..], WriteOptions { sync: true })?;
+    }
+
+    // New handle should default to `main`, not latest global seqno.
+    {
+        let db = Db::open(dir.path(), options())?;
+        assert_eq!(db.current_branch(), "main");
+        assert_eq!(
+            db.get(b"k", ReadOptions::default())?,
+            Some(bytes::Bytes::from("v1"))
+        );
+
+        db.checkout("feature")?;
+        assert_eq!(
+            db.get(b"k", ReadOptions::default())?,
+            Some(bytes::Bytes::from("v2"))
+        );
+    }
+
+    Ok(())
+}

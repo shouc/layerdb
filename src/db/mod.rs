@@ -110,7 +110,7 @@ impl Db {
         let memtables = Arc::new(MemTableManager::new(options.memtable_shards));
         let wal =
             Wal::open(&dir, &options, memtables.clone(), versions.clone()).context("open wal")?;
-        let read_snapshot = Arc::new(AtomicU64::new(versions.latest_seqno()));
+        let read_snapshot = Arc::new(AtomicU64::new(versions.current_branch_seqno()));
 
         Ok(Self {
             inner: Arc::new(DbInner {

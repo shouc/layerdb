@@ -1,0 +1,8 @@
+/target/
+*.sst
+*.log
+*.tmp
+*.manifest
+*.db
+/db/
+.DS_Store

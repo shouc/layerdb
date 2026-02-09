@@ -246,3 +246,20 @@ fn compaction_keeps_range_tombstones_when_snapshot_is_pinned() -> anyhow::Result
 
     Ok(())
 }
+
+#[test]
+fn unsynced_writes_are_visible_to_same_handle() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let mut opts = small_options();
+    opts.fsync_writes = false;
+
+    let db = Db::open(dir.path(), opts)?;
+    db.put(&b"k"[..], &b"v1"[..], WriteOptions { sync: false })?;
+
+    assert_eq!(
+        db.get(b"k", ReadOptions::default())?,
+        Some(bytes::Bytes::from("v1"))
+    );
+
+    Ok(())
+}

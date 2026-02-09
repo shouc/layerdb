@@ -149,7 +149,7 @@ impl Db {
     pub fn write_batch(&self, ops: Vec<Op>, opts: WriteOptions) -> anyhow::Result<()> {
         self.inner.wal.write_batch(&ops, opts)?;
         self.read_snapshot
-            .store(self.inner.wal.last_durable_seqno(), Ordering::Relaxed);
+            .store(self.inner.wal.last_acknowledged_seqno(), Ordering::Relaxed);
         Ok(())
     }
 

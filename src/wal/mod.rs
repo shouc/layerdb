@@ -29,6 +29,7 @@ pub struct Wal {
     tx: mpsc::UnboundedSender<WalRequest>,
     flush_tx: mpsc::UnboundedSender<FlushSignal>,
     _next_seqno: Arc<AtomicU64>,
+    last_ack_seqno: Arc<AtomicU64>,
     last_durable_seqno: Arc<AtomicU64>,
     wal_thread: Option<thread::JoinHandle<()>>,
     flush_thread: Option<thread::JoinHandle<()>>,
@@ -51,6 +52,7 @@ struct WalState {
     io: crate::io::UringExecutor,
     io_rt: Runtime,
     next_seqno: Arc<AtomicU64>,
+    last_ack_seqno: Arc<AtomicU64>,
     last_durable_seqno: Arc<AtomicU64>,
     segment_id: u64,
     segment_path: PathBuf,
@@ -89,6 +91,7 @@ impl Wal {
             .expect("spawn flush thread");
 
         let next_seqno = Arc::new(AtomicU64::new(1));
+        let last_ack_seqno = Arc::new(AtomicU64::new(0));
         let last_durable_seqno = Arc::new(AtomicU64::new(0));
         let snapshot_tracker = versions.snapshots_handle();
 
@@ -101,6 +104,7 @@ impl Wal {
             .max(base_seqno.saturating_sub(1));
 
         next_seqno.store(next_seqno_value, Ordering::Relaxed);
+        last_ack_seqno.store(last_durable, Ordering::Relaxed);
         last_durable_seqno.store(last_durable, Ordering::Relaxed);
         snapshot_tracker.set_latest_seqno(last_durable);
 
@@ -112,6 +116,7 @@ impl Wal {
             memtables,
             versions,
             next_seqno.clone(),
+            last_ack_seqno.clone(),
             last_durable_seqno.clone(),
             flush_tx_for_wal,
             recovered.last_segment_id + 1,
@@ -126,6 +131,7 @@ impl Wal {
             tx,
             flush_tx,
             _next_seqno: next_seqno,
+            last_ack_seqno,
             last_durable_seqno,
             wal_thread: Some(wal_thread),
             flush_thread: Some(flush_thread),
@@ -157,6 +163,10 @@ impl Wal {
 
     pub fn last_durable_seqno(&self) -> u64 {
         self.last_durable_seqno.load(Ordering::Relaxed)
+    }
+
+    pub fn last_acknowledged_seqno(&self) -> u64 {
+        self.last_ack_seqno.load(Ordering::Relaxed)
     }
 
     pub(crate) fn force_rotate_for_flush(&self) -> anyhow::Result<()> {
@@ -279,6 +289,7 @@ impl WalState {
         memtables: Arc<MemTableManager>,
         versions: Arc<VersionSet>,
         next_seqno: Arc<AtomicU64>,
+        last_ack_seqno: Arc<AtomicU64>,
         last_durable_seqno: Arc<AtomicU64>,
         flush_tx: mpsc::UnboundedSender<FlushSignal>,
         segment_id: u64,
@@ -311,6 +322,7 @@ impl WalState {
             io,
             io_rt,
             next_seqno,
+            last_ack_seqno,
             last_durable_seqno,
             segment_id,
             segment_path,
@@ -387,6 +399,7 @@ impl WalState {
         let last_seqno = seqno_base + ops.len() as u64 - 1;
         self.versions.snapshots().set_latest_seqno(last_seqno);
         self.versions.advance_current_branch(last_seqno)?;
+        self.last_ack_seqno.store(last_seqno, Ordering::Relaxed);
         if do_sync {
             self.last_durable_seqno.store(last_seqno, Ordering::Relaxed);
         }

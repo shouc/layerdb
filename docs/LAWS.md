@@ -122,3 +122,5 @@ Kinds:
   manifest-safe durability ordering.
 - `layerdb rebalance-tiers --db <path>`, `freeze-level`, `thaw-level`,
   `frozen-objects`, and `gc-s3` support local/HDD/S3 lifecycle workflows.
+- `layerdb get --db <path> --key <k> [--branch <name>]` inspects visible values
+  at either main (default) or an explicit branch head.

@@ -102,6 +102,14 @@ enum Command {
         #[arg(long)]
         db: PathBuf,
     },
+    Get {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        branch: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -145,6 +153,7 @@ fn main() -> anyhow::Result<()> {
         Command::CreateBranch { db, name } => create_branch(&db, &name),
         Command::Branches { db } => branches(&db),
         Command::FrozenObjects { db } => frozen_objects(&db),
+        Command::Get { db, key, branch } => get_cmd(&db, &key, branch.as_deref()),
     }
 }
 
@@ -593,6 +602,20 @@ fn frozen_objects(db: &Path) -> anyhow::Result<()> {
             frozen.superblock_bytes,
         );
     }
+    Ok(())
+}
+
+fn get_cmd(db: &Path, key: &str, branch: Option<&str>) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    if let Some(branch_name) = branch {
+        db.checkout(branch_name)?;
+    }
+
+    match db.get(key.as_bytes(), layerdb::ReadOptions::default())? {
+        Some(value) => println!("value={}", String::from_utf8_lossy(&value)),
+        None => println!("not_found"),
+    }
+
     Ok(())
 }
 

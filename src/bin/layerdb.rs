@@ -97,9 +97,9 @@ enum Command {
         db: PathBuf,
         #[arg(long)]
         name: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_seqno")]
         from_branch: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_branch")]
         from_seqno: Option<u64>,
     },
     Checkout {

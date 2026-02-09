@@ -147,3 +147,46 @@ fn create_branch_cli_rejects_future_seqno() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+
+#[test]
+fn create_branch_cli_rejects_conflicting_source_flags() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+
+    let put = Command::new(layerdb_bin()?)
+        .args([
+            "put",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--key",
+            "k",
+            "--value",
+            "v1",
+            "--sync",
+        ])
+        .output()?;
+    assert!(put.status.success());
+
+    let create = Command::new(layerdb_bin()?)
+        .args([
+            "create-branch",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--name",
+            "bad",
+            "--from-branch",
+            "main",
+            "--from-seqno",
+            "1",
+        ])
+        .output()?;
+
+    assert!(!create.status.success(), "conflicting flags unexpectedly succeeded");
+    let stderr = String::from_utf8_lossy(&create.stderr);
+    assert!(
+        stderr.contains("cannot be used with") || stderr.contains("mutually exclusive"),
+        "stderr missing conflict message: {stderr}"
+    );
+
+    Ok(())
+}

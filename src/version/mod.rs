@@ -18,6 +18,7 @@ use crate::version::manifest::{AddFile, DeleteFile, Manifest, ManifestRecord, Ve
 #[derive(Debug)]
 pub struct VersionSet {
     dir: PathBuf,
+    options: DbOptions,
     snapshots: Arc<SnapshotTracker>,
     next_file_id: AtomicU64,
     levels: parking_lot::RwLock<Levels>,
@@ -33,7 +34,7 @@ struct Levels {
 }
 
 impl VersionSet {
-    pub fn recover(dir: &Path, _options: &DbOptions) -> anyhow::Result<Self> {
+    pub fn recover(dir: &Path, options: &DbOptions) -> anyhow::Result<Self> {
         let (manifest, state) = Manifest::open(dir)?;
         let mut l0 = Vec::new();
         let mut l1 = Vec::new();
@@ -58,11 +59,46 @@ impl VersionSet {
         snapshots.set_latest_seqno(max_seqno);
         Ok(Self {
             dir: dir.to_path_buf(),
+            options: options.clone(),
             snapshots,
             next_file_id: AtomicU64::new(max_file_id.saturating_add(1).max(1)),
             levels: parking_lot::RwLock::new(Levels { l0, l1 }),
             manifest: parking_lot::Mutex::new(manifest),
         })
+    }
+
+    fn sst_root_dir(&self, level: u8) -> PathBuf {
+        if self.options.enable_hdd_tier && level > self.options.hot_levels_max {
+            self.dir.join("sst_hdd")
+        } else {
+            self.dir.join("sst")
+        }
+    }
+
+    fn resolve_sst_path(&self, level: u8, file_id: u64) -> anyhow::Result<PathBuf> {
+        let primary = self.sst_path(level, file_id);
+        if primary.exists() {
+            return Ok(primary);
+        }
+
+        let alt_dir = if primary.parent().is_some_and(|p| p.ends_with("sst_hdd")) {
+            self.dir.join("sst")
+        } else {
+            self.dir.join("sst_hdd")
+        };
+        let secondary = alt_dir.join(format!("sst_{file_id:016x}.sst"));
+        if secondary.exists() {
+            return Ok(secondary);
+        }
+
+        anyhow::bail!(
+            "manifest references missing sst file_id={file_id} level={level}: primary={primary:?} secondary={secondary:?}"
+        )
+    }
+
+    fn sst_path(&self, level: u8, file_id: u64) -> PathBuf {
+        self.sst_root_dir(level)
+            .join(format!("sst_{file_id:016x}.sst"))
     }
 
     pub fn snapshots(&self) -> &SnapshotTracker {
@@ -101,13 +137,7 @@ impl VersionSet {
             ) {
                 continue;
             }
-            let path = self
-                .dir
-                .join("sst")
-                .join(format!("sst_{:016x}.sst", add.file_id));
-            if !path.exists() {
-                anyhow::bail!("manifest references missing sst: {path:?}");
-            }
+            let path = self.resolve_sst_path(add.level, add.file_id)?;
             let reader = SstReader::open(&path)?;
             if let Some((seqno, v)) = reader.get(key, snapshot_seqno)? {
                 match &candidate {
@@ -119,13 +149,7 @@ impl VersionSet {
 
         // L1: non-overlapping; binary search by key range.
         if let Some(add) = find_l1_file(&levels.l1, key) {
-            let path = self
-                .dir
-                .join("sst")
-                .join(format!("sst_{:016x}.sst", add.file_id));
-            if !path.exists() {
-                anyhow::bail!("manifest references missing sst: {path:?}");
-            }
+            let path = self.resolve_sst_path(add.level, add.file_id)?;
             let reader = SstReader::open(&path)?;
             if let Some((seqno, v)) = reader.get(key, snapshot_seqno)? {
                 match &candidate {
@@ -172,13 +196,7 @@ impl VersionSet {
         let mut out = Vec::new();
 
         for file in guard.l0.iter().chain(guard.l1.iter()) {
-            let path = self
-                .dir
-                .join("sst")
-                .join(format!("sst_{:016x}.sst", file.file_id));
-            if !path.exists() {
-                anyhow::bail!("manifest references missing sst: {path:?}");
-            }
+            let path = self.resolve_sst_path(file.level, file.file_id)?;
             let reader = SstReader::open(&path)?;
             out.extend(reader.range_tombstones(snapshot_seqno)?);
         }
@@ -189,10 +207,11 @@ impl VersionSet {
 
     pub fn iter(&self, range: Range, snapshot_seqno: u64) -> anyhow::Result<SstIter> {
         let guard = self.levels.read();
-        let mut files = Vec::with_capacity(guard.l0.len() + guard.l1.len());
-        files.extend(guard.l0.clone());
-        files.extend(guard.l1.clone());
-        SstIter::new(self.dir.clone(), files, snapshot_seqno, range)
+        let mut paths = Vec::with_capacity(guard.l0.len() + guard.l1.len());
+        for file in guard.l0.iter().chain(guard.l1.iter()) {
+            paths.push(self.resolve_sst_path(file.level, file.file_id)?);
+        }
+        SstIter::new(paths, snapshot_seqno, range)
     }
 
     pub fn compact_l0_to_l1(&self, _options: &DbOptions) -> anyhow::Result<()> {
@@ -234,13 +253,7 @@ impl VersionSet {
 
         let mut entries = Vec::new();
         for file in &compact_inputs {
-            let path = self
-                .dir
-                .join("sst")
-                .join(format!("sst_{:016x}.sst", file.file_id));
-            if !path.exists() {
-                anyhow::bail!("manifest references missing sst: {path:?}");
-            }
+            let path = self.resolve_sst_path(file.level, file.file_id)?;
             let reader = SstReader::open(&path)?;
             let mut iter = reader.iter(u64::MAX)?;
             iter.seek_to_first();
@@ -289,7 +302,7 @@ impl VersionSet {
         }
 
         let out_file_id = self.allocate_file_id();
-        let sst_dir = self.dir.join("sst");
+        let sst_dir = self.sst_root_dir(1);
         let mut builder = crate::sst::SstBuilder::create(&sst_dir, out_file_id, 64 * 1024)?;
         for (key, value) in &out_entries {
             builder.add(key, value.as_ref())?;
@@ -376,11 +389,16 @@ impl VersionSet {
 
         // Once manifest deletions are durable, remove old files from disk.
         for input in &inputs {
-            let path = self
+            let path_nvme = self
                 .dir
                 .join("sst")
                 .join(format!("sst_{:016x}.sst", input.file_id));
-            let _ = std::fs::remove_file(path);
+            let path_hdd = self
+                .dir
+                .join("sst_hdd")
+                .join(format!("sst_{:016x}.sst", input.file_id));
+            let _ = std::fs::remove_file(path_nvme);
+            let _ = std::fs::remove_file(path_hdd);
         }
         Ok(())
     }
@@ -420,19 +438,11 @@ struct SstEntry {
 }
 
 impl SstIter {
-    fn new(
-        dir: PathBuf,
-        files: Vec<AddFile>,
-        snapshot_seqno: u64,
-        range: Range,
-    ) -> anyhow::Result<Self> {
+    fn new(paths: Vec<PathBuf>, snapshot_seqno: u64, range: Range) -> anyhow::Result<Self> {
         let bounds = crate::memtable::bounds_from_range(&range);
         let mut entries = Vec::new();
 
-        for file in files {
-            let path = dir
-                .join("sst")
-                .join(format!("sst_{:016x}.sst", file.file_id));
+        for path in paths {
             let reader = SstReader::open(&path)?;
             let mut iter = reader.iter(snapshot_seqno)?;
             iter.seek_to_first();

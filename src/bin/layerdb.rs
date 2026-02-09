@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use layerdb::internal_key::{InternalKey, KeyKind};
 use rayon::prelude::*;
 
 #[derive(Debug, Parser)]
@@ -119,6 +120,14 @@ enum Command {
     FrozenObjects {
         #[arg(long)]
         db: PathBuf,
+    },
+    ArchiveBranch {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        out: PathBuf,
     },
     Get {
         #[arg(long)]
@@ -241,6 +250,7 @@ fn main() -> anyhow::Result<()> {
         Command::Checkout { db, name } => checkout_branch_cmd(&db, &name),
         Command::Branches { db } => branches(&db),
         Command::FrozenObjects { db } => frozen_objects(&db),
+        Command::ArchiveBranch { db, name, out } => archive_branch_cmd(&db, &name, &out),
         Command::Get { db, key, branch } => get_cmd(&db, &key, branch.as_deref()),
         Command::Scan {
             db,
@@ -768,6 +778,58 @@ fn frozen_objects(db: &Path) -> anyhow::Result<()> {
             frozen.superblock_bytes,
         );
     }
+    Ok(())
+}
+
+fn archive_branch_cmd(db: &Path, name: &str, out: &Path) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    let previous_branch = db.current_branch();
+
+    db.checkout(name)?;
+    let snapshot = db.create_snapshot()?;
+    let branch_seqno = db.metrics().current_branch_seqno;
+
+    std::fs::create_dir_all(out)
+        .with_context(|| format!("create archive dir {}", out.display()))?;
+
+    let file_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_nanos() as u64;
+    let mut builder = layerdb::sst::SstBuilder::create(out, file_id, 64 * 1024)?;
+
+    let mut iter = db.iter(
+        layerdb::Range::all(),
+        layerdb::ReadOptions {
+            snapshot: Some(snapshot),
+        },
+    )?;
+    iter.seek_to_first();
+    let mut entries = 0u64;
+    while let Some(next) = iter.next() {
+        let (key, value) = next?;
+        if let Some(value) = value {
+            builder.add(
+                &InternalKey::new(key.clone(), branch_seqno, KeyKind::Put),
+                &value,
+            )?;
+            entries += 1;
+        }
+    }
+
+    db.release_snapshot(snapshot);
+    if previous_branch != name {
+        db.checkout(&previous_branch)?;
+    }
+
+    let props = builder.finish()?;
+    let out_file = out.join(format!("sst_{file_id:016x}.sst"));
+    println!(
+        "archive_branch name={name} seqno={branch_seqno} entries={entries} out={} table_root={:?}",
+        out_file.display(),
+        props.table_root,
+    );
+
     Ok(())
 }
 

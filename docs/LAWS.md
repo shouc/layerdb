@@ -134,6 +134,9 @@ Kinds:
   [--from-seqno <n>]`, `layerdb checkout --db <path> --name <branch>`,
   `layerdb branches --db <path>`, and `layerdb drop-branch --db <path> --name <branch>`
   manage branch heads and inspection.
+- `layerdb archive-branch --db <path> --name <branch> --out <dir>` exports a
+  branch-consistent snapshot into an external SST archive file for portability
+  or cold archival workflows.
 - `layerdb get --db <path> --key <k> [--branch <name>]` inspects visible values
   at either main (default) or an explicit branch head.
 - `layerdb scan --db <path> [--start <k>] [--end <k>] [--branch <name>]`

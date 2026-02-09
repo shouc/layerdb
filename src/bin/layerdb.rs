@@ -136,6 +136,16 @@ enum Command {
         #[arg(long, default_value_t = true)]
         sync: bool,
     },
+    WriteBatch {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long = "op", required = true)]
+        ops: Vec<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long, default_value_t = true)]
+        sync: bool,
+    },
     RetentionFloor {
         #[arg(long)]
         db: PathBuf,
@@ -198,6 +208,12 @@ fn main() -> anyhow::Result<()> {
             branch,
             sync,
         } => delete_cmd(&db, &key, branch.as_deref(), sync),
+        Command::WriteBatch {
+            db,
+            ops,
+            branch,
+            sync,
+        } => write_batch_cmd(&db, &ops, branch.as_deref(), sync),
         Command::RetentionFloor { db } => retention_floor_cmd(&db),
     }
 }
@@ -698,6 +714,52 @@ fn delete_cmd(db: &Path, key: &str, branch: Option<&str>, sync: bool) -> anyhow:
     }
     db.delete(key.to_string(), layerdb::WriteOptions { sync })?;
     println!("delete key={key} sync={sync}");
+    Ok(())
+}
+
+fn parse_batch_op(spec: &str) -> anyhow::Result<layerdb::Op> {
+    if let Some(rest) = spec.strip_prefix("put:") {
+        let mut parts = rest.splitn(2, ':');
+        let key = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid --op spec: {spec}"))?;
+        let value = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid --op spec: {spec}"))?;
+        if key.is_empty() {
+            anyhow::bail!("invalid --op spec: {spec}");
+        }
+        return Ok(layerdb::Op::put(key.to_string(), value.to_string()));
+    }
+
+    if let Some(key) = spec.strip_prefix("del:") {
+        if key.is_empty() {
+            anyhow::bail!("invalid --op spec: {spec}");
+        }
+        return Ok(layerdb::Op::delete(key.to_string()));
+    }
+
+    anyhow::bail!("invalid --op spec: {spec}")
+}
+
+fn write_batch_cmd(
+    db: &Path,
+    ops: &[String],
+    branch: Option<&str>,
+    sync: bool,
+) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    if let Some(branch_name) = branch {
+        db.checkout(branch_name)?;
+    }
+
+    let parsed: Vec<layerdb::Op> = ops
+        .iter()
+        .map(|spec| parse_batch_op(spec))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    db.write_batch(parsed.clone(), layerdb::WriteOptions { sync })?;
+    println!("write_batch ops={} sync={sync}", parsed.len());
     Ok(())
 }
 

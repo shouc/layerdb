@@ -10,6 +10,7 @@
 
 use std::hash::Hash;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -44,6 +45,31 @@ impl BlockCacheKey {
 /// This implementation is a size-bounded LRU by entry count.
 pub struct ClockProCache<K: Eq + Hash, V> {
     inner: Mutex<LruCache<K, Arc<V>>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    inserts: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub inserts: u64,
+    pub len: usize,
+}
+
+impl CacheStats {
+    pub fn total_lookups(&self) -> u64 {
+        self.hits.saturating_add(self.misses)
+    }
+
+    pub fn hit_rate(&self) -> Option<f64> {
+        let total = self.total_lookups();
+        if total == 0 {
+            return None;
+        }
+        Some(self.hits as f64 / total as f64)
+    }
 }
 
 impl<K, V> std::fmt::Debug for ClockProCache<K, V>
@@ -69,19 +95,38 @@ where
                     .try_into()
                     .expect("capacity_entries must fit NonZeroUsize"),
             )),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
         }
     }
 
     pub fn get(&self, key: &K) -> Option<Arc<V>> {
-        self.inner.lock().get(key).cloned()
+        let value = self.inner.lock().get(key).cloned();
+        if value.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        value
     }
 
     pub fn insert(&self, key: K, value: Arc<V>) {
         self.inner.lock().put(key, value);
+        self.inserts.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn len(&self) -> usize {
         self.inner.lock().len()
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            inserts: self.inserts.load(Ordering::Relaxed),
+            len: self.len(),
+        }
     }
 }
 
@@ -127,6 +172,13 @@ mod tests {
         assert!(cache.get(&2).is_none());
         assert_eq!(cache.get(&1).as_deref().map(|s| s.as_str()), Some("a"));
         assert_eq!(cache.get(&3).as_deref().map(|s| s.as_str()), Some("c"));
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 3);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.inserts, 3);
+        assert_eq!(stats.len, 2);
+        assert!(stats.hit_rate().expect("hit rate") > 0.7);
     }
 
     #[test]

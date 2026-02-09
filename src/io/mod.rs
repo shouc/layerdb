@@ -69,6 +69,35 @@ impl UringExecutor {
         Ok(offset)
     }
 
+    pub async fn append_many(
+        &self,
+        path: impl AsRef<Path>,
+        chunks: &[Vec<u8>],
+    ) -> anyhow::Result<u64> {
+        let _permit = self.acquire_permit().await?;
+        let path = path.as_ref();
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)
+            .await
+            .with_context(|| format!("open for append_many: {}", path.display()))?;
+        let offset = file
+            .metadata()
+            .await
+            .with_context(|| format!("metadata: {}", path.display()))?
+            .len();
+
+        for chunk in chunks {
+            file.write_all(chunk)
+                .await
+                .with_context(|| format!("append_many write: {}", path.display()))?;
+        }
+
+        Ok(offset)
+    }
+
     pub async fn write_all_at(
         &self,
         path: impl AsRef<Path>,
@@ -400,6 +429,23 @@ mod tests {
 
         let got = io.read_exact_at(&path, 0, 10).await.expect("read");
         assert_eq!(got.as_ref(), b"hello orld");
+    }
+
+    #[tokio::test]
+    async fn executor_append_many_writes_contiguously() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("data_many.bin");
+        let io = UringExecutor::new(8);
+
+        let chunks = vec![b"ab".to_vec(), b"cd".to_vec()];
+        let offset0 = io.append_many(&path, &chunks).await.expect("append_many");
+        let offset1 = io.append(&path, b"ef").await.expect("append");
+
+        assert_eq!(offset0, 0);
+        assert_eq!(offset1, 4);
+
+        let got = io.read_exact_at(&path, 0, 6).await.expect("read");
+        assert_eq!(got.as_ref(), b"abcdef");
     }
 
     #[test]

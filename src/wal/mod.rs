@@ -421,19 +421,54 @@ impl WalState {
     }
 
     fn handle_group(&mut self, requests: Vec<WalRequest>) {
-        let mut staged = Vec::with_capacity(requests.len());
+        if requests.is_empty() {
+            return;
+        }
+
+        let mut estimated_bytes = 0u64;
+        let mut total_ops = 0u64;
+        for req in &requests {
+            total_ops += req.ops.len() as u64;
+            match encode_wal_record(0, &req.ops) {
+                Ok(record) => {
+                    estimated_bytes = estimated_bytes.saturating_add(record.len() as u64);
+                }
+                Err(err) => {
+                    let msg = format!("{err:#}");
+                    for req in requests {
+                        let _ = req.done.send(Err(anyhow::anyhow!(msg.clone())));
+                    }
+                    return;
+                }
+            }
+        }
+
+        if self.segment_bytes + estimated_bytes > self.options.wal_segment_bytes {
+            for req in requests {
+                let result = self.handle_request(req.ops, req.opts, req.rotate_only);
+                let _ = req.done.send(result);
+            }
+            return;
+        }
+
+        let seqno_start = self.next_seqno.fetch_add(total_ops, Ordering::Relaxed);
+        let mut seqno_cursor = seqno_start;
+
+        let mut staged: Vec<StagedWrite> = Vec::with_capacity(requests.len());
+        let mut records = Vec::with_capacity(requests.len());
         let mut pending = requests.into_iter();
 
         while let Some(req) = pending.next() {
-            let seqno_base = self
-                .next_seqno
-                .fetch_add(req.ops.len() as u64, Ordering::Relaxed);
+            let seqno_base = seqno_cursor;
+            seqno_cursor += req.ops.len() as u64;
 
             let record = match encode_wal_record(seqno_base, &req.ops) {
                 Ok(record) => record,
                 Err(err) => {
-                    self.finish_staged(staged);
                     let msg = format!("{err:#}");
+                    for write in staged {
+                        let _ = write.done.send(Err(anyhow::anyhow!(msg.clone())));
+                    }
                     let _ = req.done.send(Err(anyhow::anyhow!(msg.clone())));
                     for rest in pending {
                         let _ = rest.done.send(Err(anyhow::anyhow!(msg.clone())));
@@ -442,30 +477,7 @@ impl WalState {
                 }
             };
 
-            if let Err(err) = self.rotate_segment_if_needed(record.len() as u64) {
-                self.finish_staged(staged);
-                let msg = format!("{err:#}");
-                let _ = req.done.send(Err(anyhow::anyhow!(msg.clone())));
-                for rest in pending {
-                    let _ = rest.done.send(Err(anyhow::anyhow!(msg.clone())));
-                }
-                return;
-            }
-
-            if let Err(err) = self
-                .io_rt
-                .block_on(self.io.append(&self.segment_path, &record))
-            {
-                self.finish_staged(staged);
-                let msg = format!("{err:#}");
-                let _ = req.done.send(Err(anyhow::anyhow!(msg.clone())));
-                for rest in pending {
-                    let _ = rest.done.send(Err(anyhow::anyhow!(msg.clone())));
-                }
-                return;
-            }
-            self.segment_bytes += record.len() as u64;
-
+            records.push(record);
             staged.push(StagedWrite {
                 done: req.done,
                 seqno_base,
@@ -474,6 +486,18 @@ impl WalState {
             });
         }
 
+        if let Err(err) = self
+            .io_rt
+            .block_on(self.io.append_many(&self.segment_path, &records))
+        {
+            let msg = format!("{err:#}");
+            for write in staged {
+                let _ = write.done.send(Err(anyhow::anyhow!(msg.clone())));
+            }
+            return;
+        }
+
+        self.segment_bytes += estimated_bytes;
         self.finish_staged(staged);
     }
 

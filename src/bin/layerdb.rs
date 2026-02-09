@@ -477,6 +477,12 @@ fn bench(db: &Path, keys: usize, workload: BenchWorkload) -> anyhow::Result<()> 
 fn compact_range_cmd(db: &Path, start: Option<&str>, end: Option<&str>) -> anyhow::Result<()> {
     let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
 
+    if let (Some(s), Some(e)) = (start, end) {
+        if s.as_bytes() >= e.as_bytes() {
+            anyhow::bail!("invalid range: start must be < end");
+        }
+    }
+
     let range = match (start, end) {
         (None, None) => None,
         (Some(s), None) => Some(layerdb::Range {

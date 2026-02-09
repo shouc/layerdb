@@ -101,3 +101,40 @@ fn compact_range_cli_accepts_full_and_bounded_ranges() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn compact_range_cli_rejects_invalid_bounds() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+
+    {
+        let db = Db::open(dir.path(), options())?;
+        db.put(&b"a"[..], &b"1"[..], WriteOptions { sync: true })?;
+    }
+
+    let output = Command::new(layerdb_bin()?)
+        .args([
+            "compact-range",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--start",
+            "z",
+            "--end",
+            "a",
+        ])
+        .output()?;
+
+    assert!(
+        !output.status.success(),
+        "compact-range unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid range: start must be < end"),
+        "stderr={stderr}"
+    );
+
+    Ok(())
+}

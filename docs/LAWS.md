@@ -131,6 +131,7 @@ Kinds:
   at either main (default) or an explicit branch head.
 - `layerdb scan --db <path> [--start <k>] [--end <k>] [--branch <name>]`
   iterates visible key/value pairs over a half-open key range.
+  When both bounds are provided, `start` must be `< end`.
 - `layerdb put --db <path> --key <k> --value <v> [--branch <name>]` and
   `layerdb delete --db <path> --key <k> [--branch <name>]` apply writes against
   the selected branch head (default: `main`).

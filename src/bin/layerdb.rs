@@ -774,6 +774,12 @@ fn scan_cmd(
     end: Option<&str>,
     branch: Option<&str>,
 ) -> anyhow::Result<()> {
+    if let (Some(s), Some(e)) = (start, end) {
+        if s >= e {
+            anyhow::bail!("scan requires start < end when both bounds are provided");
+        }
+    }
+
     let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
     if let Some(branch_name) = branch {
         db.checkout(branch_name)?;

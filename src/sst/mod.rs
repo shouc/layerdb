@@ -36,6 +36,7 @@ use bytes::Bytes;
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
+use crate::integrity::{BlockCrc32c, BlockHash, RecordHasher};
 use crate::internal_key::{InternalKey, KeyKind};
 use crate::range_tombstone::RangeTombstone;
 
@@ -238,11 +239,11 @@ impl SstBuilder {
 
     fn flush_block(&mut self) -> Result<(), SstError> {
         let payload_len = self.buf.len();
-        let crc = crc32c::crc32c(&self.buf);
-        let hash = blake3::hash(&self.buf);
-        self.table_hasher.update(hash.as_bytes());
-        self.buf.extend_from_slice(&crc.to_le_bytes());
-        self.buf.extend_from_slice(hash.as_bytes());
+        let crc = RecordHasher::crc32c(&self.buf);
+        let hash = RecordHasher::blake3(&self.buf);
+        self.table_hasher.update(&hash.0);
+        self.buf.extend_from_slice(&crc.0.to_le_bytes());
+        self.buf.extend_from_slice(&hash.0);
 
         let offset = self.file.stream_position()?;
         self.file.write_all(&self.buf)?;
@@ -436,12 +437,10 @@ impl SstReader {
         );
         let hash_expected: [u8; 32] = self.mmap[(payload_end + 4)..end].try_into().unwrap();
 
-        let crc_actual = crc32c::crc32c(payload);
-        if crc_actual != crc_expected {
+        if !RecordHasher::verify_crc32c(payload, BlockCrc32c(crc_expected)) {
             return Err(SstError::Corrupt("block crc mismatch"));
         }
-        let hash_actual = blake3::hash(payload);
-        if hash_actual.as_bytes() != &hash_expected {
+        if !RecordHasher::verify_blake3(payload, BlockHash(hash_expected)) {
             return Err(SstError::Corrupt("block hash mismatch"));
         }
 

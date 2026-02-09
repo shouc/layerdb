@@ -2,6 +2,7 @@
 pub struct DbOptions {
     pub memtable_shards: usize,
     pub wal_segment_bytes: u64,
+    pub memtable_bytes: u64,
     pub fsync_writes: bool,
 }
 
@@ -10,6 +11,7 @@ impl Default for DbOptions {
         Self {
             memtable_shards: 16,
             wal_segment_bytes: 64 * 1024 * 1024,
+            memtable_bytes: 64 * 1024 * 1024,
             fsync_writes: true,
         }
     }
@@ -24,4 +26,3 @@ pub struct WriteOptions {
 pub struct ReadOptions {
     pub snapshot: Option<crate::db::SnapshotId>,
 }
-

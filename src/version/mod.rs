@@ -28,16 +28,20 @@ impl VersionSet {
         let (manifest, state) = Manifest::open(dir)?;
         let mut files = Vec::new();
         let mut max_file_id = 0u64;
+        let mut max_seqno = 0u64;
         for (_level, level_files) in state.levels {
             for (_id, add) in level_files {
                 max_file_id = max_file_id.max(add.file_id);
+                max_seqno = max_seqno.max(add.max_seqno);
                 files.push(add);
             }
         }
         files.sort_by(|a, b| a.file_id.cmp(&b.file_id));
+        let snapshots = Arc::new(SnapshotTracker::new());
+        snapshots.set_latest_seqno(max_seqno);
         Ok(Self {
             dir: dir.to_path_buf(),
-            snapshots: Arc::new(SnapshotTracker::new()),
+            snapshots,
             next_file_id: AtomicU64::new(max_file_id.saturating_add(1).max(1)),
             files: parking_lot::RwLock::new(files),
             manifest: parking_lot::Mutex::new(manifest),
@@ -46,6 +50,10 @@ impl VersionSet {
 
     pub fn snapshots(&self) -> &SnapshotTracker {
         &self.snapshots
+    }
+
+    pub(crate) fn latest_seqno(&self) -> u64 {
+        self.snapshots.latest_seqno()
     }
 
     pub(crate) fn snapshots_handle(&self) -> Arc<SnapshotTracker> {
@@ -72,7 +80,7 @@ impl VersionSet {
             let path = self
                 .dir
                 .join("sst")
-                .join(format!("sst_{:016}.sst", add.file_id));
+                .join(format!("sst_{:016x}.sst", add.file_id));
             if !path.exists() {
                 continue;
             }
@@ -100,6 +108,7 @@ impl VersionSet {
             level: 0,
             smallest_user_key: props.smallest_user_key.clone(),
             largest_user_key: props.largest_user_key.clone(),
+            max_seqno: props.max_seqno,
             table_root: props.table_root,
             size_bytes: props.data_bytes + props.index_bytes,
         };
@@ -138,7 +147,7 @@ impl SstIter {
         for file in files {
             let path = dir
                 .join("sst")
-                .join(format!("sst_{:016}.sst", file.file_id));
+                .join(format!("sst_{:016x}.sst", file.file_id));
             let reader = match SstReader::open(&path) {
                 Ok(r) => r,
                 Err(_) => continue,

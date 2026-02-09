@@ -19,6 +19,11 @@ pub struct AddFile {
     pub level: u8,
     pub smallest_user_key: Bytes,
     pub largest_user_key: Bytes,
+    /// Maximum sequence number contained in this file.
+    ///
+    /// Used during recovery to restore the global seqno allocator even when
+    /// WAL segments were garbage collected.
+    pub max_seqno: u64,
     pub table_root: TableRoot,
     pub size_bytes: u64,
 }

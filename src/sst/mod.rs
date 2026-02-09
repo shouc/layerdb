@@ -60,6 +60,7 @@ pub struct TableRoot(pub [u8; 32]);
 pub struct SstProperties {
     pub smallest_user_key: Bytes,
     pub largest_user_key: Bytes,
+    pub max_seqno: u64,
     pub entries: u64,
     pub data_bytes: u64,
     pub index_bytes: u64,
@@ -102,6 +103,7 @@ pub struct SstBuilder {
     index: Vec<IndexEntry>,
     smallest_user_key: Option<Bytes>,
     largest_user_key: Option<Bytes>,
+    max_seqno: u64,
     entries: u64,
     data_bytes: u64,
     table_hasher: blake3::Hasher,
@@ -129,6 +131,7 @@ impl SstBuilder {
             index: Vec::new(),
             smallest_user_key: None,
             largest_user_key: None,
+            max_seqno: 0,
             entries: 0,
             data_bytes: 0,
             table_hasher: blake3::Hasher::new(),
@@ -149,6 +152,7 @@ impl SstBuilder {
         }
         self.largest_user_key = Some(key.user_key.clone());
         self.last_key = Some(key.clone());
+        self.max_seqno = self.max_seqno.max(key.seqno);
         self.entries += 1;
 
         if self.entries_in_block == 0 {
@@ -191,6 +195,7 @@ impl SstBuilder {
         let props = SstProperties {
             smallest_user_key: self.smallest_user_key.clone().unwrap_or_else(Bytes::new),
             largest_user_key: self.largest_user_key.clone().unwrap_or_else(Bytes::new),
+            max_seqno: self.max_seqno,
             entries: self.entries,
             data_bytes: self.data_bytes,
             index_bytes: index_bytes.len() as u64,

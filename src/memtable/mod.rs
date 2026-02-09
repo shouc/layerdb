@@ -10,11 +10,12 @@ use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 
 use crate::db::iterator::range_contains;
-use crate::db::{Op, OpKind, Range, Value};
+use crate::db::{LookupResult, Op, OpKind, Range, Value};
 use crate::internal_key::{InternalKey, KeyKind};
+use crate::range_tombstone::RangeTombstone;
 
 #[derive(Debug)]
-pub struct MemTableManager {
+pub(crate) struct MemTableManager {
     shard_count: usize,
     mutable: RwLock<Arc<MemTable>>,
     immutables: Mutex<VecDeque<Arc<MemTable>>>,
@@ -123,19 +124,64 @@ impl MemTableManager {
     /// - `Ok(None)` if key not present
     /// - `Ok(Some(None))` if tombstone present
     /// - `Ok(Some(Some(value)))` if value present
-    pub fn get(&self, key: &[u8], snapshot_seqno: u64) -> anyhow::Result<Option<Option<Value>>> {
+    pub fn get(&self, key: &[u8], snapshot_seqno: u64) -> anyhow::Result<Option<LookupResult>> {
+        let mut candidate: Option<(u64, Option<Value>)> = None;
+
         let mutable = self.mutable.read().clone();
-        if let Some(v) = mutable.get(key, snapshot_seqno) {
-            return Ok(Some(v));
+        if let Some((seqno, v)) = mutable.get(key, snapshot_seqno) {
+            candidate = Some((seqno, v));
         }
 
         for mem in self.immutables.lock().iter() {
-            if let Some(v) = mem.get(key, snapshot_seqno) {
-                return Ok(Some(v));
+            if let Some((seqno, v)) = mem.get(key, snapshot_seqno) {
+                match &candidate {
+                    Some((best_seq, _)) if *best_seq >= seqno => {}
+                    _ => candidate = Some((seqno, v)),
+                }
             }
         }
 
-        Ok(None)
+        let tombstone_seq = self
+            .range_tombstones(snapshot_seqno)
+            .iter()
+            .filter(|t| t.start_key.as_ref() <= key && key < t.end_key.as_ref())
+            .map(|t| t.seqno)
+            .max();
+
+        let result = match (candidate, tombstone_seq) {
+            (Some((seq, value)), Some(tseq)) => {
+                if tseq >= seq {
+                    LookupResult {
+                        seqno: tseq,
+                        value: None,
+                    }
+                } else {
+                    LookupResult { seqno: seq, value }
+                }
+            }
+            (Some((seq, value)), None) => LookupResult { seqno: seq, value },
+            (None, Some(tseq)) => LookupResult {
+                seqno: tseq,
+                value: None,
+            },
+            (None, None) => return Ok(None),
+        };
+
+        Ok(Some(result))
+    }
+
+    pub fn range_tombstones(&self, snapshot_seqno: u64) -> Vec<RangeTombstone> {
+        let mut out = Vec::new();
+
+        let mutable = self.mutable.read().clone();
+        mutable.collect_range_tombstones(snapshot_seqno, &mut out);
+
+        for mem in self.immutables.lock().iter() {
+            mem.collect_range_tombstones(snapshot_seqno, &mut out);
+        }
+
+        out.sort_by(|a, b| b.seqno.cmp(&a.seqno));
+        out
     }
 
     pub fn iter(&self, range: Range, snapshot_seqno: u64) -> anyhow::Result<MemTableIter> {
@@ -197,6 +243,7 @@ impl MemTable {
             let (kind, value) = match op.kind {
                 OpKind::Put => (KeyKind::Put, op.value.clone()),
                 OpKind::Del => (KeyKind::Del, Bytes::new()),
+                OpKind::RangeDel => (KeyKind::RangeDel, op.value.clone()),
             };
 
             per_shard[shard].push(InternalEntry {
@@ -219,7 +266,7 @@ impl MemTable {
             });
     }
 
-    fn get(&self, user_key: &[u8], snapshot_seqno: u64) -> Option<Option<Value>> {
+    fn get(&self, user_key: &[u8], snapshot_seqno: u64) -> Option<(u64, Option<Value>)> {
         let shard = shard_for_key(self.shards.len(), user_key);
         let start = InternalKey::new(Bytes::copy_from_slice(user_key), u64::MAX, KeyKind::Meta);
         let end = InternalKey::new(Bytes::copy_from_slice(user_key), 0, KeyKind::Del);
@@ -229,8 +276,8 @@ impl MemTable {
                 continue;
             }
             return match ikey.kind {
-                KeyKind::Put => Some(Some(entry.value().clone())),
-                KeyKind::Del => Some(None),
+                KeyKind::Put => Some((ikey.seqno, Some(entry.value().clone()))),
+                KeyKind::Del => Some((ikey.seqno, None)),
                 _ => continue,
             };
         }
@@ -269,6 +316,25 @@ impl MemTable {
             })
             .collect();
         out.extend(per_shard.into_iter().flatten());
+    }
+
+    fn collect_range_tombstones(&self, snapshot_seqno: u64, out: &mut Vec<RangeTombstone>) {
+        for shard in &self.shards {
+            for entry in shard.map.iter() {
+                let ikey = entry.key();
+                if ikey.seqno > snapshot_seqno {
+                    continue;
+                }
+                if ikey.kind != KeyKind::RangeDel {
+                    continue;
+                }
+                out.push(RangeTombstone {
+                    start_key: ikey.user_key.clone(),
+                    end_key: entry.value().clone(),
+                    seqno: ikey.seqno,
+                });
+            }
+        }
     }
 }
 
@@ -311,6 +377,7 @@ impl MemTableIter {
         let kind = match entry.key.kind {
             KeyKind::Put => OpKind::Put,
             KeyKind::Del => OpKind::Del,
+            KeyKind::RangeDel => OpKind::RangeDel,
             other => {
                 return Some(Err(anyhow::anyhow!(
                     "unexpected key kind in memtable iterator: {other:?}"
@@ -406,6 +473,10 @@ impl MergedMemAndSstIter {
             match kind {
                 OpKind::Put => return Some(Ok((user_key, Some(value)))),
                 OpKind::Del => continue,
+                OpKind::RangeDel => {
+                    // Range tombstones are handled by the DB-level iterator.
+                    continue;
+                }
             }
         }
     }
@@ -422,6 +493,7 @@ fn kind_rank(kind: OpKind) -> u8 {
     match kind {
         OpKind::Del => 0,
         OpKind::Put => 1,
+        OpKind::RangeDel => 2,
     }
 }
 

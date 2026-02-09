@@ -1,12 +1,14 @@
 use std::ops::Bound;
 
 use crate::db::Value;
+use crate::range_tombstone::RangeTombstone;
 
 /// Public iterator over user keys.
 ///
 /// Yield order: ascending user key.
 pub struct DbIterator {
     merged: crate::memtable::MergedMemAndSstIter,
+    range_tombstones: Vec<RangeTombstone>,
 }
 
 impl DbIterator {
@@ -14,9 +16,12 @@ impl DbIterator {
         mem: crate::memtable::MemTableIter,
         sst: crate::version::SstIter,
         snapshot_seqno: u64,
+        mut range_tombstones: Vec<RangeTombstone>,
     ) -> anyhow::Result<Self> {
+        range_tombstones.sort_by(|a, b| b.seqno.cmp(&a.seqno));
         Ok(Self {
             merged: crate::memtable::MergedMemAndSstIter::new(mem, sst, snapshot_seqno)?,
+            range_tombstones,
         })
     }
 
@@ -29,8 +34,23 @@ impl DbIterator {
     }
 
     pub fn next(&mut self) -> Option<anyhow::Result<(bytes::Bytes, Option<Value>)>> {
-        self.merged.next()
+        loop {
+            let (key, value) = match self.merged.next()? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            if is_deleted_by_range_tombstone(&self.range_tombstones, key.as_ref()) {
+                continue;
+            }
+            return Some(Ok((key, value)));
+        }
     }
+}
+
+fn is_deleted_by_range_tombstone(tombstones: &[RangeTombstone], key: &[u8]) -> bool {
+    tombstones
+        .iter()
+        .any(|t| t.start_key.as_ref() <= key && key < t.end_key.as_ref())
 }
 
 pub fn range_contains(range: &(Bound<bytes::Bytes>, Bound<bytes::Bytes>), key: &[u8]) -> bool {

@@ -14,13 +14,21 @@ Implementation details may evolve, but these invariants must remain true.
 - `compact_range(optional range)` (manual trigger)
 - `ingest_sst(sst_path)` (optional; not implemented in v1)
 
+### v2 extension in-progress
+
+- `delete_range(start, end, WriteOptions)` stores range tombstones and applies
+  them in point lookups + iterators + compaction merges.
+
 ## Semantics
 
 - **Read-your-writes per handle**: A `Db` handle uses an acknowledged seqno as
   the default read snapshot.
 - **Snapshots**: A snapshot is a consistent read at a seqno.
 - **Deletes**: Deletes are tombstones; visibility depends on snapshot seqno.
-- **Range deletes**: Planned for v2; the on-disk format must not prevent them.
+- **Range deletes**: Implemented conservatively. Tombstones are represented as
+  `RangeDel` internal entries where key=`start`, value=`end` (`[start, end)`).
+  Read visibility is snapshot-aware and compares point-entry seqno vs the
+  covering tombstone seqno.
 
 ## Storage Model
 
@@ -69,4 +77,3 @@ Kinds:
 1. Append `DeleteFile` to manifest + sync
 2. Unlink old files (or move to trash)
 3. (Optional) `fsync(dir_fd)`
-

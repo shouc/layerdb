@@ -33,6 +33,12 @@ pub enum KeyKind {
 }
 
 impl KeyKind {
+    pub fn is_range_tombstone(self) -> bool {
+        matches!(self, Self::RangeDel)
+    }
+}
+
+impl KeyKind {
     pub fn from_u8(value: u8) -> Result<Self, DecodeError> {
         match value {
             0 => Ok(Self::Del),

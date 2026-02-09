@@ -8,8 +8,9 @@ use bytes::Bytes;
 
 use crate::db::iterator::range_contains;
 use crate::db::snapshot::SnapshotTracker;
-use crate::db::{DbOptions, OpKind, Range, Value};
+use crate::db::{DbOptions, LookupResult, OpKind, Range, Value};
 use crate::internal_key::{InternalKey, KeyKind};
+use crate::range_tombstone::RangeTombstone;
 use crate::sst::{SstProperties, SstReader};
 use crate::version::manifest::{AddFile, DeleteFile, Manifest, ManifestRecord, VersionEdit};
 
@@ -80,8 +81,14 @@ impl VersionSet {
         self.next_file_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub fn get(&self, key: &[u8], snapshot_seqno: u64) -> anyhow::Result<Option<Option<Value>>> {
+    pub(crate) fn get(
+        &self,
+        key: &[u8],
+        snapshot_seqno: u64,
+    ) -> anyhow::Result<Option<LookupResult>> {
         let levels = self.levels.read();
+
+        let mut candidate: Option<(u64, Option<Value>)> = None;
 
         // L0: searched newest-first; may overlap.
         for add in levels.l0.iter().rev() {
@@ -102,8 +109,11 @@ impl VersionSet {
                 anyhow::bail!("manifest references missing sst: {path:?}");
             }
             let reader = SstReader::open(&path)?;
-            if let Some(v) = reader.get(key, snapshot_seqno)? {
-                return Ok(Some(v));
+            if let Some((seqno, v)) = reader.get(key, snapshot_seqno)? {
+                match &candidate {
+                    Some((best_seq, _)) if *best_seq >= seqno => {}
+                    _ => candidate = Some((seqno, v)),
+                }
             }
         }
 
@@ -117,11 +127,64 @@ impl VersionSet {
                 anyhow::bail!("manifest references missing sst: {path:?}");
             }
             let reader = SstReader::open(&path)?;
-            if let Some(v) = reader.get(key, snapshot_seqno)? {
-                return Ok(Some(v));
+            if let Some((seqno, v)) = reader.get(key, snapshot_seqno)? {
+                match &candidate {
+                    Some((best_seq, _)) if *best_seq >= seqno => {}
+                    _ => candidate = Some((seqno, v)),
+                }
             }
         }
-        Ok(None)
+
+        let tombstone_seq = self
+            .range_tombstones(snapshot_seqno)?
+            .iter()
+            .filter(|t| t.start_key.as_ref() <= key && key < t.end_key.as_ref())
+            .map(|t| t.seqno)
+            .max();
+
+        let result = match (candidate, tombstone_seq) {
+            (Some((seq, value)), Some(tseq)) => {
+                if tseq >= seq {
+                    LookupResult {
+                        seqno: tseq,
+                        value: None,
+                    }
+                } else {
+                    LookupResult { seqno: seq, value }
+                }
+            }
+            (Some((seq, value)), None) => LookupResult { seqno: seq, value },
+            (None, Some(tseq)) => LookupResult {
+                seqno: tseq,
+                value: None,
+            },
+            (None, None) => return Ok(None),
+        };
+
+        Ok(Some(result))
+    }
+
+    pub(crate) fn range_tombstones(
+        &self,
+        snapshot_seqno: u64,
+    ) -> anyhow::Result<Vec<RangeTombstone>> {
+        let guard = self.levels.read();
+        let mut out = Vec::new();
+
+        for file in guard.l0.iter().chain(guard.l1.iter()) {
+            let path = self
+                .dir
+                .join("sst")
+                .join(format!("sst_{:016x}.sst", file.file_id));
+            if !path.exists() {
+                anyhow::bail!("manifest references missing sst: {path:?}");
+            }
+            let reader = SstReader::open(&path)?;
+            out.extend(reader.range_tombstones(snapshot_seqno)?);
+        }
+
+        out.sort_by(|a, b| b.seqno.cmp(&a.seqno));
+        Ok(out)
     }
 
     pub fn iter(&self, range: Range, snapshot_seqno: u64) -> anyhow::Result<SstIter> {
@@ -186,6 +249,7 @@ impl VersionSet {
                 let key_kind = match kind {
                     OpKind::Put => KeyKind::Put,
                     OpKind::Del => KeyKind::Del,
+                    OpKind::RangeDel => KeyKind::RangeDel,
                 };
                 entries.push((InternalKey::new(user_key, seqno, key_kind), value));
             }
@@ -353,6 +417,7 @@ impl SstIter {
                 let key_kind = match kind {
                     OpKind::Put => KeyKind::Put,
                     OpKind::Del => KeyKind::Del,
+                    OpKind::RangeDel => KeyKind::RangeDel,
                 };
                 entries.push(SstEntry {
                     key: InternalKey::new(user_key, seqno, key_kind),
@@ -395,6 +460,7 @@ impl SstIter {
         let kind = match entry.key.kind {
             KeyKind::Put => OpKind::Put,
             KeyKind::Del => OpKind::Del,
+            KeyKind::RangeDel => OpKind::RangeDel,
             other => return Some(Err(anyhow::anyhow!("unexpected key kind: {other:?}"))),
         };
         Some(Ok((entry.key.user_key, entry.key.seqno, kind, entry.value)))

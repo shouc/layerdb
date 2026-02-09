@@ -16,10 +16,20 @@ pub use snapshot::SnapshotId;
 
 pub type Value = bytes::Bytes;
 
+#[derive(Debug, Clone)]
+pub(crate) struct LookupResult {
+    pub seqno: u64,
+    pub value: Option<Value>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
     Put,
     Del,
+    /// Range deletion tombstone.
+    ///
+    /// v2: stored and applied separately from point keys.
+    RangeDel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +53,15 @@ impl Op {
             kind: OpKind::Del,
             key: key.into(),
             value: bytes::Bytes::new(),
+        }
+    }
+
+    /// Delete all keys in `[start, end)`.
+    pub fn delete_range(start: impl Into<bytes::Bytes>, end: impl Into<bytes::Bytes>) -> Self {
+        Self {
+            kind: OpKind::RangeDel,
+            key: start.into(),
+            value: end.into(),
         }
     }
 }
@@ -114,6 +133,15 @@ impl Db {
         self.write_batch(vec![Op::delete(key)], opts)
     }
 
+    pub fn delete_range(
+        &self,
+        start: impl Into<bytes::Bytes>,
+        end: impl Into<bytes::Bytes>,
+        opts: WriteOptions,
+    ) -> anyhow::Result<()> {
+        self.write_batch(vec![Op::delete_range(start, end)], opts)
+    }
+
     pub fn write_batch(&self, ops: Vec<Op>, opts: WriteOptions) -> anyhow::Result<()> {
         self.inner.wal.write_batch(&ops, opts)
     }
@@ -129,25 +157,31 @@ impl Db {
             .snapshots()
             .resolve_read_snapshot(opts.snapshot)?;
 
-        if let Some(value) = self
+        let mem = self
             .inner
             .memtables
             .get(key.as_ref(), snapshot)
-            .context("memtable get")?
-        {
-            return Ok(value);
-        }
-
-        if let Some(value) = self
+            .context("memtable get")?;
+        let sst = self
             .inner
             .versions
             .get(key.as_ref(), snapshot)
-            .context("sst get")?
-        {
-            return Ok(value);
-        }
+            .context("sst get")?;
 
-        Ok(None)
+        let chosen = match (mem, sst) {
+            (Some(a), Some(b)) => {
+                if a.seqno >= b.seqno {
+                    Some(a)
+                } else {
+                    Some(b)
+                }
+            }
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+
+        Ok(chosen.and_then(|r| r.value))
     }
 
     pub fn iter(&self, range: Range, opts: ReadOptions) -> anyhow::Result<crate::db::DbIterator> {
@@ -156,10 +190,15 @@ impl Db {
             .versions
             .snapshots()
             .resolve_read_snapshot(opts.snapshot)?;
+
+        let mut range_tombstones = self.inner.memtables.range_tombstones(snapshot);
+        range_tombstones.extend(self.inner.versions.range_tombstones(snapshot)?);
+
         crate::db::iterator::DbIterator::new(
             self.inner.memtables.iter(range.clone(), snapshot)?,
             self.inner.versions.iter(range, snapshot)?,
             snapshot,
+            range_tombstones,
         )
     }
 

@@ -37,6 +37,7 @@ use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
 use crate::internal_key::{InternalKey, KeyKind};
+use crate::range_tombstone::RangeTombstone;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SstError {
@@ -321,7 +322,14 @@ impl SstReader {
         &self,
         user_key: &[u8],
         snapshot_seqno: u64,
-    ) -> Result<Option<Option<Bytes>>, SstError> {
+    ) -> Result<Option<(u64, Option<Bytes>)>, SstError> {
+        let tombstone_seq = self
+            .range_tombstones(snapshot_seqno)?
+            .iter()
+            .filter(|t| t.start_key.as_ref() <= user_key && user_key < t.end_key.as_ref())
+            .map(|t| t.seqno)
+            .max();
+
         let target = InternalKey::new(
             Bytes::copy_from_slice(user_key),
             snapshot_seqno,
@@ -343,11 +351,42 @@ impl SstReader {
         if k.user_key.as_ref() != user_key {
             return Ok(None);
         }
-        Ok(Some(match k.kind {
-            KeyKind::Put => Some(v),
-            KeyKind::Del => None,
+        let candidate = match k.kind {
+            KeyKind::Put => Some((k.seqno, Some(v))),
+            KeyKind::Del => Some((k.seqno, None)),
             _ => None,
-        }))
+        };
+
+        match (candidate, tombstone_seq) {
+            (Some((seq, value)), Some(tseq)) => {
+                if tseq >= seq {
+                    Ok(Some((tseq, None)))
+                } else {
+                    Ok(Some((seq, value)))
+                }
+            }
+            (Some((seq, value)), None) => Ok(Some((seq, value))),
+            (None, Some(tseq)) => Ok(Some((tseq, None))),
+            (None, None) => Ok(None),
+        }
+    }
+
+    pub fn range_tombstones(&self, snapshot_seqno: u64) -> Result<Vec<RangeTombstone>, SstError> {
+        let mut out = Vec::new();
+        let mut iter = self.iter(snapshot_seqno)?;
+        iter.seek_to_first();
+        while let Some(next) = iter.next() {
+            let (key, seqno, kind, value) = next?;
+            if kind != crate::db::OpKind::RangeDel {
+                continue;
+            }
+            out.push(RangeTombstone {
+                start_key: key,
+                end_key: value,
+                seqno,
+            });
+        }
+        Ok(out)
     }
 
     pub fn iter(&self, snapshot_seqno: u64) -> Result<SstIter<'_>, SstError> {
@@ -501,6 +540,7 @@ impl<'a> SstIter<'a> {
             let kind = match ikey.kind {
                 KeyKind::Put => crate::db::OpKind::Put,
                 KeyKind::Del => crate::db::OpKind::Del,
+                KeyKind::RangeDel => crate::db::OpKind::RangeDel,
                 _ => continue,
             };
             return Some(Ok((ikey.user_key, ikey.seqno, kind, value)));

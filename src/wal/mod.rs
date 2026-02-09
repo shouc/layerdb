@@ -61,10 +61,11 @@ const WAL_RECORD_HEADER_BYTES: usize = 4 + 4 + 8 + 4;
 enum WalOpKind {
     Put = 1,
     Del = 2,
+    RangeDel = 3,
 }
 
 impl Wal {
-    pub fn open(
+    pub(crate) fn open(
         dir: &Path,
         options: &DbOptions,
         memtables: Arc<MemTableManager>,
@@ -386,6 +387,7 @@ fn encode_wal_record(seqno_base: u64, ops: &[Op]) -> anyhow::Result<Vec<u8>> {
         let kind = match op.kind {
             OpKind::Put => WalOpKind::Put as u8,
             OpKind::Del => WalOpKind::Del as u8,
+            OpKind::RangeDel => WalOpKind::RangeDel as u8,
         };
         let key_len: u32 = op
             .key
@@ -396,7 +398,7 @@ fn encode_wal_record(seqno_base: u64, ops: &[Op]) -> anyhow::Result<Vec<u8>> {
         ops_bytes.extend_from_slice(&key_len.to_le_bytes());
         ops_bytes.extend_from_slice(op.key.as_ref());
         match op.kind {
-            OpKind::Put => {
+            OpKind::Put | OpKind::RangeDel => {
                 let val_len: u32 = op
                     .value
                     .len()
@@ -533,10 +535,11 @@ fn decode_wal_payload(payload: &[u8]) -> anyhow::Result<(u64, Vec<Op>)> {
         let op_kind = match kind {
             1 => OpKind::Put,
             2 => OpKind::Del,
+            3 => OpKind::RangeDel,
             other => anyhow::bail!("unknown wal op kind {other}"),
         };
         let value = match op_kind {
-            OpKind::Put => {
+            OpKind::Put | OpKind::RangeDel => {
                 if offset + val_len > payload.len() {
                     anyhow::bail!("truncated wal value");
                 }

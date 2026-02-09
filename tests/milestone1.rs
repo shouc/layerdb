@@ -109,3 +109,60 @@ fn iter_returns_latest_visible_per_key() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn range_tombstones_hide_keys_across_snapshots() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db = Db::open(dir.path(), small_options())?;
+
+    db.put(&b"a"[..], &b"1"[..], WriteOptions { sync: true })?;
+    db.put(&b"b"[..], &b"2"[..], WriteOptions { sync: true })?;
+    db.put(&b"c"[..], &b"3"[..], WriteOptions { sync: true })?;
+
+    let before = db.create_snapshot()?;
+
+    db.delete_range(&b"b"[..], &b"d"[..], WriteOptions { sync: true })?;
+
+    assert_eq!(
+        db.get(
+            b"b",
+            ReadOptions {
+                snapshot: Some(before),
+            },
+        )?,
+        Some(bytes::Bytes::from("2"))
+    );
+    assert_eq!(db.get(b"b", ReadOptions::default())?, None);
+    assert_eq!(db.get(b"c", ReadOptions::default())?, None);
+    assert_eq!(
+        db.get(b"a", ReadOptions::default())?,
+        Some(bytes::Bytes::from("1"))
+    );
+
+    let mut iter = db.iter(Range::all(), ReadOptions::default())?;
+    iter.seek_to_first();
+    let mut keys = Vec::new();
+    while let Some(next) = iter.next() {
+        let (k, v) = next?;
+        if v.is_some() {
+            keys.push(k);
+        }
+    }
+    assert_eq!(keys, vec![bytes::Bytes::from("a")]);
+
+    db.compact_range(None)?;
+
+    assert_eq!(db.get(b"b", ReadOptions::default())?, None);
+    assert_eq!(db.get(b"c", ReadOptions::default())?, None);
+    assert_eq!(
+        db.get(
+            b"b",
+            ReadOptions {
+                snapshot: Some(before),
+            },
+        )?,
+        Some(bytes::Bytes::from("2"))
+    );
+
+    Ok(())
+}

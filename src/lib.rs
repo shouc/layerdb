@@ -17,6 +17,7 @@ pub mod integrity;
 pub mod internal_key;
 pub mod io;
 pub mod memtable;
+pub mod range_tombstone;
 pub mod sst;
 pub mod tier;
 pub mod version;

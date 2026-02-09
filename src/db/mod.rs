@@ -76,8 +76,8 @@ struct DbInner {
     dir: PathBuf,
     options: DbOptions,
     wal: Wal,
-    memtables: MemTableManager,
-    versions: VersionSet,
+    memtables: Arc<MemTableManager>,
+    versions: Arc<VersionSet>,
 }
 
 impl Db {
@@ -85,9 +85,9 @@ impl Db {
         let dir = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).with_context(|| format!("create dir {dir:?}"))?;
 
-        let versions = VersionSet::recover(&dir, &options).context("recover versionset")?;
-        let wal = Wal::open(&dir, &options).context("open wal")?;
-        let memtables = MemTableManager::new(options.memtable_shards);
+        let versions = Arc::new(VersionSet::recover(&dir, &options).context("recover versionset")?);
+        let memtables = Arc::new(MemTableManager::new(options.memtable_shards));
+        let wal = Wal::open(&dir, &options, memtables.clone(), versions.clone()).context("open wal")?;
 
         Ok(Self {
             inner: Arc::new(DbInner {
@@ -114,9 +114,7 @@ impl Db {
     }
 
     pub fn write_batch(&self, ops: Vec<Op>, opts: WriteOptions) -> anyhow::Result<()> {
-        self.inner
-            .wal
-            .write_batch(&self.inner.memtables, &ops, opts)
+        self.inner.wal.write_batch(&ops, opts)
     }
 
     pub fn create_snapshot(&self) -> anyhow::Result<SnapshotId> {

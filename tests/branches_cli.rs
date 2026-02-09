@@ -68,3 +68,40 @@ fn branches_cli_lists_current_and_feature_heads() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn create_branch_cli_adds_branch() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+
+    {
+        let db = Db::open(dir.path(), options())?;
+        db.put(&b"k"[..], &b"v1"[..], WriteOptions { sync: true })?;
+    }
+
+    let create_output = Command::new(layerdb_bin()?)
+        .args([
+            "create-branch",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--name",
+            "feature",
+        ])
+        .output()?;
+
+    assert!(
+        create_output.status.success(),
+        "create-branch failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&create_output.stdout),
+        String::from_utf8_lossy(&create_output.stderr)
+    );
+
+    let list_output = Command::new(layerdb_bin()?)
+        .args(["branches", "--db", dir.path().to_str().expect("utf8 path")])
+        .output()?;
+    assert!(list_output.status.success());
+
+    let stdout = String::from_utf8_lossy(&list_output.stdout);
+    assert!(stdout.contains(" feature "), "stdout={stdout}");
+
+    Ok(())
+}

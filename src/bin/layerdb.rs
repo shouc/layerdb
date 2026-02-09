@@ -67,6 +67,12 @@ enum Command {
         #[arg(long)]
         name: String,
     },
+    CreateBranch {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        name: String,
+    },
     Branches {
         #[arg(long)]
         db: PathBuf,
@@ -94,6 +100,7 @@ fn main() -> anyhow::Result<()> {
         } => thaw_level(&db, level, max_files),
         Command::GcS3 { db } => gc_s3(&db),
         Command::DropBranch { db, name } => drop_branch(&db, &name),
+        Command::CreateBranch { db, name } => create_branch(&db, &name),
         Command::Branches { db } => branches(&db),
     }
 }
@@ -349,6 +356,13 @@ fn drop_branch(db: &Path, name: &str) -> anyhow::Result<()> {
     let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
     db.drop_branch(name)?;
     println!("drop_branch name={name}");
+    Ok(())
+}
+
+fn create_branch(db: &Path, name: &str) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    db.create_branch(name, None)?;
+    println!("create_branch name={name}");
     Ok(())
 }
 

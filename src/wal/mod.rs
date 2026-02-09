@@ -152,7 +152,7 @@ impl WalState {
     ) -> anyhow::Result<Self> {
         let wal_dir = dir.join("wal");
         std::fs::create_dir_all(&wal_dir)?;
-        let segment_path = wal_dir.join(format!("wal_{segment_id:016}.log"));
+        let segment_path = wal_dir.join(format!("wal_{segment_id:016x}.log"));
         let segment = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -180,7 +180,7 @@ impl WalState {
         self.segment_id += 1;
         self.segment_bytes = 0;
         let wal_dir = self.dir.join("wal");
-        let segment_path = wal_dir.join(format!("wal_{:016}.log", self.segment_id));
+        let segment_path = wal_dir.join(format!("wal_{:016x}.log", self.segment_id));
         self.segment = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

@@ -123,6 +123,9 @@ Kinds:
 - `layerdb rebalance-tiers --db <path>`, `freeze-level`, `thaw-level`,
   `frozen-objects`, `gc-s3`, and `gc-local` support local/HDD/S3 lifecycle
   workflows.
+- `layerdb create-branch --db <path> --name <branch> [--from-branch <src>]`,
+  `layerdb branches --db <path>`, and `layerdb drop-branch --db <path> --name <branch>`
+  manage branch heads and inspection.
 - `layerdb get --db <path> --key <k> [--branch <name>]` inspects visible values
   at either main (default) or an explicit branch head.
 - `layerdb put --db <path> --key <k> --value <v> [--branch <name>]` and

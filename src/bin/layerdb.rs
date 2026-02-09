@@ -97,6 +97,8 @@ enum Command {
         db: PathBuf,
         #[arg(long)]
         name: String,
+        #[arg(long)]
+        from_branch: Option<String>,
     },
     Branches {
         #[arg(long)]
@@ -203,7 +205,11 @@ fn main() -> anyhow::Result<()> {
         Command::GcS3 { db } => gc_s3(&db),
         Command::GcLocal { db } => gc_local(&db),
         Command::DropBranch { db, name } => drop_branch(&db, &name),
-        Command::CreateBranch { db, name } => create_branch(&db, &name),
+        Command::CreateBranch {
+            db,
+            name,
+            from_branch,
+        } => create_branch(&db, &name, from_branch.as_deref()),
         Command::Branches { db } => branches(&db),
         Command::FrozenObjects { db } => frozen_objects(&db),
         Command::Get { db, key, branch } => get_cmd(&db, &key, branch.as_deref()),
@@ -660,10 +666,17 @@ fn drop_branch(db: &Path, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn create_branch(db: &Path, name: &str) -> anyhow::Result<()> {
+fn create_branch(db: &Path, name: &str, from_branch: Option<&str>) -> anyhow::Result<()> {
     let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    if let Some(source_branch) = from_branch {
+        db.checkout(source_branch)?;
+    }
     db.create_branch(name, None)?;
-    println!("create_branch name={name}");
+    if let Some(source_branch) = from_branch {
+        println!("create_branch name={name} from_branch={source_branch}");
+    } else {
+        println!("create_branch name={name}");
+    }
     Ok(())
 }
 

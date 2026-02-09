@@ -429,9 +429,9 @@ impl WalState {
         let mut total_ops = 0u64;
         for req in &requests {
             total_ops += req.ops.len() as u64;
-            match encode_wal_record(0, &req.ops) {
-                Ok(record) => {
-                    estimated_bytes = estimated_bytes.saturating_add(record.len() as u64);
+            match wal_record_size(&req.ops) {
+                Ok(size) => {
+                    estimated_bytes = estimated_bytes.saturating_add(size as u64);
                 }
                 Err(err) => {
                     let msg = format!("{err:#}");
@@ -606,6 +606,43 @@ fn sync_dir(path: &Path) -> anyhow::Result<()> {
     let dir_fd = std::fs::File::open(path)?;
     dir_fd.sync_all()?;
     Ok(())
+}
+
+fn wal_record_size(ops: &[Op]) -> anyhow::Result<usize> {
+    let mut ops_bytes_len = 0usize;
+    for op in ops {
+        let _: u32 = op
+            .key
+            .len()
+            .try_into()
+            .map_err(|_| WalError::RecordTooLarge)?;
+
+        let value_len = match op.kind {
+            OpKind::Put | OpKind::RangeDel => {
+                let val_len: u32 = op
+                    .value
+                    .len()
+                    .try_into()
+                    .map_err(|_| WalError::RecordTooLarge)?;
+                val_len as usize
+            }
+            OpKind::Del => 0,
+        };
+
+        ops_bytes_len = ops_bytes_len
+            .saturating_add(1)
+            .saturating_add(4)
+            .saturating_add(op.key.len())
+            .saturating_add(4)
+            .saturating_add(value_len);
+    }
+
+    let _: u32 = ops.len().try_into().map_err(|_| WalError::RecordTooLarge)?;
+    let _: u32 = (8 + 4 + ops_bytes_len)
+        .try_into()
+        .map_err(|_| WalError::RecordTooLarge)?;
+
+    Ok(WAL_RECORD_HEADER_BYTES + ops_bytes_len)
 }
 
 fn encode_wal_record(seqno_base: u64, ops: &[Op]) -> anyhow::Result<Vec<u8>> {

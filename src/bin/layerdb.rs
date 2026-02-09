@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 
@@ -106,9 +107,9 @@ fn db_check(db: &Path) -> anyhow::Result<()> {
     }
 
     let records = manifest_adds(db)?;
-    let missing: Vec<_> = records
+    let results: Vec<anyhow::Result<(u8, u64)>> = records
         .par_iter()
-        .filter_map(|(_, add)| {
+        .map(|(_, add)| {
             let tier_dir = match add.tier {
                 layerdb::tier::StorageTier::Nvme => "sst",
                 layerdb::tier::StorageTier::Hdd => "sst_hdd",
@@ -117,17 +118,78 @@ fn db_check(db: &Path) -> anyhow::Result<()> {
             let path = db
                 .join(tier_dir)
                 .join(format!("sst_{:016x}.sst", add.file_id));
-            (!path.exists()).then_some(path)
+            if !path.exists() {
+                anyhow::bail!("missing referenced sst: {}", path.display());
+            }
+
+            let reader = layerdb::sst::SstReader::open(&path)
+                .with_context(|| format!("open sst {}", path.display()))?;
+            let props = reader.properties();
+
+            if props.table_root != add.table_root {
+                anyhow::bail!(
+                    "table root mismatch file_id={} path={} manifest={:?} file={:?}",
+                    add.file_id,
+                    path.display(),
+                    add.table_root,
+                    props.table_root
+                );
+            }
+            if props.format_version != add.sst_format_version {
+                anyhow::bail!(
+                    "format version mismatch file_id={} path={} manifest={} file={}",
+                    add.file_id,
+                    path.display(),
+                    add.sst_format_version,
+                    props.format_version
+                );
+            }
+            if props.smallest_user_key != add.smallest_user_key
+                || props.largest_user_key != add.largest_user_key
+            {
+                anyhow::bail!(
+                    "key range mismatch file_id={} path={}",
+                    add.file_id,
+                    path.display()
+                );
+            }
+            if props.max_seqno != add.max_seqno {
+                anyhow::bail!(
+                    "max_seqno mismatch file_id={} path={} manifest={} file={}",
+                    add.file_id,
+                    path.display(),
+                    add.max_seqno,
+                    props.max_seqno
+                );
+            }
+
+            let mut iter = reader.iter(u64::MAX)?;
+            iter.seek_to_first();
+            let mut entries = 0u64;
+            while let Some(next) = iter.next() {
+                let _ = next?;
+                entries += 1;
+            }
+            Ok((add.level, entries))
         })
         .collect();
 
-    if !missing.is_empty() {
-        for path in missing {
-            eprintln!("missing referenced sst: {}", path.display());
+    let mut totals: BTreeMap<u8, u64> = BTreeMap::new();
+    for result in results {
+        match result {
+            Ok((level, entries)) => {
+                *totals.entry(level).or_default() += entries;
+            }
+            Err(err) => {
+                eprintln!("db_check error: {err:#}");
+                anyhow::bail!("db_check failed");
+            }
         }
-        anyhow::bail!("db_check failed");
     }
 
+    for (level, entries) in totals {
+        println!("db_check: level={level} entries={entries}");
+    }
     println!("db_check ok: {} files referenced", records.len());
     Ok(())
 }

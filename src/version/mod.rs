@@ -13,6 +13,7 @@ use crate::db::{DbOptions, LookupResult, OpKind, Range, Value};
 use crate::internal_key::{InternalKey, KeyKind};
 use crate::range_tombstone::RangeTombstone;
 use crate::sst::{SstProperties, SstReader};
+use crate::tier::StorageTier;
 use crate::version::manifest::{AddFile, DeleteFile, Manifest, ManifestRecord, VersionEdit};
 
 /// Version set + manifest.
@@ -151,6 +152,14 @@ impl VersionSet {
             self.dir.join("sst_hdd")
         } else {
             self.dir.join("sst")
+        }
+    }
+
+    fn tier_for_level(&self, level: u8) -> StorageTier {
+        if self.options.enable_hdd_tier && level > self.options.hot_levels_max {
+            StorageTier::Hdd
+        } else {
+            StorageTier::Nvme
         }
     }
 
@@ -400,6 +409,8 @@ impl VersionSet {
             max_seqno: props.max_seqno,
             table_root: props.table_root,
             size_bytes: props.data_bytes + props.index_bytes,
+            tier: self.tier_for_level(0),
+            sst_format_version: props.format_version,
         };
         {
             let mut manifest = self.manifest.lock();
@@ -425,6 +436,8 @@ impl VersionSet {
                 max_seqno: props.max_seqno,
                 table_root: props.table_root,
                 size_bytes: props.data_bytes + props.index_bytes,
+                tier: self.tier_for_level(1),
+                sst_format_version: props.format_version,
             });
         }
 

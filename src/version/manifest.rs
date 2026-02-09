@@ -6,6 +6,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::sst::TableRoot;
+use crate::tier::StorageTier;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ManifestRecord {
@@ -34,6 +35,22 @@ pub struct AddFile {
     pub max_seqno: u64,
     pub table_root: TableRoot,
     pub size_bytes: u64,
+
+    /// Physical storage tier for this SST.
+    ///
+    /// Defaults to NVMe for backward compatibility with old manifest records.
+    #[serde(default)]
+    pub tier: StorageTier,
+
+    /// SST format version written by `SstBuilder`.
+    ///
+    /// Defaults to v1 for backward compatibility.
+    #[serde(default = "default_sst_format_version")]
+    pub sst_format_version: u32,
+}
+
+fn default_sst_format_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,6 +12,12 @@ pub enum StorageTier {
     S3,
 }
 
+impl Default for StorageTier {
+    fn default() -> Self {
+        Self::Nvme
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalFsTier {
     root: PathBuf,

@@ -109,7 +109,14 @@ fn db_check(db: &Path) -> anyhow::Result<()> {
     let missing: Vec<_> = records
         .par_iter()
         .filter_map(|(_, add)| {
-            let path = db.join("sst").join(format!("sst_{:016x}.sst", add.file_id));
+            let tier_dir = match add.tier {
+                layerdb::tier::StorageTier::Nvme => "sst",
+                layerdb::tier::StorageTier::Hdd => "sst_hdd",
+                layerdb::tier::StorageTier::S3 => "sst_s3",
+            };
+            let path = db
+                .join(tier_dir)
+                .join(format!("sst_{:016x}.sst", add.file_id));
             (!path.exists()).then_some(path)
         })
         .collect();
@@ -130,7 +137,14 @@ fn scrub(db: &Path) -> anyhow::Result<()> {
     let results: Vec<anyhow::Result<(u8, u64)>> = records
         .par_iter()
         .map(|(_, add)| {
-            let path = db.join("sst").join(format!("sst_{:016x}.sst", add.file_id));
+            let tier_dir = match add.tier {
+                layerdb::tier::StorageTier::Nvme => "sst",
+                layerdb::tier::StorageTier::Hdd => "sst_hdd",
+                layerdb::tier::StorageTier::S3 => "sst_s3",
+            };
+            let path = db
+                .join(tier_dir)
+                .join(format!("sst_{:016x}.sst", add.file_id));
             let reader = layerdb::sst::SstReader::open(&path)?;
             let mut iter = reader.iter(u64::MAX)?;
             iter.seek_to_first();

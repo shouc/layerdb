@@ -82,6 +82,10 @@ enum Command {
         #[arg(long)]
         db: PathBuf,
     },
+    GcLocal {
+        #[arg(long)]
+        db: PathBuf,
+    },
     DropBranch {
         #[arg(long)]
         db: PathBuf,
@@ -153,6 +157,7 @@ fn main() -> anyhow::Result<()> {
             max_files,
         } => thaw_level(&db, level, max_files),
         Command::GcS3 { db } => gc_s3(&db),
+        Command::GcLocal { db } => gc_local(&db),
         Command::DropBranch { db, name } => drop_branch(&db, &name),
         Command::CreateBranch { db, name } => create_branch(&db, &name),
         Command::Branches { db } => branches(&db),
@@ -568,6 +573,13 @@ fn gc_s3(db: &Path) -> anyhow::Result<()> {
     let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
     let removed = db.gc_orphaned_s3_files()?;
     println!("gc_s3 removed={removed}");
+    Ok(())
+}
+
+fn gc_local(db: &Path) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    let removed = db.gc_orphaned_local_files()?;
+    println!("gc_local removed={removed}");
     Ok(())
 }
 

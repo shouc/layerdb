@@ -312,6 +312,10 @@ impl Db {
         self.inner.versions.gc_orphaned_s3_files()
     }
 
+    pub fn gc_orphaned_local_files(&self) -> anyhow::Result<usize> {
+        self.inner.versions.gc_orphaned_local_files()
+    }
+
     pub fn frozen_objects(&self) -> Vec<crate::version::FrozenObjectMeta> {
         self.inner.versions.frozen_objects_snapshot()
     }

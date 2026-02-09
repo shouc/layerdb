@@ -121,7 +121,8 @@ Kinds:
 - `layerdb ingest-sst --db <path> --sst <file>` installs an external SST using
   manifest-safe durability ordering.
 - `layerdb rebalance-tiers --db <path>`, `freeze-level`, `thaw-level`,
-  `frozen-objects`, and `gc-s3` support local/HDD/S3 lifecycle workflows.
+  `frozen-objects`, `gc-s3`, and `gc-local` support local/HDD/S3 lifecycle
+  workflows.
 - `layerdb get --db <path> --key <k> [--branch <name>]` inspects visible values
   at either main (default) or an explicit branch head.
 - `layerdb retention-floor --db <path>` prints the effective sequence floor

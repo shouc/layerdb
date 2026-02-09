@@ -549,6 +549,51 @@ impl VersionSet {
         Ok(moved)
     }
 
+    pub fn gc_orphaned_local_files(&self) -> anyhow::Result<usize> {
+        let referenced: std::collections::HashSet<u64> = {
+            let guard = self.levels.read();
+            guard
+                .l0
+                .iter()
+                .chain(guard.l1.iter())
+                .map(|file| file.file_id)
+                .collect()
+        };
+
+        let mut removed = 0usize;
+        for dir in [
+            self.dir.join("sst"),
+            self.dir.join("sst_hdd"),
+            self.dir.join("sst_cache"),
+        ] {
+            if !dir.exists() {
+                continue;
+            }
+
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("sst") {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let Some(file_id) = parse_sst_file_id(name) else {
+                    continue;
+                };
+
+                if referenced.contains(&file_id) {
+                    continue;
+                }
+
+                std::fs::remove_file(&path)?;
+                removed += 1;
+            }
+        }
+
+        Ok(removed)
+    }
+
     pub fn gc_orphaned_s3_files(&self) -> anyhow::Result<usize> {
         let referenced: std::collections::HashSet<u64> = {
             let guard = self.levels.read();

@@ -130,5 +130,7 @@ Kinds:
   the selected branch head (default: `main`).
 - `layerdb write-batch --db <path> --op <put:key:val|del:key>...` applies an
   atomic point-op batch to the selected branch head.
+- `layerdb delete-range --db <path> --start <a> --end <b> [--branch <name>]`
+  appends a half-open range tombstone `[start, end)` to the selected branch head.
 - `layerdb retention-floor --db <path>` prints the effective sequence floor
   retained for snapshot+branch compaction safety.

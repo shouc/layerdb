@@ -146,6 +146,18 @@ enum Command {
         #[arg(long, default_value_t = true)]
         sync: bool,
     },
+    DeleteRange {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        start: String,
+        #[arg(long)]
+        end: String,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long, default_value_t = true)]
+        sync: bool,
+    },
     RetentionFloor {
         #[arg(long)]
         db: PathBuf,
@@ -214,6 +226,13 @@ fn main() -> anyhow::Result<()> {
             branch,
             sync,
         } => write_batch_cmd(&db, &ops, branch.as_deref(), sync),
+        Command::DeleteRange {
+            db,
+            start,
+            end,
+            branch,
+            sync,
+        } => delete_range_cmd(&db, &start, &end, branch.as_deref(), sync),
         Command::RetentionFloor { db } => retention_floor_cmd(&db),
     }
 }
@@ -760,6 +779,27 @@ fn write_batch_cmd(
 
     db.write_batch(parsed.clone(), layerdb::WriteOptions { sync })?;
     println!("write_batch ops={} sync={sync}", parsed.len());
+    Ok(())
+}
+
+fn delete_range_cmd(
+    db: &Path,
+    start: &str,
+    end: &str,
+    branch: Option<&str>,
+    sync: bool,
+) -> anyhow::Result<()> {
+    if start >= end {
+        anyhow::bail!("delete-range requires start < end");
+    }
+
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    if let Some(branch_name) = branch {
+        db.checkout(branch_name)?;
+    }
+
+    db.delete_range(start.to_string(), end.to_string(), layerdb::WriteOptions { sync })?;
+    println!("delete_range start={start} end={end} sync={sync}");
     Ok(())
 }
 

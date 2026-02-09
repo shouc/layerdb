@@ -20,7 +20,8 @@ use crate::range_tombstone::RangeTombstone;
 use crate::sst::{SstIoContext, SstProperties, SstReader};
 use crate::tier::StorageTier;
 use crate::version::manifest::{
-    AddFile, DeleteFile, DropBranch, FreezeFile, Manifest, ManifestRecord, MoveFile, VersionEdit,
+    AddFile, BranchArchive, DeleteFile, DropBranch, DropBranchArchive, FreezeFile, Manifest,
+    ManifestRecord, MoveFile, VersionEdit,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -113,6 +114,7 @@ pub struct VersionSet {
     branches: RwLock<std::collections::BTreeMap<String, u64>>,
     current_branch: RwLock<String>,
     frozen_objects: RwLock<std::collections::BTreeMap<u64, FrozenObjectMeta>>,
+    branch_archives: RwLock<std::collections::BTreeMap<String, BranchArchive>>,
     tier_counters: TierCounters,
 }
 
@@ -179,6 +181,8 @@ impl VersionSet {
             );
         }
 
+        let branch_archives = state.branch_archives;
+
         let sst_io_ctx = if options.sst_use_io_executor_reads || options.sst_use_io_executor_writes {
             Some(Arc::new(SstIoContext::new(
                 crate::io::UringExecutor::new(options.io_max_in_flight.max(1)),
@@ -205,6 +209,7 @@ impl VersionSet {
             branches: RwLock::new(branches),
             current_branch: RwLock::new("main".to_string()),
             frozen_objects: RwLock::new(frozen_objects),
+            branch_archives: RwLock::new(branch_archives),
             tier_counters: TierCounters::default(),
         })
     }
@@ -297,6 +302,43 @@ impl VersionSet {
             .iter()
             .map(|(name, seq)| (name.clone(), *seq))
             .collect()
+    }
+
+    pub fn list_branch_archives(&self) -> Vec<BranchArchive> {
+        self.branch_archives
+            .read()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn add_branch_archive(&self, archive: BranchArchive) -> anyhow::Result<()> {
+        {
+            let mut manifest = self.manifest.lock();
+            manifest.append(&ManifestRecord::BranchArchive(archive.clone()), true)?;
+            manifest.sync_dir()?;
+        }
+
+        self.branch_archives
+            .write()
+            .insert(archive.archive_id.clone(), archive);
+        Ok(())
+    }
+
+    pub fn drop_branch_archive(&self, archive_id: &str) -> anyhow::Result<()> {
+        {
+            let mut manifest = self.manifest.lock();
+            manifest.append(
+                &ManifestRecord::DropBranchArchive(DropBranchArchive {
+                    archive_id: archive_id.to_string(),
+                }),
+                true,
+            )?;
+            manifest.sync_dir()?;
+        }
+
+        self.branch_archives.write().remove(archive_id);
+        Ok(())
     }
 
     pub fn current_branch(&self) -> String {

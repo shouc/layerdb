@@ -2,7 +2,7 @@ mod options;
 pub(crate) mod snapshot;
 
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -109,7 +109,6 @@ pub struct Db {
 }
 
 struct DbInner {
-    dir: PathBuf,
     options: DbOptions,
     wal: Wal,
     memtables: Arc<MemTableManager>,
@@ -129,7 +128,6 @@ impl Db {
 
         Ok(Self {
             inner: Arc::new(DbInner {
-                dir,
                 options,
                 wal,
                 memtables,
@@ -220,6 +218,45 @@ impl Db {
 
     pub fn list_branches(&self) -> Vec<(String, u64)> {
         self.inner.versions.list_branches()
+    }
+
+    pub fn list_archives(&self) -> Vec<crate::version::manifest::BranchArchive> {
+        self.inner.versions.list_branch_archives()
+    }
+
+    pub fn add_archive(
+        &self,
+        archive_id: impl Into<String>,
+        branch: impl Into<String>,
+        seqno: u64,
+        archive_path: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .versions
+            .add_branch_archive(crate::version::manifest::BranchArchive {
+                archive_id: archive_id.into(),
+                branch: branch.into(),
+                seqno,
+                archive_path: archive_path.into(),
+            })
+    }
+
+    pub fn drop_archive(&self, archive_id: &str) -> anyhow::Result<()> {
+        self.inner.versions.drop_branch_archive(archive_id)
+    }
+
+    pub fn gc_archives(&self) -> anyhow::Result<usize> {
+        let archives = self.list_archives();
+        let mut removed = 0usize;
+        for archive in archives {
+            if Path::new(&archive.archive_path).exists() {
+                continue;
+            }
+
+            self.drop_archive(&archive.archive_id)?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     pub fn current_branch(&self) -> String {

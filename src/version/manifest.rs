@@ -17,6 +17,8 @@ pub enum ManifestRecord {
     VersionEdit(VersionEdit),
     BranchHead(BranchHead),
     DropBranch(DropBranch),
+    BranchArchive(BranchArchive),
+    DropBranchArchive(DropBranchArchive),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -89,11 +91,26 @@ pub struct DropBranch {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchArchive {
+    pub archive_id: String,
+    pub branch: String,
+    pub seqno: u64,
+    #[serde(alias = "relative_path")]
+    pub archive_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DropBranchArchive {
+    pub archive_id: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ManifestState {
     pub levels: BTreeMap<u8, BTreeMap<u64, AddFile>>,
     pub branches: BTreeMap<String, u64>,
     pub frozen_objects: BTreeMap<u64, FreezeFile>,
+    pub branch_archives: BTreeMap<String, BranchArchive>,
 }
 
 #[derive(Debug)]
@@ -214,6 +231,14 @@ fn apply_record(state: &mut ManifestState, record: ManifestRecord) {
         }
         ManifestRecord::DropBranch(drop_branch) => {
             state.branches.remove(&drop_branch.name);
+        }
+        ManifestRecord::BranchArchive(archive) => {
+            state
+                .branch_archives
+                .insert(archive.archive_id.clone(), archive);
+        }
+        ManifestRecord::DropBranchArchive(drop) => {
+            state.branch_archives.remove(&drop.archive_id);
         }
     }
 }

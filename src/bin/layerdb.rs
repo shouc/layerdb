@@ -130,6 +130,20 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    ListArchives {
+        #[arg(long)]
+        db: PathBuf,
+    },
+    DropArchive {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        archive_id: String,
+    },
+    GcArchives {
+        #[arg(long)]
+        db: PathBuf,
+    },
     Get {
         #[arg(long)]
         db: PathBuf,
@@ -252,6 +266,9 @@ fn main() -> anyhow::Result<()> {
         Command::Branches { db } => branches(&db),
         Command::FrozenObjects { db } => frozen_objects(&db),
         Command::ArchiveBranch { db, name, out } => archive_branch_cmd(&db, &name, &out),
+        Command::ListArchives { db } => list_archives_cmd(&db),
+        Command::DropArchive { db, archive_id } => drop_archive_cmd(&db, &archive_id),
+        Command::GcArchives { db } => gc_archives_cmd(&db),
         Command::Get { db, key, branch } => get_cmd(&db, &key, branch.as_deref()),
         Command::Scan {
             db,
@@ -288,6 +305,34 @@ fn main() -> anyhow::Result<()> {
         Command::RetentionFloor { db } => retention_floor_cmd(&db),
         Command::Metrics { db } => metrics_cmd(&db),
     }
+}
+
+fn list_archives_cmd(db: &Path) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    for archive in db.list_archives() {
+        println!(
+            "archive id={} branch={} seqno={} path={}",
+            archive.archive_id,
+            archive.branch,
+            archive.seqno,
+            archive.archive_path
+        );
+    }
+    Ok(())
+}
+
+fn drop_archive_cmd(db: &Path, archive_id: &str) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    db.drop_archive(archive_id)?;
+    println!("drop_archive id={archive_id}");
+    Ok(())
+}
+
+fn gc_archives_cmd(db: &Path) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    let removed = db.gc_archives()?;
+    println!("gc_archives removed={removed}");
+    Ok(())
 }
 
 fn manifest_dump(db: &Path) -> anyhow::Result<()> {
@@ -805,8 +850,15 @@ fn archive_branch_cmd(db: &Path, name: &str, out: &Path) -> anyhow::Result<()> {
 
     let props = builder.finish()?;
     let out_file = out.join(format!("sst_{file_id:016x}.sst"));
+    let archive_id = format!("{name}-{branch_seqno}-{file_id:016x}");
+    db.add_archive(
+        archive_id.clone(),
+        name,
+        branch_seqno,
+        out_file.to_string_lossy().into_owned(),
+    )?;
     println!(
-        "archive_branch name={name} seqno={branch_seqno} entries={entries} out={} table_root={:?}",
+        "archive_branch name={name} archive_id={archive_id} seqno={branch_seqno} entries={entries} out={} table_root={:?}",
         out_file.display(),
         props.table_root,
     );
@@ -1153,6 +1205,8 @@ fn manifest_files(
             }
             layerdb::version::manifest::ManifestRecord::BranchHead(_) => {}
             layerdb::version::manifest::ManifestRecord::DropBranch(_) => {}
+            layerdb::version::manifest::ManifestRecord::BranchArchive(_) => {}
+            layerdb::version::manifest::ManifestRecord::DropBranchArchive(_) => {}
         }
         offset += len;
     }

@@ -89,6 +89,7 @@ fn archive_branch_cli_exports_branch_snapshot_sst() -> anyhow::Result<()> {
         stdout.contains("archive_branch name=feature"),
         "stdout={stdout}"
     );
+    assert!(stdout.contains("archive_id="), "stdout={stdout}");
     assert!(stdout.contains("entries=2"), "stdout={stdout}");
 
     let archive_sst = std::fs::read_dir(out_dir.path())?

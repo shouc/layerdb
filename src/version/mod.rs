@@ -379,6 +379,18 @@ impl VersionSet {
         self.snapshots.latest_seqno()
     }
 
+    fn min_retained_seqno(&self) -> u64 {
+        let min_snapshot = self.snapshots.min_pinned_seqno();
+        let min_branch = self
+            .branches
+            .read()
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(min_snapshot);
+        min_snapshot.min(min_branch)
+    }
+
     pub(crate) fn snapshots_handle(&self) -> Arc<SnapshotTracker> {
         self.snapshots.clone()
     }
@@ -870,7 +882,7 @@ impl VersionSet {
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let min_snapshot_seqno = self.snapshots.min_pinned_seqno();
+        let min_snapshot_seqno = self.min_retained_seqno();
         let mut out_entries = Vec::with_capacity(entries.len());
         let mut idx = 0usize;
         while idx < entries.len() {

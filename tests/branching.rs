@@ -250,3 +250,33 @@ fn drop_main_branch_is_rejected() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn compaction_preserves_branch_history_without_pinned_snapshot() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db = Db::open(dir.path(), options())?;
+
+    db.put(&b"k"[..], &b"v1"[..], WriteOptions { sync: true })?;
+    let snap_v1 = db.create_snapshot()?;
+    db.create_branch("feature", Some(snap_v1))?;
+    db.release_snapshot(snap_v1);
+
+    db.delete(&b"k"[..], WriteOptions { sync: true })?;
+    db.put(&b"k"[..], &b"v3"[..], WriteOptions { sync: true })?;
+
+    db.compact_range(None)?;
+
+    db.checkout("main")?;
+    assert_eq!(
+        db.get(b"k", ReadOptions::default())?,
+        Some(bytes::Bytes::from("v3"))
+    );
+
+    db.checkout("feature")?;
+    assert_eq!(
+        db.get(b"k", ReadOptions::default())?,
+        Some(bytes::Bytes::from("v1"))
+    );
+
+    Ok(())
+}

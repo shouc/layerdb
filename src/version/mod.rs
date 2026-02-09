@@ -1,6 +1,6 @@
 pub mod manifest;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1554,6 +1554,7 @@ impl VersionSet {
 
         let mut compact_inputs = Vec::new();
         compact_inputs.extend(l0_in_range.clone());
+        let mut l1_inputs = Vec::new();
         for file in &l1 {
             if overlaps(
                 &smallest,
@@ -1561,9 +1562,13 @@ impl VersionSet {
                 &file.smallest_user_key,
                 &file.largest_user_key,
             ) {
+                l1_inputs.push(file.clone());
                 compact_inputs.push(file.clone());
             }
         }
+
+        let can_drop_obsolete_point_tombstones =
+            self.compaction_inputs_fully_cover_range(&l0_in_range, &l1_inputs, &smallest, &largest);
 
         let mut entries = Vec::new();
         for file in &compact_inputs {
@@ -1588,32 +1593,24 @@ impl VersionSet {
         let mut idx = 0usize;
         while idx < entries.len() {
             let user_key = entries[idx].0.user_key.clone();
-            let mut kept_point_below_min = false;
+            let mut group = Vec::new();
             while idx < entries.len() && entries[idx].0.user_key == user_key {
-                let (ikey, value) = &entries[idx];
-                match ikey.kind {
-                    KeyKind::Put | KeyKind::Del => {
-                        if ikey.seqno >= min_snapshot_seqno {
-                            out_entries.push((ikey.clone(), value.clone()));
-                        } else if !kept_point_below_min {
-                            kept_point_below_min = true;
-                            if ikey.kind == KeyKind::Put {
-                                out_entries.push((ikey.clone(), value.clone()));
-                            }
-                        }
-                    }
-                    KeyKind::RangeDel => {
-                        // Range tombstone dropping is handled conservatively
-                        // by `drop_obsolete_range_tombstones_bottommost`.
-                        out_entries.push((ikey.clone(), value.clone()));
-                    }
-                    _ => {}
-                }
+                group.push(entries[idx].clone());
                 idx += 1;
             }
+
+            out_entries.extend(compact_user_key_entries(
+                group,
+                min_snapshot_seqno,
+                can_drop_obsolete_point_tombstones,
+            ));
         }
 
-        out_entries = drop_obsolete_range_tombstones_bottommost(out_entries, min_snapshot_seqno);
+        out_entries = drop_obsolete_range_tombstones_bottommost(
+            out_entries,
+            min_snapshot_seqno,
+            can_drop_obsolete_point_tombstones,
+        );
 
         if out_entries.is_empty() {
             return Ok(());
@@ -1820,6 +1817,24 @@ impl VersionSet {
         }
         Ok(())
     }
+
+    fn compaction_inputs_fully_cover_range(
+        &self,
+        selected_l0: &[AddFile],
+        selected_l1: &[AddFile],
+        smallest: &[u8],
+        largest: &[u8],
+    ) -> bool {
+        let guard = self.levels.read();
+        compaction_inputs_cover_overlaps(
+            &guard.l0,
+            &guard.l1,
+            selected_l0,
+            selected_l1,
+            smallest,
+            largest,
+        )
+    }
 }
 
 fn parse_object_file_id(object_id: &str) -> Option<u64> {
@@ -1899,10 +1914,88 @@ fn estimate_overlap_bytes(files: &[AddFile]) -> u64 {
     overlap
 }
 
+fn compaction_inputs_cover_overlaps(
+    all_l0: &[AddFile],
+    all_l1: &[AddFile],
+    selected_l0: &[AddFile],
+    selected_l1: &[AddFile],
+    smallest: &[u8],
+    largest: &[u8],
+) -> bool {
+    let selected_l0_ids: HashSet<u64> = selected_l0.iter().map(|f| f.file_id).collect();
+    let selected_l1_ids: HashSet<u64> = selected_l1.iter().map(|f| f.file_id).collect();
+
+    for file in all_l0 {
+        if overlaps(
+            smallest,
+            largest,
+            file.smallest_user_key.as_ref(),
+            file.largest_user_key.as_ref(),
+        ) && !selected_l0_ids.contains(&file.file_id)
+        {
+            return false;
+        }
+    }
+
+    for file in all_l1 {
+        if overlaps(
+            smallest,
+            largest,
+            file.smallest_user_key.as_ref(),
+            file.largest_user_key.as_ref(),
+        ) && !selected_l1_ids.contains(&file.file_id)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn compact_user_key_entries(
+    entries: Vec<(InternalKey, Bytes)>,
+    min_snapshot_seqno: u64,
+    can_drop_obsolete_point_tombstones: bool,
+) -> Vec<(InternalKey, Bytes)> {
+    let mut out = Vec::new();
+    let mut kept_one_below_min = false;
+
+    for (ikey, value) in entries {
+        match ikey.kind {
+            KeyKind::Put | KeyKind::Del => {
+                if ikey.seqno >= min_snapshot_seqno {
+                    out.push((ikey, value));
+                    continue;
+                }
+
+                if kept_one_below_min {
+                    continue;
+                }
+
+                kept_one_below_min = true;
+                if ikey.kind == KeyKind::Put || !can_drop_obsolete_point_tombstones {
+                    out.push((ikey, value));
+                }
+            }
+            KeyKind::RangeDel => {
+                out.push((ikey, value));
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
 fn drop_obsolete_range_tombstones_bottommost(
     entries: Vec<(InternalKey, Bytes)>,
     min_snapshot_seqno: u64,
+    can_drop_obsolete_range_tombstones: bool,
 ) -> Vec<(InternalKey, Bytes)> {
+    if !can_drop_obsolete_range_tombstones {
+        return entries;
+    }
+
     let droppable: Vec<RangeTombstone> = entries
         .iter()
         .filter_map(|(key, value)| {

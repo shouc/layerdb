@@ -159,7 +159,12 @@ impl VersionSet {
         let mut compact_inputs = Vec::new();
         compact_inputs.extend(l0.clone());
         for file in &l1 {
-            if overlaps(&smallest, &largest, &file.smallest_user_key, &file.largest_user_key) {
+            if overlaps(
+                &smallest,
+                &largest,
+                &file.smallest_user_key,
+                &file.largest_user_key,
+            ) {
                 compact_inputs.push(file.clone());
             }
         }
@@ -273,7 +278,9 @@ impl VersionSet {
 
             // Add compaction outputs to L1.
             guard.l1.extend(adds);
-            guard.l1.sort_by(|a, b| a.smallest_user_key.cmp(&b.smallest_user_key));
+            guard
+                .l1
+                .sort_by(|a, b| a.smallest_user_key.cmp(&b.smallest_user_key));
         }
 
         // Once manifest deletions are durable, remove old files from disk.
@@ -305,12 +312,7 @@ fn find_l1_file<'a>(l1: &'a [AddFile], key: &[u8]) -> Option<&'a AddFile> {
     None
 }
 
-fn overlaps(
-    a_smallest: &[u8],
-    a_largest: &[u8],
-    b_smallest: &[u8],
-    b_largest: &[u8],
-) -> bool {
+fn overlaps(a_smallest: &[u8], a_largest: &[u8], b_smallest: &[u8], b_largest: &[u8]) -> bool {
     !(a_largest < b_smallest || b_largest < a_smallest)
 }
 

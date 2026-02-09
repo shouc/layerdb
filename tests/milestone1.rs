@@ -25,7 +25,10 @@ fn recover_from_wal_and_manifest() -> anyhow::Result<()> {
     {
         let db = Db::open(dir.path(), small_options())?;
         assert_eq!(db.get(b"a", ReadOptions::default())?, None);
-        assert_eq!(db.get(b"b", ReadOptions::default())?, Some(bytes::Bytes::from("2")));
+        assert_eq!(
+            db.get(b"b", ReadOptions::default())?,
+            Some(bytes::Bytes::from("2"))
+        );
     }
     Ok(())
 }

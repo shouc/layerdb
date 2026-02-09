@@ -188,9 +188,7 @@ fn bench(db: &Path, keys: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn manifest_adds(
-    db: &Path,
-) -> anyhow::Result<Vec<(usize, layerdb::version::manifest::AddFile)>> {
+fn manifest_adds(db: &Path) -> anyhow::Result<Vec<(usize, layerdb::version::manifest::AddFile)>> {
     let data = std::fs::read(db.join("MANIFEST"))?;
     let mut offset = 0usize;
     let mut adds: BTreeMap<u64, layerdb::version::manifest::AddFile> = BTreeMap::new();

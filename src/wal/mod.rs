@@ -92,7 +92,9 @@ impl Wal {
         let _ = flush_tx.send(FlushSignal::Kick);
         let base_seqno = versions.latest_seqno().saturating_add(1);
         let next_seqno_value = recovered.next_seqno.max(base_seqno).max(1);
-        let last_durable = recovered.last_durable_seqno.max(base_seqno.saturating_sub(1));
+        let last_durable = recovered
+            .last_durable_seqno
+            .max(base_seqno.saturating_sub(1));
 
         next_seqno.store(next_seqno_value, Ordering::Relaxed);
         last_durable_seqno.store(last_durable, Ordering::Relaxed);
@@ -262,9 +264,7 @@ fn flush_one(state: &mut FlushState, mem: &crate::memtable::MemTable) -> anyhow:
 }
 
 fn maybe_delete_wal_segment(dir: &Path, segment_id: u64) {
-    let wal_path = dir
-        .join("wal")
-        .join(format!("wal_{segment_id:016x}.log"));
+    let wal_path = dir.join("wal").join(format!("wal_{segment_id:016x}.log"));
     let _ = std::fs::remove_file(wal_path);
 }
 

@@ -37,11 +37,7 @@ fn value_bytes(value: u8) -> Vec<u8> {
     vec![b'0' + (value % 10)]
 }
 
-fn ref_apply(
-    model: &mut BTreeMap<Vec<u8>, Vec<(u64, Option<Vec<u8>>)>>,
-    seqno: u64,
-    op: &MiniOp,
-) {
+fn ref_apply(model: &mut BTreeMap<Vec<u8>, Vec<(u64, Option<Vec<u8>>)>>, seqno: u64, op: &MiniOp) {
     match op {
         MiniOp::Put { key, value } => {
             model

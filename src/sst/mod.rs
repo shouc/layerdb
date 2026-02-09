@@ -274,6 +274,7 @@ pub struct SstReader {
     mmap: Mmap,
     index: Vec<IndexEntry>,
     props: SstProperties,
+    range_tombstones_cache: parking_lot::Mutex<Option<Vec<RangeTombstone>>>,
 }
 
 impl SstReader {
@@ -312,6 +313,7 @@ impl SstReader {
             mmap,
             index,
             props,
+            range_tombstones_cache: parking_lot::Mutex::new(None),
         })
     }
 
@@ -324,12 +326,7 @@ impl SstReader {
         user_key: &[u8],
         snapshot_seqno: u64,
     ) -> Result<Option<(u64, Option<Bytes>)>, SstError> {
-        let tombstone_seq = self
-            .range_tombstones(snapshot_seqno)?
-            .iter()
-            .filter(|t| t.start_key.as_ref() <= user_key && user_key < t.end_key.as_ref())
-            .map(|t| t.seqno)
-            .max();
+        let tombstone_seq = self.max_covering_tombstone_seq(user_key, snapshot_seqno)?;
 
         let target = InternalKey::new(
             Bytes::copy_from_slice(user_key),
@@ -373,8 +370,38 @@ impl SstReader {
     }
 
     pub fn range_tombstones(&self, snapshot_seqno: u64) -> Result<Vec<RangeTombstone>, SstError> {
+        let all = self.load_range_tombstones_all()?;
+        Ok(all
+            .iter()
+            .filter(|t| t.seqno <= snapshot_seqno)
+            .cloned()
+            .collect())
+    }
+
+    fn max_covering_tombstone_seq(
+        &self,
+        user_key: &[u8],
+        snapshot_seqno: u64,
+    ) -> Result<Option<u64>, SstError> {
+        let all = self.load_range_tombstones_all()?;
+        Ok(all
+            .iter()
+            .filter(|t| {
+                t.seqno <= snapshot_seqno
+                    && t.start_key.as_ref() <= user_key
+                    && user_key < t.end_key.as_ref()
+            })
+            .map(|t| t.seqno)
+            .max())
+    }
+
+    fn load_range_tombstones_all(&self) -> Result<Vec<RangeTombstone>, SstError> {
+        if let Some(cached) = self.range_tombstones_cache.lock().as_ref() {
+            return Ok(cached.clone());
+        }
+
         let mut out = Vec::new();
-        let mut iter = self.iter(snapshot_seqno)?;
+        let mut iter = self.iter(u64::MAX)?;
         iter.seek_to_first();
         while let Some(next) = iter.next() {
             let (key, seqno, kind, value) = next?;
@@ -387,6 +414,8 @@ impl SstReader {
                 seqno,
             });
         }
+        out.sort_by(|a, b| b.seqno.cmp(&a.seqno));
+        *self.range_tombstones_cache.lock() = Some(out.clone());
         Ok(out)
     }
 

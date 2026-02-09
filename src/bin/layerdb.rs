@@ -102,6 +102,12 @@ enum Command {
         #[arg(long)]
         from_seqno: Option<u64>,
     },
+    Checkout {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        name: String,
+    },
     Branches {
         #[arg(long)]
         db: PathBuf,
@@ -223,6 +229,7 @@ fn main() -> anyhow::Result<()> {
             from_branch,
             from_seqno,
         } => create_branch(&db, &name, from_branch.as_deref(), from_seqno),
+        Command::Checkout { db, name } => checkout_branch_cmd(&db, &name),
         Command::Branches { db } => branches(&db),
         Command::FrozenObjects { db } => frozen_objects(&db),
         Command::Get { db, key, branch } => get_cmd(&db, &key, branch.as_deref()),
@@ -712,6 +719,13 @@ fn create_branch(
         }
         (Some(_), Some(_)) => unreachable!("validated mutually exclusive options"),
     }
+    Ok(())
+}
+
+fn checkout_branch_cmd(db: &Path, name: &str) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    db.checkout(name)?;
+    println!("checkout name={name}");
     Ok(())
 }
 

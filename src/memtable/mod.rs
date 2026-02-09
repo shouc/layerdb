@@ -218,18 +218,12 @@ impl MemTable {
     }
 
     pub(crate) fn to_sorted_entries(&self) -> Vec<(InternalKey, Bytes)> {
-        let per_shard: Vec<Vec<(InternalKey, Bytes)>> = self
-            .shards
-            .par_iter()
-            .map(|shard| {
-                shard
-                    .map
-                    .iter()
-                    .map(|e| (e.key().clone(), e.value().clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let mut out: Vec<(InternalKey, Bytes)> = per_shard.into_iter().flatten().collect();
+        let mut out: Vec<(InternalKey, Bytes)> = Vec::new();
+        for shard in &self.shards {
+            for entry in shard.map.iter() {
+                out.push((entry.key().clone(), entry.value().clone()));
+            }
+        }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }

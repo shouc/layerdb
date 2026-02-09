@@ -3,6 +3,7 @@ pub(crate) mod snapshot;
 
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -89,6 +90,7 @@ impl Range {
 /// - Explicit snapshots provide consistent reads at a seqno.
 pub struct Db {
     inner: Arc<DbInner>,
+    read_snapshot: Arc<AtomicU64>,
 }
 
 struct DbInner {
@@ -108,6 +110,7 @@ impl Db {
         let memtables = Arc::new(MemTableManager::new(options.memtable_shards));
         let wal =
             Wal::open(&dir, &options, memtables.clone(), versions.clone()).context("open wal")?;
+        let read_snapshot = Arc::new(AtomicU64::new(versions.latest_seqno()));
 
         Ok(Self {
             inner: Arc::new(DbInner {
@@ -117,6 +120,7 @@ impl Db {
                 memtables,
                 versions,
             }),
+            read_snapshot,
         })
     }
 
@@ -143,19 +147,55 @@ impl Db {
     }
 
     pub fn write_batch(&self, ops: Vec<Op>, opts: WriteOptions) -> anyhow::Result<()> {
-        self.inner.wal.write_batch(&ops, opts)
+        self.inner.wal.write_batch(&ops, opts)?;
+        self.read_snapshot
+            .store(self.inner.wal.last_durable_seqno(), Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn create_snapshot(&self) -> anyhow::Result<SnapshotId> {
-        self.inner.versions.snapshots().create_snapshot()
+        self.inner
+            .versions
+            .snapshots()
+            .create_snapshot_at(self.default_read_snapshot())
     }
 
-    pub fn get(&self, key: impl AsRef<[u8]>, opts: ReadOptions) -> anyhow::Result<Option<Value>> {
-        let snapshot = self
+    pub fn create_branch(
+        &self,
+        name: impl AsRef<str>,
+        from_snapshot: Option<SnapshotId>,
+    ) -> anyhow::Result<()> {
+        let seqno = self
             .inner
             .versions
             .snapshots()
-            .resolve_read_snapshot(opts.snapshot)?;
+            .resolve_read_snapshot(from_snapshot)?;
+        self.inner.versions.create_branch(name.as_ref(), seqno)
+    }
+
+    pub fn checkout(&self, branch: impl AsRef<str>) -> anyhow::Result<()> {
+        let seqno = self.inner.versions.checkout_branch(branch.as_ref())?;
+        self.read_snapshot.store(seqno, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn list_branches(&self) -> Vec<(String, u64)> {
+        self.inner.versions.list_branches()
+    }
+
+    pub fn current_branch(&self) -> String {
+        self.inner.versions.current_branch()
+    }
+
+    pub fn get(&self, key: impl AsRef<[u8]>, opts: ReadOptions) -> anyhow::Result<Option<Value>> {
+        let snapshot = match opts.snapshot {
+            Some(snapshot) => self
+                .inner
+                .versions
+                .snapshots()
+                .resolve_read_snapshot(Some(snapshot))?,
+            None => self.default_read_snapshot(),
+        };
 
         let mem = self
             .inner
@@ -185,11 +225,14 @@ impl Db {
     }
 
     pub fn iter(&self, range: Range, opts: ReadOptions) -> anyhow::Result<crate::db::DbIterator> {
-        let snapshot = self
-            .inner
-            .versions
-            .snapshots()
-            .resolve_read_snapshot(opts.snapshot)?;
+        let snapshot = match opts.snapshot {
+            Some(snapshot) => self
+                .inner
+                .versions
+                .snapshots()
+                .resolve_read_snapshot(Some(snapshot))?,
+            None => self.default_read_snapshot(),
+        };
 
         let mut range_tombstones = self.inner.memtables.range_tombstones(snapshot);
         range_tombstones.extend(self.inner.versions.range_tombstones(snapshot)?);
@@ -211,6 +254,10 @@ impl Db {
 
     pub fn ingest_sst(&self, _sst_path: impl AsRef<Path>) -> anyhow::Result<()> {
         anyhow::bail!("ingest_sst not implemented in v1")
+    }
+
+    fn default_read_snapshot(&self) -> u64 {
+        self.read_snapshot.load(Ordering::Relaxed)
     }
 }
 

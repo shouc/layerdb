@@ -12,6 +12,7 @@ pub enum ManifestRecord {
     AddFile(AddFile),
     DeleteFile(DeleteFile),
     VersionEdit(VersionEdit),
+    BranchHead(BranchHead),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -41,9 +42,16 @@ pub struct DeleteFile {
     pub level: u8,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchHead {
+    pub name: String,
+    pub seqno: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ManifestState {
     pub levels: BTreeMap<u8, BTreeMap<u64, AddFile>>,
+    pub branches: BTreeMap<String, u64>,
 }
 
 #[derive(Debug)]
@@ -136,6 +144,9 @@ fn apply_record(state: &mut ManifestState, record: ManifestRecord) {
                     level.remove(&del.file_id);
                 }
             }
+        }
+        ManifestRecord::BranchHead(branch) => {
+            state.branches.insert(branch.name, branch.seqno);
         }
     }
 }

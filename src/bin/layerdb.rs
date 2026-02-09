@@ -216,6 +216,7 @@ fn manifest_adds(db: &Path) -> anyhow::Result<Vec<(usize, layerdb::version::mani
                     adds.remove(&del.file_id);
                 }
             }
+            layerdb::version::manifest::ManifestRecord::BranchHead(_) => {}
         }
         offset += len;
     }

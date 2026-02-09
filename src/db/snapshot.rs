@@ -49,8 +49,16 @@ impl SnapshotTracker {
     }
 
     pub fn create_snapshot(&self) -> anyhow::Result<SnapshotId> {
+        self.create_snapshot_at(self.latest_seqno())
+    }
+
+    pub fn create_snapshot_at(&self, seqno: u64) -> anyhow::Result<SnapshotId> {
+        let latest = self.latest_seqno();
+        if seqno > latest {
+            anyhow::bail!("snapshot seqno {seqno} is ahead of latest {latest}");
+        }
+
         let id = SnapshotId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let seqno = self.latest_seqno();
         self.inner.lock().pinned.insert(id.0, seqno);
         Ok(id)
     }

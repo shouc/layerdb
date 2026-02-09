@@ -11,6 +11,8 @@ Implementation details may evolve, but these invariants must remain true.
 - `get(key, ReadOptions { snapshot })`
 - `iter(range, ReadOptions { snapshot })`
 - `create_snapshot() -> SnapshotId`
+- `create_branch(name, from_snapshot)` (optional)
+- `checkout(branch)` (optional)
 - `compact_range(optional range)` (manual trigger)
 - `ingest_sst(sst_path)` (optional; not implemented in v1)
 

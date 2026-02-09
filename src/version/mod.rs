@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use parking_lot::RwLock;
 
 use crate::db::iterator::range_contains;
 use crate::db::snapshot::SnapshotTracker;
@@ -24,6 +25,8 @@ pub struct VersionSet {
     levels: parking_lot::RwLock<Levels>,
     manifest: parking_lot::Mutex<Manifest>,
     reader_cache: crate::cache::ClockProCache<PathBuf, SstReader>,
+    branches: RwLock<std::collections::BTreeMap<String, u64>>,
+    current_branch: RwLock<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -58,6 +61,10 @@ impl VersionSet {
         l1.sort_by(|a, b| a.smallest_user_key.cmp(&b.smallest_user_key));
         let snapshots = Arc::new(SnapshotTracker::new());
         snapshots.set_latest_seqno(max_seqno);
+
+        let mut branches = state.branches;
+        branches.entry("main".to_string()).or_insert(max_seqno);
+
         Ok(Self {
             dir: dir.to_path_buf(),
             options: options.clone(),
@@ -66,7 +73,67 @@ impl VersionSet {
             levels: parking_lot::RwLock::new(Levels { l0, l1 }),
             manifest: parking_lot::Mutex::new(manifest),
             reader_cache: crate::cache::ClockProCache::new(options.sst_reader_cache_entries),
+            branches: RwLock::new(branches),
+            current_branch: RwLock::new("main".to_string()),
         })
+    }
+
+    pub fn create_branch(&self, name: &str, from_seqno: u64) -> anyhow::Result<()> {
+        if name.is_empty() {
+            anyhow::bail!("branch name cannot be empty");
+        }
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+        {
+            anyhow::bail!("branch name contains invalid characters");
+        }
+
+        {
+            let branches = self.branches.read();
+            if branches.contains_key(name) {
+                anyhow::bail!("branch already exists: {name}");
+            }
+        }
+
+        {
+            let mut manifest = self.manifest.lock();
+            manifest.append(
+                &ManifestRecord::BranchHead(crate::version::manifest::BranchHead {
+                    name: name.to_string(),
+                    seqno: from_seqno,
+                }),
+                true,
+            )?;
+            manifest.sync_dir()?;
+        }
+
+        self.branches.write().insert(name.to_string(), from_seqno);
+        Ok(())
+    }
+
+    pub fn checkout_branch(&self, name: &str) -> anyhow::Result<u64> {
+        let seqno = {
+            let branches = self.branches.read();
+            branches
+                .get(name)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("unknown branch: {name}"))?
+        };
+        *self.current_branch.write() = name.to_string();
+        Ok(seqno)
+    }
+
+    pub fn list_branches(&self) -> Vec<(String, u64)> {
+        self.branches
+            .read()
+            .iter()
+            .map(|(name, seq)| (name.clone(), *seq))
+            .collect()
+    }
+
+    pub fn current_branch(&self) -> String {
+        self.current_branch.read().clone()
     }
 
     fn cached_reader(&self, path: &Path) -> anyhow::Result<Arc<SstReader>> {

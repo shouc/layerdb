@@ -6,9 +6,14 @@
 //! - Deletes are tombstones.
 //! - WAL + manifest follow a strict fsync/rename discipline.
 //!
-//! The implementation is being built in milestones. Milestone 1 targets a
-//! single local filesystem tier with WAL + memtable + flush to L0 SST, manifest
-//! recovery, snapshots, iter, and L0->L1 compaction.
+//! The implementation is milestone-driven and currently includes:
+//! - local WAL/memtable/flush/compaction with snapshot-safe reads,
+//! - range tombstones + conservative dropping,
+//! - async IO executor abstractions,
+//! - NVMe/HDD tier routing,
+//! - S3 frozen-level lifecycle (freeze/thaw/gc + read-through cache),
+//! - integrity hashing with foreground + background scrub support,
+//! - optional branch heads persisted in manifest.
 
 pub mod cache;
 pub mod compaction;
@@ -23,5 +28,6 @@ pub mod tier;
 pub mod version;
 pub mod wal;
 
+pub use db::{BackgroundScrubber, BackgroundScrubberState, ScrubReport};
 pub use db::{Db, DbOptions, ReadOptions, SnapshotId, WriteOptions};
 pub use db::{Op, Range, Value};

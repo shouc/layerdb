@@ -26,6 +26,7 @@ pub enum WalError {
 #[derive(Debug)]
 pub struct Wal {
     tx: mpsc::UnboundedSender<WalRequest>,
+    flush_tx: mpsc::UnboundedSender<FlushSignal>,
     _next_seqno: Arc<AtomicU64>,
     last_durable_seqno: Arc<AtomicU64>,
     wal_thread: Option<thread::JoinHandle<()>>,
@@ -36,6 +37,7 @@ pub struct Wal {
 struct WalRequest {
     ops: Vec<Op>,
     opts: WriteOptions,
+    rotate_only: bool,
     done: oneshot::Sender<anyhow::Result<()>>,
 }
 
@@ -50,7 +52,7 @@ struct WalState {
     segment_id: u64,
     segment: std::fs::File,
     segment_bytes: u64,
-    flush_tx: mpsc::UnboundedSender<()>,
+    flush_tx: mpsc::UnboundedSender<FlushSignal>,
 }
 
 const WAL_RECORD_HEADER_BYTES: usize = 4 + 4 + 8 + 4;
@@ -87,7 +89,7 @@ impl Wal {
         let snapshot_tracker = versions.snapshots_handle();
 
         let recovered = recover_from_wal(&dir.join("wal"), options, &memtables, &snapshot_tracker)?;
-        let _ = flush_tx.send(());
+        let _ = flush_tx.send(FlushSignal::Kick);
         let base_seqno = versions.latest_seqno().saturating_add(1);
         let next_seqno_value = recovered.next_seqno.max(base_seqno).max(1);
         let last_durable = recovered.last_durable_seqno.max(base_seqno.saturating_sub(1));
@@ -116,6 +118,7 @@ impl Wal {
 
         Ok(Self {
             tx,
+            flush_tx,
             _next_seqno: next_seqno,
             last_durable_seqno,
             wal_thread: Some(wal_thread),
@@ -124,11 +127,21 @@ impl Wal {
     }
 
     pub fn write_batch(&self, ops: &[Op], opts: WriteOptions) -> anyhow::Result<()> {
+        self.send_request(ops.to_vec(), opts, false)
+    }
+
+    fn send_request(
+        &self,
+        ops: Vec<Op>,
+        opts: WriteOptions,
+        rotate_only: bool,
+    ) -> anyhow::Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         self.tx
             .send(WalRequest {
-                ops: ops.to_vec(),
+                ops,
                 opts,
+                rotate_only,
                 done: done_tx,
             })
             .map_err(|_| WalError::Closed)?;
@@ -139,6 +152,17 @@ impl Wal {
     pub fn last_durable_seqno(&self) -> u64 {
         self.last_durable_seqno.load(Ordering::Relaxed)
     }
+
+    pub(crate) fn force_rotate_for_flush(&self) -> anyhow::Result<()> {
+        self.send_request(Vec::new(), WriteOptions { sync: true }, true)?;
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.flush_tx
+            .send(FlushSignal::Barrier(done_tx))
+            .map_err(|_| WalError::Closed)?;
+        done_rx.blocking_recv().map_err(|_| WalError::Closed)?;
+        Ok(())
+    }
 }
 
 impl Drop for Wal {
@@ -146,6 +170,10 @@ impl Drop for Wal {
         let (dummy_tx, _dummy_rx) = mpsc::unbounded_channel();
         let old_tx = std::mem::replace(&mut self.tx, dummy_tx);
         drop(old_tx);
+
+        let (dummy_flush_tx, _dummy_flush_rx) = mpsc::unbounded_channel();
+        let old_flush_tx = std::mem::replace(&mut self.flush_tx, dummy_flush_tx);
+        drop(old_flush_tx);
 
         if let Some(handle) = self.wal_thread.take() {
             let _ = handle.join();
@@ -162,6 +190,11 @@ struct RecoveredWal {
     last_segment_id: u64,
 }
 
+enum FlushSignal {
+    Kick,
+    Barrier(oneshot::Sender<()>),
+}
+
 #[derive(Debug, Clone)]
 struct FlushState {
     dir: PathBuf,
@@ -171,38 +204,42 @@ struct FlushState {
 
 fn wal_thread_main(state: &mut WalState, mut rx: mpsc::UnboundedReceiver<WalRequest>) {
     while let Some(req) = rx.blocking_recv() {
-        let result = state.handle_request(req.ops, req.opts);
+        let result = state.handle_request(req.ops, req.opts, req.rotate_only);
         let _ = req.done.send(result);
     }
 }
 
-fn flush_thread_main(mut state: FlushState, mut rx: mpsc::UnboundedReceiver<()>) {
-    while rx.blocking_recv().is_some() {
-        loop {
-            let mem = match state.memtables.take_oldest_immutable() {
-                None => break,
-                Some(m) => m,
-            };
+fn flush_thread_main(mut state: FlushState, mut rx: mpsc::UnboundedReceiver<FlushSignal>) {
+    while let Some(signal) = rx.blocking_recv() {
+        flush_all(&mut state);
 
-            match flush_one(&mut state, &mem) {
-                Ok(()) => {
-                    maybe_delete_wal_segment(&state.dir, mem.wal_segment_id);
-                }
-                Err(e) => {
-                    eprintln!("layerdb: flush failed: {e:?}");
-                    state.memtables.requeue_immutable_oldest(mem);
-                    break;
-                }
-            }
+        if let FlushSignal::Barrier(done) = signal {
+            let _ = done.send(());
         }
     }
 
-    while let Some(mem) = state.memtables.take_oldest_immutable() {
-        if flush_one(&mut state, &mem).is_ok() {
-            maybe_delete_wal_segment(&state.dir, mem.wal_segment_id);
-        } else {
-            state.memtables.requeue_immutable_oldest(mem);
-            break;
+    flush_all(&mut state);
+}
+
+fn flush_all(state: &mut FlushState) {
+    loop {
+        let mem = match state.memtables.oldest_immutable() {
+            None => break,
+            Some(m) => m,
+        };
+
+        match flush_one(state, &mem) {
+            Ok(()) => {
+                // Drop the memtable only after a successful flush.
+                let _ = state
+                    .memtables
+                    .drop_oldest_immutable_if_segment_id(mem.wal_segment_id);
+                maybe_delete_wal_segment(&state.dir, mem.wal_segment_id);
+            }
+            Err(e) => {
+                eprintln!("layerdb: flush failed: {e:?}");
+                break;
+            }
         }
     }
 }
@@ -239,7 +276,7 @@ impl WalState {
         versions: Arc<VersionSet>,
         next_seqno: Arc<AtomicU64>,
         last_durable_seqno: Arc<AtomicU64>,
-        flush_tx: mpsc::UnboundedSender<()>,
+        flush_tx: mpsc::UnboundedSender<FlushSignal>,
         segment_id: u64,
     ) -> anyhow::Result<Self> {
         let wal_dir = dir.join("wal");
@@ -289,11 +326,20 @@ impl WalState {
         sync_dir(&wal_dir)?;
 
         self.memtables.rotate_memtable(self.segment_id);
-        let _ = self.flush_tx.send(());
+        let _ = self.flush_tx.send(FlushSignal::Kick);
         Ok(())
     }
 
-    fn handle_request(&mut self, ops: Vec<Op>, opts: WriteOptions) -> anyhow::Result<()> {
+    fn handle_request(
+        &mut self,
+        ops: Vec<Op>,
+        opts: WriteOptions,
+        rotate_only: bool,
+    ) -> anyhow::Result<()> {
+        if rotate_only {
+            return self.rotate_segment();
+        }
+
         if ops.is_empty() {
             return Ok(());
         }

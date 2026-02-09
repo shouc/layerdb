@@ -75,6 +75,21 @@ impl MemTableManager {
         self.immutables.lock().pop_back()
     }
 
+    pub(crate) fn oldest_immutable(&self) -> Option<Arc<MemTable>> {
+        self.immutables.lock().back().cloned()
+    }
+
+    pub(crate) fn drop_oldest_immutable_if_segment_id(&self, wal_segment_id: u64) -> bool {
+        let mut guard = self.immutables.lock();
+        match guard.back() {
+            Some(mem) if mem.wal_segment_id == wal_segment_id => {
+                guard.pop_back();
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn requeue_immutable_oldest(&self, mem: Arc<MemTable>) {
         self.immutables.lock().push_back(mem);
     }

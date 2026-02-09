@@ -89,7 +89,15 @@ struct Footer {
 }
 
 const MAGIC: &[u8; 8] = b"LAYERDB1";
-const FOOTER_SIZE: usize = 8 + 8 + 4 + 8 + 4 + 32;
+// Footer is appended after the properties block.
+//
+// Layout:
+// - index_offset (u64)
+// - index_len (u32)
+// - props_offset (u64)
+// - props_len (u32)
+// - table_root (32 bytes)
+const FOOTER_SIZE: usize = 8 + 4 + 8 + 4 + 32;
 const BLOCK_TRAILER_SIZE: usize = 4 + 32;
 
 pub struct SstBuilder {
@@ -218,6 +226,7 @@ impl SstBuilder {
         };
         let footer_bytes = encode_footer(&footer);
         self.file.write_all(&footer_bytes)?;
+        self.file.write_all(MAGIC)?;
         self.file.sync_data()?;
         drop(self.file);
 
@@ -500,7 +509,7 @@ impl<'a> SstIter<'a> {
 }
 
 fn encode_footer(footer: &Footer) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(FOOTER_SIZE + MAGIC.len());
+    let mut buf = Vec::with_capacity(FOOTER_SIZE);
     buf.extend_from_slice(&footer.index_offset.to_le_bytes());
     buf.extend_from_slice(&footer.index_len.to_le_bytes());
     buf.extend_from_slice(&footer.props_offset.to_le_bytes());

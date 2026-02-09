@@ -164,6 +164,8 @@ impl Db {
     }
 
     pub fn compact_range(&self, _range: Option<Range>) -> anyhow::Result<()> {
+        // Ensure current mutable memtable is flushed before manual compaction.
+        self.inner.wal.force_rotate_for_flush()?;
         // v1: manual compaction triggers a conservative full L0->L1 compaction.
         self.inner.versions.compact_l0_to_l1(&self.inner.options)
     }

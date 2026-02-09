@@ -355,7 +355,11 @@ impl VersionSet {
         SstIter::new(paths, snapshot_seqno, range)
     }
 
-    pub fn compact_l0_to_l1(&self, _options: &DbOptions) -> anyhow::Result<()> {
+    pub fn compact_l0_to_l1(
+        &self,
+        range: Option<&Range>,
+        _options: &DbOptions,
+    ) -> anyhow::Result<()> {
         let (l0, l1) = {
             let guard = self.levels.read();
             if guard.l0.is_empty() {
@@ -364,9 +368,28 @@ impl VersionSet {
             (guard.l0.clone(), guard.l1.clone())
         };
 
+        let range_bounds = range.map(crate::memtable::bounds_from_range);
+        let l0_in_range: Vec<AddFile> = if let Some(bounds) = &range_bounds {
+            l0.into_iter()
+                .filter(|file| {
+                    range_overlaps_file(
+                        bounds,
+                        file.smallest_user_key.as_ref(),
+                        file.largest_user_key.as_ref(),
+                    )
+                })
+                .collect()
+        } else {
+            l0
+        };
+
+        if l0_in_range.is_empty() {
+            return Ok(());
+        }
+
         let mut smallest: Option<Bytes> = None;
         let mut largest: Option<Bytes> = None;
-        for file in &l0 {
+        for file in &l0_in_range {
             smallest = Some(match smallest {
                 None => file.smallest_user_key.clone(),
                 Some(s) => std::cmp::min(s, file.smallest_user_key.clone()),
@@ -380,7 +403,7 @@ impl VersionSet {
         let largest = largest.unwrap_or_else(Bytes::new);
 
         let mut compact_inputs = Vec::new();
-        compact_inputs.extend(l0.clone());
+        compact_inputs.extend(l0_in_range.clone());
         for file in &l1 {
             if overlaps(
                 &smallest,
@@ -595,6 +618,26 @@ impl VersionSet {
         }
         Ok(())
     }
+}
+
+fn range_overlaps_file(
+    bounds: &(std::ops::Bound<Bytes>, std::ops::Bound<Bytes>),
+    file_smallest: &[u8],
+    file_largest: &[u8],
+) -> bool {
+    let lower_ok = match &bounds.0 {
+        std::ops::Bound::Unbounded => true,
+        std::ops::Bound::Included(start) => file_largest >= start.as_ref(),
+        std::ops::Bound::Excluded(start) => file_largest > start.as_ref(),
+    };
+
+    let upper_ok = match &bounds.1 {
+        std::ops::Bound::Unbounded => true,
+        std::ops::Bound::Included(end) => file_smallest <= end.as_ref(),
+        std::ops::Bound::Excluded(end) => file_smallest < end.as_ref(),
+    };
+
+    lower_ok && upper_ok
 }
 
 fn find_l1_file<'a>(l1: &'a [AddFile], key: &[u8]) -> Option<&'a AddFile> {

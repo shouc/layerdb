@@ -245,11 +245,14 @@ impl Db {
         )
     }
 
-    pub fn compact_range(&self, _range: Option<Range>) -> anyhow::Result<()> {
+    pub fn compact_range(&self, range: Option<Range>) -> anyhow::Result<()> {
         // Ensure current mutable memtable is flushed before manual compaction.
         self.inner.wal.force_rotate_for_flush()?;
-        // v1: manual compaction triggers a conservative full L0->L1 compaction.
-        self.inner.versions.compact_l0_to_l1(&self.inner.options)
+        // v1: manual compaction triggers a conservative L0->L1 compaction,
+        // optionally constrained to an input key range.
+        self.inner
+            .versions
+            .compact_l0_to_l1(range.as_ref(), &self.inner.options)
     }
 
     pub fn ingest_sst(&self, sst_path: impl AsRef<Path>) -> anyhow::Result<()> {

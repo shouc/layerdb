@@ -263,3 +263,43 @@ fn unsynced_writes_are_visible_to_same_handle() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn compact_range_only_compacts_overlapping_l0_inputs() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db = Db::open(dir.path(), small_options())?;
+
+    db.put(&b"a"[..], &b"va1"[..], WriteOptions { sync: true })?;
+    db.compact_range(Some(Range {
+        start: Bound::Included(bytes::Bytes::from("m")),
+        end: Bound::Excluded(bytes::Bytes::from("z")),
+    }))?;
+
+    db.put(&b"x"[..], &b"vx1"[..], WriteOptions { sync: true })?;
+
+    db.compact_range(Some(Range {
+        start: Bound::Included(bytes::Bytes::from("m")),
+        end: Bound::Excluded(bytes::Bytes::from("z")),
+    }))?;
+
+    assert_eq!(
+        db.get(b"a", ReadOptions::default())?,
+        Some(bytes::Bytes::from("va1"))
+    );
+    assert_eq!(
+        db.get(b"x", ReadOptions::default())?,
+        Some(bytes::Bytes::from("vx1"))
+    );
+
+    // `a` should still be compactable later when including its key-range.
+    db.compact_range(Some(Range {
+        start: Bound::Included(bytes::Bytes::from("a")),
+        end: Bound::Included(bytes::Bytes::from("b")),
+    }))?;
+    assert_eq!(
+        db.get(b"a", ReadOptions::default())?,
+        Some(bytes::Bytes::from("va1"))
+    );
+
+    Ok(())
+}

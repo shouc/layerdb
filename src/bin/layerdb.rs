@@ -182,6 +182,10 @@ enum Command {
         #[arg(long)]
         db: PathBuf,
     },
+    Metrics {
+        #[arg(long)]
+        db: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -266,6 +270,7 @@ fn main() -> anyhow::Result<()> {
             sync,
         } => delete_range_cmd(&db, &start, &end, branch.as_deref(), sync),
         Command::RetentionFloor { db } => retention_floor_cmd(&db),
+        Command::Metrics { db } => metrics_cmd(&db),
     }
 }
 
@@ -926,7 +931,11 @@ fn delete_range_cmd(
         db.checkout(branch_name)?;
     }
 
-    db.delete_range(start.to_string(), end.to_string(), layerdb::WriteOptions { sync })?;
+    db.delete_range(
+        start.to_string(),
+        end.to_string(),
+        layerdb::WriteOptions { sync },
+    )?;
     println!("delete_range start={start} end={end} sync={sync}");
     Ok(())
 }
@@ -934,6 +943,82 @@ fn delete_range_cmd(
 fn retention_floor_cmd(db: &Path) -> anyhow::Result<()> {
     let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
     println!("retention_floor seqno={}", db.retention_floor_seqno());
+    Ok(())
+}
+
+fn format_hit_rate(rate: Option<f64>) -> String {
+    match rate {
+        Some(rate) => format!("{:.4}", rate),
+        None => "n/a".to_string(),
+    }
+}
+
+fn metrics_cmd(db: &Path) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    let metrics = db.metrics();
+
+    println!(
+        "metrics wal_last_durable_seqno={} wal_last_ack_seqno={} retention_floor_seqno={}",
+        metrics.wal_last_durable_seqno, metrics.wal_last_ack_seqno, metrics.retention_floor_seqno
+    );
+    println!(
+        "metrics branch current={} head_seqno={}",
+        metrics.current_branch, metrics.current_branch_seqno
+    );
+
+    let reader = metrics.version.reader_cache;
+    println!(
+        "metrics cache=reader hits={} misses={} inserts={} len={} hit_rate={}",
+        reader.hits,
+        reader.misses,
+        reader.inserts,
+        reader.len,
+        format_hit_rate(reader.hit_rate())
+    );
+
+    if let Some(data) = metrics.version.data_block_cache {
+        println!(
+            "metrics cache=data hits={} misses={} inserts={} len={} hit_rate={}",
+            data.hits,
+            data.misses,
+            data.inserts,
+            data.len,
+            format_hit_rate(data.hit_rate())
+        );
+    } else {
+        println!("metrics cache=data disabled");
+    }
+
+    for (level, level_metrics) in metrics.version.levels {
+        println!(
+            "metrics level={} files={} bytes={} overlap_bytes={}",
+            level, level_metrics.file_count, level_metrics.bytes, level_metrics.overlap_bytes
+        );
+    }
+
+    match (
+        metrics.version.compaction_candidate_level,
+        metrics.version.compaction_candidate_score,
+    ) {
+        (Some(level), Some(score)) => {
+            println!(
+                "metrics compaction candidate_level={} score={:.4} should_compact={}",
+                level, score, metrics.version.should_compact
+            );
+        }
+        _ => {
+            println!(
+                "metrics compaction candidate_level=- score=n/a should_compact={}",
+                metrics.version.should_compact
+            );
+        }
+    }
+
+    println!(
+        "metrics frozen_s3_files={}",
+        metrics.version.frozen_s3_files
+    );
+
     Ok(())
 }
 

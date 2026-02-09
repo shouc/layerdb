@@ -111,6 +111,9 @@ Kinds:
 - `layerdb db-check --db <path>` verifies manifest references, table roots, and
   checksum-decoded readability.
 - `layerdb verify --db <path>` is an alias for `db-check`.
+- `layerdb metrics --db <path>` prints runtime counters including WAL durability
+  progress, retention floor, branch head, cache hit/miss rates, level bytes,
+  overlap estimates, compaction candidate score, and frozen S3 file count.
 - `layerdb scrub --db <path>` scans all active SSTs and reports entry totals by
   level.
 - `layerdb bench --db <path> --workload <...>` supports `smoke`, `fill`,

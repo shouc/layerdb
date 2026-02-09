@@ -21,6 +21,16 @@ pub use snapshot::SnapshotId;
 
 pub type Value = bytes::Bytes;
 
+#[derive(Debug, Clone, Default)]
+pub struct DbMetrics {
+    pub wal_last_durable_seqno: u64,
+    pub wal_last_ack_seqno: u64,
+    pub retention_floor_seqno: u64,
+    pub current_branch: String,
+    pub current_branch_seqno: u64,
+    pub version: crate::version::VersionMetrics,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LookupResult {
     pub seqno: u64,
@@ -185,11 +195,7 @@ impl Db {
         self.inner.versions.create_branch(name.as_ref(), seqno)
     }
 
-    pub fn create_branch_at_seqno(
-        &self,
-        name: impl AsRef<str>,
-        seqno: u64,
-    ) -> anyhow::Result<()> {
+    pub fn create_branch_at_seqno(&self, name: impl AsRef<str>, seqno: u64) -> anyhow::Result<()> {
         let latest = self.inner.versions.latest_seqno();
         if seqno > latest {
             anyhow::bail!("branch seqno {seqno} is ahead of latest {latest}");
@@ -222,6 +228,17 @@ impl Db {
 
     pub fn retention_floor_seqno(&self) -> u64 {
         self.inner.versions.min_retained_seqno()
+    }
+
+    pub fn metrics(&self) -> DbMetrics {
+        DbMetrics {
+            wal_last_durable_seqno: self.inner.wal.last_durable_seqno(),
+            wal_last_ack_seqno: self.inner.wal.last_acknowledged_seqno(),
+            retention_floor_seqno: self.inner.versions.min_retained_seqno(),
+            current_branch: self.inner.versions.current_branch(),
+            current_branch_seqno: self.inner.versions.current_branch_seqno(),
+            version: self.inner.versions.metrics(),
+        }
     }
 
     pub fn get(&self, key: impl AsRef<[u8]>, opts: ReadOptions) -> anyhow::Result<Option<Value>> {

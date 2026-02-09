@@ -29,5 +29,5 @@ pub mod version;
 pub mod wal;
 
 pub use db::{BackgroundScrubber, BackgroundScrubberState, ScrubReport};
-pub use db::{Db, DbOptions, ReadOptions, SnapshotId, WriteOptions};
+pub use db::{Db, DbMetrics, DbOptions, ReadOptions, SnapshotId, WriteOptions};
 pub use db::{Op, Range, Value};

@@ -1,5 +1,6 @@
 pub mod manifest;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -19,6 +20,24 @@ use crate::tier::StorageTier;
 use crate::version::manifest::{
     AddFile, DeleteFile, DropBranch, FreezeFile, Manifest, ManifestRecord, MoveFile, VersionEdit,
 };
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LevelMetricsSnapshot {
+    pub file_count: usize,
+    pub bytes: u64,
+    pub overlap_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VersionMetrics {
+    pub reader_cache: crate::cache::CacheStats,
+    pub data_block_cache: Option<crate::cache::CacheStats>,
+    pub levels: BTreeMap<u8, LevelMetricsSnapshot>,
+    pub compaction_candidate_level: Option<u8>,
+    pub compaction_candidate_score: Option<f64>,
+    pub should_compact: bool,
+    pub frozen_s3_files: usize,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrozenObjectMeta {
@@ -393,6 +412,55 @@ impl VersionSet {
 
     pub(crate) fn snapshots_handle(&self) -> Arc<SnapshotTracker> {
         self.snapshots.clone()
+    }
+
+    pub fn metrics(&self) -> VersionMetrics {
+        let mut levels = BTreeMap::new();
+        let mut compaction_level_metrics = BTreeMap::new();
+
+        {
+            let guard = self.levels.read();
+            for (level, files) in [(0u8, &guard.l0), (1u8, &guard.l1)] {
+                let bytes = files.iter().map(|f| f.size_bytes).sum();
+                let file_count = files.len();
+                let overlap_bytes = estimate_overlap_bytes(files);
+                levels.insert(
+                    level,
+                    LevelMetricsSnapshot {
+                        file_count,
+                        bytes,
+                        overlap_bytes,
+                    },
+                );
+                compaction_level_metrics.insert(
+                    level,
+                    crate::compaction::LevelMetrics {
+                        bytes,
+                        file_count,
+                        overlap_bytes,
+                    },
+                );
+            }
+        }
+
+        let compaction_options = crate::compaction::CompactionOptions::default();
+        let candidate = crate::compaction::CompactionPicker::pick_highest_score(
+            &compaction_level_metrics,
+            &compaction_options,
+        );
+
+        VersionMetrics {
+            reader_cache: self.reader_cache.stats(),
+            data_block_cache: self.data_block_cache.as_ref().map(|cache| cache.stats()),
+            levels,
+            compaction_candidate_level: candidate.as_ref().map(|c| c.level),
+            compaction_candidate_score: candidate.as_ref().map(|c| c.score),
+            should_compact: crate::compaction::CompactionPicker::should_compact(
+                &compaction_level_metrics,
+                &compaction_options,
+            ),
+            frozen_s3_files: self.frozen_objects.read().len(),
+        }
     }
 
     pub(crate) fn allocate_file_id(&self) -> u64 {
@@ -1190,6 +1258,29 @@ fn parse_sst_file_id(name: &str) -> Option<u64> {
     }
     let hex = &name[4..name.len() - 4];
     u64::from_str_radix(hex, 16).ok()
+}
+
+fn estimate_overlap_bytes(files: &[AddFile]) -> u64 {
+    if files.len() < 2 {
+        return 0;
+    }
+
+    let mut overlap = 0u64;
+    for left in 0..files.len() {
+        for right in (left + 1)..files.len() {
+            if overlaps(
+                files[left].smallest_user_key.as_ref(),
+                files[left].largest_user_key.as_ref(),
+                files[right].smallest_user_key.as_ref(),
+                files[right].largest_user_key.as_ref(),
+            ) {
+                overlap =
+                    overlap.saturating_add(files[left].size_bytes.min(files[right].size_bytes));
+            }
+        }
+    }
+
+    overlap
 }
 
 fn drop_obsolete_range_tombstones_bottommost(

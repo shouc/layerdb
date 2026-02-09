@@ -146,6 +146,38 @@ impl VersionSet {
         self.current_branch.read().clone()
     }
 
+    pub fn advance_current_branch(&self, seqno: u64) -> anyhow::Result<()> {
+        let branch_name = self.current_branch();
+        let current_head = self
+            .branches
+            .read()
+            .get(&branch_name)
+            .copied()
+            .unwrap_or(0);
+        if seqno <= current_head {
+            return Ok(());
+        }
+
+        {
+            let mut manifest = self.manifest.lock();
+            manifest.append(
+                &ManifestRecord::BranchHead(crate::version::manifest::BranchHead {
+                    name: branch_name.clone(),
+                    seqno,
+                }),
+                true,
+            )?;
+            manifest.sync_dir()?;
+        }
+
+        let mut branches = self.branches.write();
+        let head = branches.entry(branch_name).or_insert(0);
+        if seqno > *head {
+            *head = seqno;
+        }
+        Ok(())
+    }
+
     fn cached_reader(&self, path: &Path) -> anyhow::Result<Arc<SstReader>> {
         let key = path.to_path_buf();
         if let Some(reader) = self.reader_cache.get(&key) {

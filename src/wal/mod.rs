@@ -386,6 +386,7 @@ impl WalState {
         self.memtables.apply_batch(seqno_base, &ops)?;
         let last_seqno = seqno_base + ops.len() as u64 - 1;
         self.versions.snapshots().set_latest_seqno(last_seqno);
+        self.versions.advance_current_branch(last_seqno)?;
         if do_sync {
             self.last_durable_seqno.store(last_seqno, Ordering::Relaxed);
         }

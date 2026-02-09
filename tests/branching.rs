@@ -78,3 +78,49 @@ fn branches_persist_across_restart() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn branch_head_advances_with_writes_and_persists() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+
+    {
+        let db = Db::open(dir.path(), options())?;
+        db.put(&b"k"[..], &b"v1"[..], WriteOptions { sync: true })?;
+        let snap_v1 = db.create_snapshot()?;
+        db.create_branch("feature", Some(snap_v1))?;
+
+        db.checkout("feature")?;
+        db.put(&b"k"[..], &b"v2"[..], WriteOptions { sync: true })?;
+
+        let feature_head = db
+            .list_branches()
+            .into_iter()
+            .find(|(name, _)| name == "feature")
+            .expect("feature branch exists")
+            .1;
+        let main_head = db
+            .list_branches()
+            .into_iter()
+            .find(|(name, _)| name == "main")
+            .expect("main branch exists")
+            .1;
+        assert!(feature_head > main_head);
+    }
+
+    {
+        let db = Db::open(dir.path(), options())?;
+        db.checkout("feature")?;
+        assert_eq!(
+            db.get(b"k", ReadOptions::default())?,
+            Some(bytes::Bytes::from("v2"))
+        );
+
+        db.checkout("main")?;
+        assert_eq!(
+            db.get(b"k", ReadOptions::default())?,
+            Some(bytes::Bytes::from("v1"))
+        );
+    }
+
+    Ok(())
+}

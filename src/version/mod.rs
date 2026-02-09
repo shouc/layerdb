@@ -1101,7 +1101,13 @@ impl VersionSet {
                     continue;
                 }
 
-                let file_id = parse_object_file_id(object_id);
+                let file_id = match std::fs::read(obj_path.join("meta.bin"))
+                    .ok()
+                    .and_then(|bytes| bincode::deserialize::<S3ObjectMetaFile>(&bytes).ok())
+                {
+                    Some(meta) => Some(meta.file_id),
+                    None => parse_object_file_id(object_id),
+                };
                 let Some(file_id) = file_id else {
                     continue;
                 };

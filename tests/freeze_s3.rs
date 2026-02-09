@@ -172,6 +172,46 @@ fn frozen_reads_materialize_local_cache() -> anyhow::Result<()> {
 }
 
 #[test]
+fn frozen_read_detects_corrupted_superblock() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+
+    {
+        let db = Db::open(dir.path(), options())?;
+        db.put(&b"a"[..], &b"1"[..], WriteOptions { sync: true })?;
+        db.compact_range(None)?;
+        let moved = db.freeze_level_to_s3(1, None)?;
+        assert!(moved >= 1);
+    }
+
+    let frozen_db = Db::open(dir.path(), options())?;
+    let frozen = frozen_db.frozen_objects();
+    assert!(!frozen.is_empty());
+    let first = &frozen[0];
+
+    let superblock_path = dir
+        .path()
+        .join("sst_s3")
+        .join(format!("L{}", first.level))
+        .join(&first.object_id)
+        .join("sb_00000000.bin");
+    let mut bytes = std::fs::read(&superblock_path)?;
+    assert!(!bytes.is_empty(), "superblock should not be empty");
+    bytes[0] ^= 0x01;
+    std::fs::write(&superblock_path, bytes)?;
+
+    let err = frozen_db
+        .get(b"a", ReadOptions::default())
+        .expect_err("corrupted superblock must fail read");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("superblock hash mismatch"),
+        "unexpected error: {message}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn thaw_level_moves_back_to_local_tier() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let db = Db::open(dir.path(), options())?;

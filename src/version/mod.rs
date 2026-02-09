@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::db::{DbOptions, Range, Value};
 use crate::db::snapshot::SnapshotTracker;
@@ -7,19 +8,23 @@ use crate::db::snapshot::SnapshotTracker;
 #[derive(Debug)]
 pub struct VersionSet {
     dir: PathBuf,
-    snapshots: SnapshotTracker,
+    snapshots: Arc<SnapshotTracker>,
 }
 
 impl VersionSet {
     pub fn recover(dir: &Path, _options: &DbOptions) -> anyhow::Result<Self> {
         Ok(Self {
             dir: dir.to_path_buf(),
-            snapshots: SnapshotTracker::new(),
+            snapshots: Arc::new(SnapshotTracker::new()),
         })
     }
 
     pub fn snapshots(&self) -> &SnapshotTracker {
         &self.snapshots
+    }
+
+    pub(crate) fn snapshots_handle(&self) -> Arc<SnapshotTracker> {
+        self.snapshots.clone()
     }
 
     pub fn get(&self, _key: &[u8], _snapshot_seqno: u64) -> anyhow::Result<Option<Option<Value>>> {
@@ -45,4 +50,3 @@ impl SstIter {
         None
     }
 }
-

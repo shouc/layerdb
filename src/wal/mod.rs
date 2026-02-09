@@ -60,6 +60,14 @@ struct WalState {
     flush_tx: mpsc::UnboundedSender<FlushSignal>,
 }
 
+#[derive(Debug)]
+struct StagedWrite {
+    done: oneshot::Sender<anyhow::Result<()>>,
+    seqno_base: u64,
+    ops: Vec<Op>,
+    require_sync: bool,
+}
+
 const WAL_RECORD_HEADER_BYTES: usize = 4 + 4 + 8 + 4;
 
 #[repr(u8)]
@@ -233,10 +241,42 @@ struct FlushState {
     versions: Arc<VersionSet>,
 }
 
+fn is_batchable_request(req: &WalRequest) -> bool {
+    !req.rotate_only && !req.ops.is_empty()
+}
+
 fn wal_thread_main(state: &mut WalState, mut rx: mpsc::UnboundedReceiver<WalRequest>) {
-    while let Some(req) = rx.blocking_recv() {
-        let result = state.handle_request(req.ops, req.opts, req.rotate_only);
-        let _ = req.done.send(result);
+    let mut carry: Option<WalRequest> = None;
+
+    loop {
+        let req = match carry.take() {
+            Some(req) => req,
+            None => match rx.blocking_recv() {
+                Some(req) => req,
+                None => break,
+            },
+        };
+
+        if !is_batchable_request(&req) {
+            let result = state.handle_request(req.ops, req.opts, req.rotate_only);
+            let _ = req.done.send(result);
+            continue;
+        }
+
+        let mut group = vec![req];
+        while group.len() < 32 {
+            match rx.try_recv() {
+                Ok(next) if is_batchable_request(&next) => group.push(next),
+                Ok(next) => {
+                    carry = Some(next);
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        state.handle_group(group);
     }
 }
 
@@ -378,6 +418,118 @@ impl WalState {
         self.memtables.rotate_memtable(self.segment_id);
         let _ = self.flush_tx.send(FlushSignal::Kick);
         Ok(())
+    }
+
+    fn handle_group(&mut self, requests: Vec<WalRequest>) {
+        let mut staged = Vec::with_capacity(requests.len());
+        let mut pending = requests.into_iter();
+
+        while let Some(req) = pending.next() {
+            let seqno_base = self
+                .next_seqno
+                .fetch_add(req.ops.len() as u64, Ordering::Relaxed);
+
+            let record = match encode_wal_record(seqno_base, &req.ops) {
+                Ok(record) => record,
+                Err(err) => {
+                    self.finish_staged(staged);
+                    let msg = format!("{err:#}");
+                    let _ = req.done.send(Err(anyhow::anyhow!(msg.clone())));
+                    for rest in pending {
+                        let _ = rest.done.send(Err(anyhow::anyhow!(msg.clone())));
+                    }
+                    return;
+                }
+            };
+
+            if let Err(err) = self.rotate_segment_if_needed(record.len() as u64) {
+                self.finish_staged(staged);
+                let msg = format!("{err:#}");
+                let _ = req.done.send(Err(anyhow::anyhow!(msg.clone())));
+                for rest in pending {
+                    let _ = rest.done.send(Err(anyhow::anyhow!(msg.clone())));
+                }
+                return;
+            }
+
+            if let Err(err) = self
+                .io_rt
+                .block_on(self.io.append(&self.segment_path, &record))
+            {
+                self.finish_staged(staged);
+                let msg = format!("{err:#}");
+                let _ = req.done.send(Err(anyhow::anyhow!(msg.clone())));
+                for rest in pending {
+                    let _ = rest.done.send(Err(anyhow::anyhow!(msg.clone())));
+                }
+                return;
+            }
+            self.segment_bytes += record.len() as u64;
+
+            staged.push(StagedWrite {
+                done: req.done,
+                seqno_base,
+                ops: req.ops,
+                require_sync: req.opts.sync || self.options.fsync_writes,
+            });
+        }
+
+        self.finish_staged(staged);
+    }
+
+    fn finish_staged(&mut self, staged: Vec<StagedWrite>) {
+        if staged.is_empty() {
+            return;
+        }
+
+        let do_sync = staged.iter().any(|write| write.require_sync);
+
+        if do_sync {
+            if let Err(err) = self.io_rt.block_on(self.io.sync_file(&self.segment_path)) {
+                let msg = format!("{err:#}");
+                for write in staged {
+                    let _ = write.done.send(Err(anyhow::anyhow!(msg.clone())));
+                }
+                return;
+            }
+        }
+
+        let mut staged_iter = staged.into_iter();
+        while let Some(write) = staged_iter.next() {
+            let done = write.done;
+
+            if let Err(err) = self.memtables.apply_batch(write.seqno_base, &write.ops) {
+                let msg = format!("{err:#}");
+                let _ = done.send(Err(anyhow::anyhow!(msg.clone())));
+                for rest in staged_iter {
+                    let _ = rest.done.send(Err(anyhow::anyhow!(msg.clone())));
+                }
+                return;
+            }
+
+            let last_seqno = write.seqno_base + write.ops.len() as u64 - 1;
+            self.versions.snapshots().set_latest_seqno(last_seqno);
+            if let Err(err) = self.versions.advance_current_branch(last_seqno) {
+                let msg = format!("{err:#}");
+                let _ = done.send(Err(anyhow::anyhow!(msg.clone())));
+                for rest in staged_iter {
+                    let _ = rest.done.send(Err(anyhow::anyhow!(msg.clone())));
+                }
+                return;
+            }
+
+            self.last_ack_seqno.store(last_seqno, Ordering::Relaxed);
+            if do_sync {
+                self.last_durable_seqno.store(last_seqno, Ordering::Relaxed);
+            }
+            let _ = done.send(Ok(()));
+        }
+
+        if self.memtables.mutable_approximate_bytes() > self.options.memtable_bytes {
+            if let Err(err) = self.rotate_segment() {
+                eprintln!("layerdb: group rotate failed: {err:#}");
+            }
+        }
     }
 
     fn handle_request(

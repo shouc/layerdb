@@ -13,6 +13,7 @@ pub enum ManifestRecord {
     AddFile(AddFile),
     DeleteFile(DeleteFile),
     MoveFile(MoveFile),
+    FreezeFile(FreezeFile),
     VersionEdit(VersionEdit),
     BranchHead(BranchHead),
 }
@@ -68,6 +69,15 @@ pub struct MoveFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreezeFile {
+    pub file_id: u64,
+    pub level: u8,
+    pub object_id: String,
+    pub object_version: Option<String>,
+    pub superblock_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchHead {
     pub name: String,
     pub seqno: u64,
@@ -77,6 +87,7 @@ pub struct BranchHead {
 pub struct ManifestState {
     pub levels: BTreeMap<u8, BTreeMap<u64, AddFile>>,
     pub branches: BTreeMap<String, u64>,
+    pub frozen_objects: BTreeMap<u64, FreezeFile>,
 }
 
 #[derive(Debug)]
@@ -145,6 +156,7 @@ fn replay_manifest(data: &[u8]) -> anyhow::Result<ManifestState> {
 fn apply_record(state: &mut ManifestState, record: ManifestRecord) {
     match record {
         ManifestRecord::AddFile(add) => {
+            state.frozen_objects.remove(&add.file_id);
             state
                 .levels
                 .entry(add.level)
@@ -155,6 +167,7 @@ fn apply_record(state: &mut ManifestState, record: ManifestRecord) {
             if let Some(level) = state.levels.get_mut(&del.level) {
                 level.remove(&del.file_id);
             }
+            state.frozen_objects.remove(&del.file_id);
         }
         ManifestRecord::MoveFile(mv) => {
             if let Some(level) = state.levels.get_mut(&mv.level) {
@@ -162,9 +175,21 @@ fn apply_record(state: &mut ManifestState, record: ManifestRecord) {
                     add.tier = mv.tier;
                 }
             }
+            if mv.tier != StorageTier::S3 {
+                state.frozen_objects.remove(&mv.file_id);
+            }
+        }
+        ManifestRecord::FreezeFile(freeze) => {
+            if let Some(level) = state.levels.get_mut(&freeze.level) {
+                if let Some(add) = level.get_mut(&freeze.file_id) {
+                    add.tier = StorageTier::S3;
+                }
+            }
+            state.frozen_objects.insert(freeze.file_id, freeze);
         }
         ManifestRecord::VersionEdit(edit) => {
             for add in edit.adds {
+                state.frozen_objects.remove(&add.file_id);
                 state
                     .levels
                     .entry(add.level)
@@ -175,6 +200,7 @@ fn apply_record(state: &mut ManifestState, record: ManifestRecord) {
                 if let Some(level) = state.levels.get_mut(&del.level) {
                     level.remove(&del.file_id);
                 }
+                state.frozen_objects.remove(&del.file_id);
             }
         }
         ManifestRecord::BranchHead(branch) => {

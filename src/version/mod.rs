@@ -17,8 +17,17 @@ use crate::range_tombstone::RangeTombstone;
 use crate::sst::{SstProperties, SstReader};
 use crate::tier::StorageTier;
 use crate::version::manifest::{
-    AddFile, DeleteFile, Manifest, ManifestRecord, MoveFile, VersionEdit,
+    AddFile, DeleteFile, FreezeFile, Manifest, ManifestRecord, MoveFile, VersionEdit,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenObjectMeta {
+    pub file_id: u64,
+    pub level: u8,
+    pub object_id: String,
+    pub object_version: Option<String>,
+    pub superblock_bytes: u32,
+}
 
 /// Version set + manifest.
 #[derive(Debug)]
@@ -34,6 +43,7 @@ pub struct VersionSet {
         Option<Arc<crate::cache::ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
     branches: RwLock<std::collections::BTreeMap<String, u64>>,
     current_branch: RwLock<String>,
+    frozen_objects: RwLock<std::collections::BTreeMap<u64, FrozenObjectMeta>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -85,6 +95,20 @@ impl VersionSet {
         let mut branches = state.branches;
         branches.entry("main".to_string()).or_insert(max_seqno);
 
+        let mut frozen_objects = std::collections::BTreeMap::new();
+        for (file_id, freeze) in state.frozen_objects {
+            frozen_objects.insert(
+                file_id,
+                FrozenObjectMeta {
+                    file_id,
+                    level: freeze.level,
+                    object_id: freeze.object_id,
+                    object_version: freeze.object_version,
+                    superblock_bytes: freeze.superblock_bytes,
+                },
+            );
+        }
+
         Ok(Self {
             dir: dir.to_path_buf(),
             options: options.clone(),
@@ -100,7 +124,12 @@ impl VersionSet {
             }),
             branches: RwLock::new(branches),
             current_branch: RwLock::new("main".to_string()),
+            frozen_objects: RwLock::new(frozen_objects),
         })
+    }
+
+    pub fn frozen_objects_snapshot(&self) -> Vec<FrozenObjectMeta> {
+        self.frozen_objects.read().values().cloned().collect()
     }
 
     pub fn create_branch(&self, name: &str, from_seqno: u64) -> anyhow::Result<()> {
@@ -370,6 +399,70 @@ impl VersionSet {
         }
 
         Ok(moves.len())
+    }
+
+    pub fn mark_file_frozen(
+        &self,
+        file_id: u64,
+        object_id: impl Into<String>,
+        object_version: Option<String>,
+        superblock_bytes: u32,
+    ) -> anyhow::Result<()> {
+        let mut target: Option<AddFile> = None;
+        {
+            let guard = self.levels.read();
+            for add in guard.l0.iter().chain(guard.l1.iter()) {
+                if add.file_id == file_id {
+                    target = Some(add.clone());
+                    break;
+                }
+            }
+        }
+
+        let Some(add) = target else {
+            anyhow::bail!("unknown file_id for freeze: {file_id}");
+        };
+
+        let object_id = object_id.into();
+        let freeze = FreezeFile {
+            file_id,
+            level: add.level,
+            object_id: object_id.clone(),
+            object_version: object_version.clone(),
+            superblock_bytes,
+        };
+
+        {
+            let mut manifest = self.manifest.lock();
+            manifest.append(&ManifestRecord::FreezeFile(freeze), true)?;
+            manifest.sync_dir()?;
+        }
+
+        {
+            let mut levels = self.levels.write();
+            for file in levels.l0.iter_mut() {
+                if file.file_id == file_id {
+                    file.tier = StorageTier::S3;
+                }
+            }
+            for file in levels.l1.iter_mut() {
+                if file.file_id == file_id {
+                    file.tier = StorageTier::S3;
+                }
+            }
+        }
+
+        self.frozen_objects.write().insert(
+            file_id,
+            FrozenObjectMeta {
+                file_id,
+                level: add.level,
+                object_id,
+                object_version,
+                superblock_bytes,
+            },
+        );
+        Ok(())
     }
 
     fn move_file_between_tiers(

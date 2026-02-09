@@ -314,6 +314,11 @@ fn manifest_adds(db: &Path) -> anyhow::Result<Vec<(usize, layerdb::version::mani
                     add.tier = mv.tier;
                 }
             }
+            layerdb::version::manifest::ManifestRecord::FreezeFile(freeze) => {
+                if let Some(add) = adds.get_mut(&freeze.file_id) {
+                    add.tier = layerdb::tier::StorageTier::S3;
+                }
+            }
             layerdb::version::manifest::ManifestRecord::BranchHead(_) => {}
         }
         offset += len;

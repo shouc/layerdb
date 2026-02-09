@@ -5,7 +5,6 @@ use std::thread;
 
 use anyhow::Context;
 use bytes::Bytes;
-use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::db::{DbOptions, Op, OpKind, WriteOptions};
@@ -51,7 +50,6 @@ struct WalState {
     memtables: Arc<MemTableManager>,
     versions: Arc<VersionSet>,
     io: crate::io::UringExecutor,
-    io_rt: Runtime,
     next_seqno: Arc<AtomicU64>,
     last_ack_seqno: Arc<AtomicU64>,
     last_durable_seqno: Arc<AtomicU64>,
@@ -93,6 +91,7 @@ impl Wal {
             dir: dir.to_path_buf(),
             memtables: memtables.clone(),
             versions: versions.clone(),
+            options: options.clone(),
         };
         let flush_thread = thread::Builder::new()
             .name("layerdb-flush".to_string())
@@ -240,6 +239,7 @@ struct FlushState {
     dir: PathBuf,
     memtables: Arc<MemTableManager>,
     versions: Arc<VersionSet>,
+    options: DbOptions,
 }
 
 fn is_batchable_request(req: &WalRequest) -> bool {
@@ -324,7 +324,12 @@ fn flush_one(state: &mut FlushState, mem: &crate::memtable::MemTable) -> anyhow:
 
     let file_id = state.versions.allocate_file_id();
     let sst_dir = state.dir.join("sst");
-    let mut builder = crate::sst::SstBuilder::create(&sst_dir, file_id, 64 * 1024)?;
+    let mut builder = if state.options.sst_use_io_executor_writes {
+        let io = crate::io::UringExecutor::new(state.options.io_max_in_flight.max(1));
+        crate::sst::SstBuilder::create_with_io(&sst_dir, file_id, 64 * 1024, io)?
+    } else {
+        crate::sst::SstBuilder::create(&sst_dir, file_id, 64 * 1024)?
+    };
     for (key, value) in &entries {
         builder.add(key, value.as_ref())?;
     }
@@ -353,19 +358,15 @@ impl WalState {
         let wal_dir = dir.join("wal");
         std::fs::create_dir_all(&wal_dir)?;
         let segment_path = wal_dir.join(format!("wal_{segment_id:016x}.log"));
-        let io_rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
         let io = crate::io::UringExecutor::new(options.io_max_in_flight);
-        io_rt.block_on(async {
-            tokio::fs::OpenOptions::new()
+        {
+            let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .read(true)
                 .open(&segment_path)
-                .await
-                .map(|_| ())
-        })?;
+                .with_context(|| format!("open wal segment {}", segment_path.display()))?;
+        }
         let segment_bytes = std::fs::metadata(&segment_path)
             .map(|m| m.len())
             .unwrap_or(0);
@@ -376,7 +377,6 @@ impl WalState {
             memtables,
             versions,
             io,
-            io_rt,
             next_seqno,
             last_ack_seqno,
             last_durable_seqno,
@@ -396,20 +396,19 @@ impl WalState {
     }
 
     fn rotate_segment(&mut self) -> anyhow::Result<()> {
-        self.io_rt.block_on(self.io.sync_file(&self.segment_path))?;
+        self.io.sync_file_blocking(&self.segment_path)?;
         self.segment_id += 1;
 
         let wal_dir = self.dir.join("wal");
         let segment_path = wal_dir.join(format!("wal_{:016x}.log", self.segment_id));
-        self.io_rt.block_on(async {
-            tokio::fs::OpenOptions::new()
+        {
+            let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .read(true)
                 .open(&segment_path)
-                .await
-                .map(|_| ())
-        })?;
+                .with_context(|| format!("open wal segment {}", segment_path.display()))?;
+        }
         self.segment_path = segment_path;
         self.segment_bytes = std::fs::metadata(&self.segment_path)
             .map(|m| m.len())
@@ -488,8 +487,8 @@ impl WalState {
         }
 
         if let Err(err) = self
-            .io_rt
-            .block_on(self.io.append_many(&self.segment_path, records))
+            .io
+            .append_many_blocking(&self.segment_path, &records)
         {
             let msg = format!("{err:#}");
             for write in staged {
@@ -510,7 +509,7 @@ impl WalState {
         let do_sync = staged.iter().any(|write| write.require_sync);
 
         if do_sync {
-            if let Err(err) = self.io_rt.block_on(self.io.sync_file(&self.segment_path)) {
+            if let Err(err) = self.io.sync_file_blocking(&self.segment_path) {
                 let msg = format!("{err:#}");
                 for write in staged {
                     let _ = write.done.send(Err(anyhow::anyhow!(msg.clone())));
@@ -578,13 +577,12 @@ impl WalState {
         let record = encode_wal_record(seqno_base, &ops)?;
         self.rotate_segment_if_needed(record.len() as u64)?;
 
-        self.io_rt
-            .block_on(self.io.append(&self.segment_path, &record))?;
+        self.io.append_blocking(&self.segment_path, &record)?;
         self.segment_bytes += record.len() as u64;
 
         let do_sync = opts.sync || self.options.fsync_writes;
         if do_sync {
-            self.io_rt.block_on(self.io.sync_file(&self.segment_path))?;
+            self.io.sync_file_blocking(&self.segment_path)?;
         }
 
         self.memtables.apply_batch(seqno_base, &ops)?;
@@ -727,10 +725,6 @@ fn recover_from_wal(
         memtables.reset_for_wal_recovery(*first_id);
     }
 
-    let io_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("create wal recovery io runtime")?;
     let io = crate::io::UringExecutor::new(options.io_max_in_flight.max(1));
 
     for (idx, (segment_id, path)) in entries.iter().enumerate() {
@@ -740,9 +734,10 @@ fn recover_from_wal(
         let data = if file_len == 0 {
             bytes::Bytes::new()
         } else {
-            io_rt
-                .block_on(io.read_exact_at(path, 0, file_len))
-                .with_context(|| format!("wal read {}", path.display()))?
+            let mut data = vec![0u8; file_len];
+            io.read_into_at_blocking(path, 0, &mut data)
+                .with_context(|| format!("wal read {}", path.display()))?;
+            bytes::Bytes::from(data)
         };
         let mut offset = 0usize;
         while offset + WAL_RECORD_HEADER_BYTES <= data.len() {

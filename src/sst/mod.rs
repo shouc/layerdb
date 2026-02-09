@@ -130,7 +130,7 @@ const BLOCK_TRAILER_SIZE: usize = 4 + 32;
 
 pub struct SstBuilder {
     block_size: usize,
-    file: std::fs::File,
+    file: Option<std::fs::File>,
     path_tmp: PathBuf,
     path_final: PathBuf,
     buf: Vec<u8>,
@@ -145,6 +145,9 @@ pub struct SstBuilder {
     table_hasher: blake3::Hasher,
     range_tombstones: Vec<RangeTombstone>,
     point_keys: Vec<Bytes>,
+
+    io: Option<crate::io::UringExecutor>,
+    io_offset: u64,
 }
 
 fn max_bytes(a: Option<Bytes>, b: Bytes) -> Bytes {
@@ -167,7 +170,7 @@ impl SstBuilder {
             .open(&path_tmp)?;
         Ok(Self {
             block_size,
-            file,
+            file: Some(file),
             path_tmp,
             path_final,
             buf: Vec::with_capacity(block_size + 256),
@@ -182,6 +185,43 @@ impl SstBuilder {
             table_hasher: blake3::Hasher::new(),
             range_tombstones: Vec::new(),
             point_keys: Vec::new(),
+            io: None,
+            io_offset: 0,
+        })
+    }
+
+    pub fn create_with_io(
+        dir: &Path,
+        file_id: u64,
+        block_size: usize,
+        io: crate::io::UringExecutor,
+    ) -> Result<Self, SstError> {
+        std::fs::create_dir_all(dir)?;
+        let path_tmp = dir.join(format!("sst_{file_id:016x}.tmp"));
+        let path_final = dir.join(format!("sst_{file_id:016x}.sst"));
+        {
+            let _ = std::fs::remove_file(&path_tmp);
+        }
+
+        Ok(Self {
+            block_size,
+            file: None,
+            path_tmp,
+            path_final,
+            buf: Vec::with_capacity(block_size + 256),
+            entries_in_block: 0,
+            last_key: None,
+            index: Vec::new(),
+            smallest_user_key: None,
+            largest_user_key: None,
+            max_seqno: 0,
+            entries: 0,
+            data_bytes: 0,
+            table_hasher: blake3::Hasher::new(),
+            range_tombstones: Vec::new(),
+            point_keys: Vec::new(),
+            io: Some(io),
+            io_offset: 0,
         })
     }
 
@@ -249,16 +289,17 @@ impl SstBuilder {
             self.flush_block()?;
         }
 
-        let index_offset = self.file.stream_position()?;
+        let index_offset = self.stream_position()?;
+
         let index_bytes =
             bincode::serialize(&self.index).map_err(|_| SstError::Corrupt("index serialize"))?;
-        self.file.write_all(&index_bytes)?;
+        self.write_all(&index_bytes)?;
         let index_len: u32 = index_bytes
             .len()
             .try_into()
             .map_err(|_| SstError::Corrupt("index too large"))?;
 
-        let props_offset = self.file.stream_position()?;
+        let props_offset = self.stream_position()?;
         self.table_hasher.update(&index_bytes);
         let table_root = TableRoot(*self.table_hasher.finalize().as_bytes());
         let point_filter = build_point_filter(&self.point_keys)?;
@@ -280,7 +321,7 @@ impl SstBuilder {
             .len()
             .try_into()
             .map_err(|_| SstError::Corrupt("props too large"))?;
-        self.file.write_all(&props_bytes)?;
+        self.write_all(&props_bytes)?;
 
         let footer = Footer {
             index_offset,
@@ -290,14 +331,54 @@ impl SstBuilder {
             table_root,
         };
         let footer_bytes = encode_footer(&footer);
-        self.file.write_all(&footer_bytes)?;
-        self.file.write_all(MAGIC)?;
-        self.file.sync_data()?;
-        drop(self.file);
+        self.write_all(&footer_bytes)?;
+        self.write_all(MAGIC)?;
+        self.sync_data()?;
+        drop(self.file.take());
 
         std::fs::rename(&self.path_tmp, &self.path_final)?;
         fsync_parent_dir(&self.path_final)?;
         Ok(props)
+    }
+
+    fn stream_position(&mut self) -> Result<u64, SstError> {
+        if let Some(file) = &mut self.file {
+            Ok(file.stream_position()?)
+        } else {
+            Ok(self.io_offset)
+        }
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> Result<(), SstError> {
+        if let Some(file) = &mut self.file {
+            file.write_all(data)?;
+        } else if let Some(io) = &self.io {
+            io.write_all_at_blocking(&self.path_tmp, self.io_offset, data)
+                .map_err(|_| SstError::Corrupt("io write"))?;
+        } else {
+            return Err(SstError::Corrupt("sst builder missing output"));
+        }
+
+        self.io_offset = self
+            .io_offset
+            .checked_add(data.len() as u64)
+            .ok_or(SstError::Corrupt("sst size overflow"))?;
+        Ok(())
+    }
+
+    fn sync_data(&mut self) -> Result<(), SstError> {
+        if let Some(file) = &self.file {
+            file.sync_data()?;
+            return Ok(());
+        }
+
+        if let Some(io) = &self.io {
+            io.sync_file_blocking(&self.path_tmp)
+                .map_err(|_| SstError::Corrupt("io sync"))?;
+            return Ok(());
+        }
+
+        Err(SstError::Corrupt("sst builder missing output"))
     }
 
     fn flush_block(&mut self) -> Result<(), SstError> {
@@ -308,10 +389,11 @@ impl SstBuilder {
         self.buf.extend_from_slice(&crc.0.to_le_bytes());
         self.buf.extend_from_slice(&hash.0);
 
-        let offset = self.file.stream_position()?;
-        self.file.write_all(&self.buf)?;
-        let len: u32 = self
-            .buf
+        let offset = self.stream_position()?;
+        let mut block = Vec::new();
+        std::mem::swap(&mut block, &mut self.buf);
+        self.write_all(&block)?;
+        let len: u32 = block
             .len()
             .try_into()
             .map_err(|_| SstError::Corrupt("block too large"))?;
@@ -326,7 +408,8 @@ impl SstBuilder {
         });
 
         self.data_bytes += payload_len as u64;
-        self.buf.clear();
+        block.clear();
+        std::mem::swap(&mut block, &mut self.buf);
         self.entries_in_block = 0;
         Ok(())
     }
@@ -341,6 +424,24 @@ pub struct SstReader {
     range_tombstones_cache: parking_lot::Mutex<Option<Vec<RangeTombstone>>>,
     data_block_cache: Option<Arc<ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
     point_filter: Option<bloomfilter::Bloom<Bytes>>,
+
+    io_ctx: Option<Arc<SstIoContext>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SstIoContext {
+    io: crate::io::UringExecutor,
+    buf_pool: crate::io::BufPool,
+}
+
+impl SstIoContext {
+    pub fn new(io: crate::io::UringExecutor, buf_pool: crate::io::BufPool) -> Self {
+        Self { io, buf_pool }
+    }
+
+    pub fn io(&self) -> &crate::io::UringExecutor {
+        &self.io
+    }
 }
 
 impl SstReader {
@@ -348,11 +449,27 @@ impl SstReader {
         Self::open_with_cache(path, None)
     }
 
+    pub fn open_with_io(
+        path: impl AsRef<Path>,
+        io_ctx: Arc<SstIoContext>,
+        data_block_cache: Option<Arc<ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
+    ) -> Result<Self, SstError> {
+        Self::open_inner(path.as_ref(), Some(io_ctx), data_block_cache)
+    }
+
     pub fn open_with_cache(
         path: impl AsRef<Path>,
         data_block_cache: Option<Arc<ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
     ) -> Result<Self, SstError> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_inner(path.as_ref(), None, data_block_cache)
+    }
+
+    fn open_inner(
+        path: &Path,
+        io_ctx: Option<Arc<SstIoContext>>,
+        data_block_cache: Option<Arc<ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
+    ) -> Result<Self, SstError> {
+        let path = path.to_path_buf();
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         if mmap.len() < MAGIC.len() + FOOTER_SIZE {
@@ -403,6 +520,7 @@ impl SstReader {
             range_tombstones_cache: parking_lot::Mutex::new(range_tombstones_cache),
             data_block_cache,
             point_filter,
+            io_ctx,
         })
     }
 
@@ -567,6 +685,10 @@ impl SstReader {
     }
 
     fn decode_block(&self, handle: BlockHandle) -> Result<Vec<(InternalKey, Bytes)>, SstError> {
+        if let Some(io_ctx) = self.io_ctx.as_ref() {
+            return self.decode_block_io(io_ctx, handle);
+        }
+
         let start = handle.offset as usize;
         let end = start + handle.len as usize;
         if end > self.mmap.len() {
@@ -584,6 +706,61 @@ impl SstReader {
                 .unwrap(),
         );
         let hash_expected: [u8; 32] = self.mmap[(payload_end + 4)..end].try_into().unwrap();
+
+        if !RecordHasher::verify_crc32c(payload, BlockCrc32c(crc_expected)) {
+            return Err(SstError::Corrupt("block crc mismatch"));
+        }
+        if !RecordHasher::verify_blake3(payload, BlockHash(hash_expected)) {
+            return Err(SstError::Corrupt("block hash mismatch"));
+        }
+
+        if payload.len() < 4 {
+            return Err(SstError::Corrupt("block payload too small"));
+        }
+        let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        let mut offset = 4usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (ikey, used) = InternalKey::decode(&payload[offset..])?;
+            offset += used;
+            if offset + 4 > payload.len() {
+                return Err(SstError::Corrupt("truncated value"));
+            }
+            let val_len =
+                u32::from_le_bytes(payload[offset..(offset + 4)].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + val_len > payload.len() {
+                return Err(SstError::Corrupt("truncated value bytes"));
+            }
+            let value = Bytes::copy_from_slice(&payload[offset..(offset + val_len)]);
+            offset += val_len;
+            out.push((ikey, value));
+        }
+        Ok(out)
+    }
+
+    fn decode_block_io(
+        &self,
+        io_ctx: &SstIoContext,
+        handle: BlockHandle,
+    ) -> Result<Vec<(InternalKey, Bytes)>, SstError> {
+        let mut buf = io_ctx.buf_pool.acquire(handle.len as usize);
+        buf.resize(handle.len as usize, 0u8);
+
+        io_ctx
+            .io
+            .read_into_at_blocking(&self.path, handle.offset, &mut buf)
+            .map_err(|_| SstError::Corrupt("io read"))?;
+
+        if buf.len() <= BLOCK_TRAILER_SIZE {
+            return Err(SstError::Corrupt("block too small"));
+        }
+
+        let payload_end = buf.len() - BLOCK_TRAILER_SIZE;
+        let payload = &buf[..payload_end];
+        let crc_expected =
+            u32::from_le_bytes(buf[payload_end..(payload_end + 4)].try_into().unwrap());
+        let hash_expected: [u8; 32] = buf[(payload_end + 4)..].try_into().unwrap();
 
         if !RecordHasher::verify_crc32c(payload, BlockCrc32c(crc_expected)) {
             return Err(SstError::Corrupt("block crc mismatch"));

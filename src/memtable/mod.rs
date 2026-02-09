@@ -53,10 +53,6 @@ impl MemTableManager {
         }
     }
 
-    pub(crate) fn mutable_wal_segment_id(&self) -> u64 {
-        self.mutable.read().wal_segment_id
-    }
-
     pub(crate) fn reset_for_wal_recovery(&self, wal_segment_id: u64) {
         *self.mutable.write() = Arc::new(MemTable::new(self.shard_count, wal_segment_id));
         self.immutables.lock().clear();
@@ -70,10 +66,6 @@ impl MemTableManager {
         );
         self.immutables.lock().push_front(old.clone());
         old
-    }
-
-    pub(crate) fn take_oldest_immutable(&self) -> Option<Arc<MemTable>> {
-        self.immutables.lock().pop_back()
     }
 
     pub(crate) fn oldest_immutable(&self) -> Option<Arc<MemTable>> {
@@ -91,11 +83,8 @@ impl MemTableManager {
         }
     }
 
-    pub(crate) fn requeue_immutable_oldest(&self, mem: Arc<MemTable>) {
-        self.immutables.lock().push_back(mem);
-    }
-
-    pub fn approximate_bytes(&self) -> u64 {
+    #[allow(dead_code)]
+    pub(crate) fn approximate_bytes(&self) -> u64 {
         let mutable = self.mutable.read();
         let immutable_bytes: u64 = self
             .immutables

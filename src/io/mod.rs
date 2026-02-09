@@ -5,7 +5,7 @@
 //! file APIs and bounded by a semaphore to model queue depth.
 
 use std::collections::HashMap;
-use std::io::{IoSlice, Write};
+use std::io::{IoSlice, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -174,6 +174,28 @@ impl UringExecutor {
         Ok(Bytes::from(buf))
     }
 
+    pub async fn read_into_at(
+        &self,
+        path: impl AsRef<Path>,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> anyhow::Result<()> {
+        let _permit = self.acquire_permit().await?;
+        let path = path.as_ref();
+        let mut file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .await
+            .with_context(|| format!("open for read_into_at: {}", path.display()))?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .with_context(|| format!("seek: {}", path.display()))?;
+        file.read_exact(buf)
+            .await
+            .with_context(|| format!("read_exact: {}", path.display()))?;
+        Ok(())
+    }
+
     pub async fn sync_file(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         let _permit = self.acquire_permit().await?;
         let path = path.as_ref();
@@ -203,6 +225,134 @@ impl UringExecutor {
         })
         .await
         .context("join sync_parent_dir task")?
+    }
+
+    pub fn append_blocking(&self, path: impl AsRef<Path>, data: &[u8]) -> anyhow::Result<u64> {
+        let path = path.as_ref();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("open for append: {}", path.display()))?;
+        let offset = file
+            .metadata()
+            .with_context(|| format!("metadata: {}", path.display()))?
+            .len();
+        file.write_all(data)
+            .with_context(|| format!("append write: {}", path.display()))?;
+        Ok(offset)
+    }
+
+    pub fn append_many_blocking(
+        &self,
+        path: impl AsRef<Path>,
+        chunks: &[Vec<u8>],
+    ) -> anyhow::Result<u64> {
+        let path = path.as_ref();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("open for append_many: {}", path.display()))?;
+        let offset = file
+            .metadata()
+            .with_context(|| format!("metadata: {}", path.display()))?
+            .len();
+
+        let mut chunk_idx = 0usize;
+        let mut chunk_off = 0usize;
+
+        while chunk_idx < chunks.len() {
+            let mut slices = Vec::with_capacity(chunks.len() - chunk_idx);
+            slices.push(IoSlice::new(&chunks[chunk_idx][chunk_off..]));
+            for chunk in chunks.iter().skip(chunk_idx + 1) {
+                slices.push(IoSlice::new(chunk));
+            }
+
+            let written = file
+                .write_vectored(&slices)
+                .with_context(|| format!("append_many write_vectored: {}", path.display()))?;
+            if written == 0 {
+                anyhow::bail!("append_many wrote zero bytes: {}", path.display());
+            }
+
+            let mut remaining = written;
+            while remaining > 0 && chunk_idx < chunks.len() {
+                let available = chunks[chunk_idx].len() - chunk_off;
+                if remaining < available {
+                    chunk_off += remaining;
+                    remaining = 0;
+                } else {
+                    remaining -= available;
+                    chunk_idx += 1;
+                    chunk_off = 0;
+                }
+            }
+        }
+
+        Ok(offset)
+    }
+
+    pub fn write_all_at_blocking(
+        &self,
+        path: impl AsRef<Path>,
+        offset: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open for write: {}", path.display()))?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .with_context(|| format!("seek: {}", path.display()))?;
+        file.write_all(data)
+            .with_context(|| format!("write: {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn read_into_at_blocking(
+        &self,
+        path: impl AsRef<Path>,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .with_context(|| format!("open for read_into_at: {}", path.display()))?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .with_context(|| format!("seek: {}", path.display()))?;
+        file.read_exact(buf)
+            .with_context(|| format!("read_exact: {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn sync_file_blocking(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open for sync: {}", path.display()))?;
+        file.sync_data()
+            .with_context(|| format!("sync_data: {}", path.display()))
+    }
+
+    pub fn sync_parent_dir_blocking(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        let parent = path
+            .as_ref()
+            .parent()
+            .context("path has no parent for dir sync")?;
+        let dir = std::fs::File::open(parent)
+            .with_context(|| format!("open dir: {}", parent.display()))?;
+        dir.sync_all()
+            .with_context(|| format!("sync dir: {}", parent.display()))
     }
 }
 

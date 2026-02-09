@@ -13,6 +13,18 @@ pub struct DbOptions {
     /// v1 only has levels 0 and 1.
     pub hot_levels_max: u8,
 
+    /// Upper bound on L0 input bytes compacted per run when output tier is HDD.
+    ///
+    /// Helps bound HDD compaction work and foreground latency impact.
+    /// `0` disables HDD-targeted compaction runs.
+    pub hdd_compaction_budget_bytes: u64,
+
+    /// Maximum files to move per `rebalance_tiers` run.
+    ///
+    /// Keeps HDD/NVMe mover work bounded so foreground requests stay smooth.
+    /// `0` disables tier moves.
+    pub tier_rebalance_max_moves: usize,
+
     /// Maximum number of SST readers to keep open.
     pub sst_reader_cache_entries: usize,
 
@@ -23,6 +35,12 @@ pub struct DbOptions {
 
     /// Maximum in-flight operations for the async IO executor.
     pub io_max_in_flight: usize,
+
+    /// Use io-executor + buffer pool for SST reads instead of mmap.
+    pub sst_use_io_executor_reads: bool,
+
+    /// Use io-executor for SST writes (flush/compaction builders).
+    pub sst_use_io_executor_writes: bool,
 }
 
 impl Default for DbOptions {
@@ -35,9 +53,13 @@ impl Default for DbOptions {
 
             enable_hdd_tier: false,
             hot_levels_max: 2,
+            hdd_compaction_budget_bytes: u64::MAX,
+            tier_rebalance_max_moves: usize::MAX,
             sst_reader_cache_entries: 128,
             block_cache_entries: 0,
             io_max_in_flight: 256,
+            sst_use_io_executor_reads: false,
+            sst_use_io_executor_writes: false,
         }
     }
 }

@@ -67,6 +67,10 @@ impl MemTableManager {
         self.immutables.lock().pop_back()
     }
 
+    pub(crate) fn requeue_immutable_oldest(&self, mem: Arc<MemTable>) {
+        self.immutables.lock().push_back(mem);
+    }
+
     pub fn approximate_bytes(&self) -> u64 {
         let mutable = self.mutable.read();
         let immutable_bytes: u64 = self
@@ -76,6 +80,10 @@ impl MemTableManager {
             .map(|m| m.approximate_bytes())
             .sum();
         mutable.approximate_bytes() + immutable_bytes
+    }
+
+    pub(crate) fn mutable_approximate_bytes(&self) -> u64 {
+        self.mutable.read().approximate_bytes()
     }
 
     pub fn apply_batch(&self, seqno_base: u64, ops: &[Op]) -> anyhow::Result<()> {
@@ -134,8 +142,25 @@ impl MemTable {
         }
     }
 
-    fn approximate_bytes(&self) -> u64 {
+    pub(crate) fn approximate_bytes(&self) -> u64 {
         self.approximate_bytes.load(AtomicOrdering::Relaxed)
+    }
+
+    pub(crate) fn to_sorted_entries(&self) -> Vec<(InternalKey, Bytes)> {
+        let per_shard: Vec<Vec<(InternalKey, Bytes)>> = self
+            .shards
+            .par_iter()
+            .map(|shard| {
+                shard
+                    .map
+                    .iter()
+                    .map(|e| (e.key().clone(), e.value().clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut out: Vec<(InternalKey, Bytes)> = per_shard.into_iter().flatten().collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     fn apply_batch(&self, shard_count: usize, seqno_base: u64, ops: &[Op]) {

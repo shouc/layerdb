@@ -48,6 +48,12 @@ enum Command {
         #[arg(long)]
         end: Option<String>,
     },
+    IngestSst {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        sst: PathBuf,
+    },
     RebalanceTiers {
         #[arg(long)]
         db: PathBuf,
@@ -117,6 +123,7 @@ fn main() -> anyhow::Result<()> {
         Command::CompactRange { db, start, end } => {
             compact_range_cmd(&db, start.as_deref(), end.as_deref())
         }
+        Command::IngestSst { db, sst } => ingest_sst_cmd(&db, &sst),
         Command::RebalanceTiers { db } => rebalance_tiers(&db),
         Command::FreezeLevel {
             db,
@@ -492,6 +499,13 @@ fn compact_range_cmd(db: &Path, start: Option<&str>, end: Option<&str>) -> anyho
         start.unwrap_or("-"),
         end.unwrap_or("-")
     );
+    Ok(())
+}
+
+fn ingest_sst_cmd(db: &Path, sst: &Path) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    db.ingest_sst(sst)?;
+    println!("ingest_sst source={}", sst.display());
     Ok(())
 }
 

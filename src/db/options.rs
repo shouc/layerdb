@@ -18,7 +18,7 @@ pub struct DbOptions {
 
     /// Maximum number of data blocks to cache.
     ///
-    /// Currently unused; reserved for milestone 5.
+    /// Enabled for SST data-block cache lookups.
     pub block_cache_entries: usize,
 
     /// Maximum in-flight operations for the async IO executor.

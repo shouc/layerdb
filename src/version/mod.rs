@@ -453,7 +453,8 @@ impl VersionSet {
                         }
                     }
                     KeyKind::RangeDel => {
-                        // Range tombstones are not dropped yet (v2).
+                        // Range tombstone dropping is handled conservatively
+                        // by `drop_obsolete_range_tombstones_bottommost`.
                         out_entries.push((ikey.clone(), value.clone()));
                     }
                     _ => {}

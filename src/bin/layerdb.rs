@@ -114,6 +114,28 @@ enum Command {
         #[arg(long)]
         branch: Option<String>,
     },
+    Put {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        value: String,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long, default_value_t = true)]
+        sync: bool,
+    },
+    Delete {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long, default_value_t = true)]
+        sync: bool,
+    },
     RetentionFloor {
         #[arg(long)]
         db: PathBuf,
@@ -163,6 +185,19 @@ fn main() -> anyhow::Result<()> {
         Command::Branches { db } => branches(&db),
         Command::FrozenObjects { db } => frozen_objects(&db),
         Command::Get { db, key, branch } => get_cmd(&db, &key, branch.as_deref()),
+        Command::Put {
+            db,
+            key,
+            value,
+            branch,
+            sync,
+        } => put_cmd(&db, &key, &value, branch.as_deref(), sync),
+        Command::Delete {
+            db,
+            key,
+            branch,
+            sync,
+        } => delete_cmd(&db, &key, branch.as_deref(), sync),
         Command::RetentionFloor { db } => retention_floor_cmd(&db),
     }
 }
@@ -633,6 +668,36 @@ fn get_cmd(db: &Path, key: &str, branch: Option<&str>) -> anyhow::Result<()> {
         None => println!("not_found"),
     }
 
+    Ok(())
+}
+
+fn put_cmd(
+    db: &Path,
+    key: &str,
+    value: &str,
+    branch: Option<&str>,
+    sync: bool,
+) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    if let Some(branch_name) = branch {
+        db.checkout(branch_name)?;
+    }
+    db.put(
+        key.to_string(),
+        value.to_string(),
+        layerdb::WriteOptions { sync },
+    )?;
+    println!("put key={key} value={value} sync={sync}");
+    Ok(())
+}
+
+fn delete_cmd(db: &Path, key: &str, branch: Option<&str>, sync: bool) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    if let Some(branch_name) = branch {
+        db.checkout(branch_name)?;
+    }
+    db.delete(key.to_string(), layerdb::WriteOptions { sync })?;
+    println!("delete key={key} sync={sync}");
     Ok(())
 }
 

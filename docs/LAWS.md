@@ -125,5 +125,8 @@ Kinds:
   workflows.
 - `layerdb get --db <path> --key <k> [--branch <name>]` inspects visible values
   at either main (default) or an explicit branch head.
+- `layerdb put --db <path> --key <k> --value <v> [--branch <name>]` and
+  `layerdb delete --db <path> --key <k> [--branch <name>]` apply writes against
+  the selected branch head (default: `main`).
 - `layerdb retention-floor --db <path>` prints the effective sequence floor
   retained for snapshot+branch compaction safety.

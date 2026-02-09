@@ -75,11 +75,14 @@ fn metrics_cli_reports_core_sections() -> anyhow::Result<()> {
     assert!(stdout.contains("metrics cache=reader"), "stdout={stdout}");
     assert!(stdout.contains("metrics level=0"), "stdout={stdout}");
     assert!(stdout.contains("metrics level=1"), "stdout={stdout}");
+    assert!(stdout.contains("metrics debt level=0"), "stdout={stdout}");
+    assert!(stdout.contains("metrics debt l0_files="), "stdout={stdout}");
     assert!(stdout.contains("metrics compaction"), "stdout={stdout}");
     assert!(
         stdout.contains("metrics frozen_s3_files="),
         "stdout={stdout}"
     );
+    assert!(stdout.contains("metrics tier s3_gets="), "stdout={stdout}");
 
     Ok(())
 }
@@ -118,5 +121,22 @@ fn metrics_cli_reports_frozen_s3_counts() -> anyhow::Result<()> {
         .parse()?;
     assert!(count >= 1, "stdout={stdout}");
 
+    let tier_line = stdout
+        .lines()
+        .find(|line| line.starts_with("metrics tier "))
+        .ok_or_else(|| anyhow::anyhow!("missing tier line: {stdout}"))?;
+    let _ = parse_metric_field_u64(tier_line, "s3_gets")?;
+    let _ = parse_metric_field_u64(tier_line, "s3_get_cache_hits")?;
+    let _ = parse_metric_field_u64(tier_line, "s3_puts")?;
+    let _ = parse_metric_field_u64(tier_line, "s3_deletes")?;
+
     Ok(())
+}
+
+fn parse_metric_field_u64(line: &str, field: &str) -> anyhow::Result<u64> {
+    line.split_whitespace()
+        .find_map(|part| part.strip_prefix(&format!("{field}=")))
+        .ok_or_else(|| anyhow::anyhow!("missing field {field} in line: {line}"))?
+        .parse()
+        .map_err(Into::into)
 }

@@ -994,7 +994,17 @@ fn metrics_cmd(db: &Path) -> anyhow::Result<()> {
             "metrics level={} files={} bytes={} overlap_bytes={}",
             level, level_metrics.file_count, level_metrics.bytes, level_metrics.overlap_bytes
         );
+
+        let debt = metrics
+            .version
+            .compaction_debt_bytes_by_level
+            .get(&level)
+            .copied()
+            .unwrap_or(0);
+        println!("metrics debt level={} bytes={}", level, debt);
     }
+
+    println!("metrics debt l0_files={}", metrics.version.l0_file_debt);
 
     match (
         metrics.version.compaction_candidate_level,
@@ -1017,6 +1027,13 @@ fn metrics_cmd(db: &Path) -> anyhow::Result<()> {
     println!(
         "metrics frozen_s3_files={}",
         metrics.version.frozen_s3_files
+    );
+    println!(
+        "metrics tier s3_gets={} s3_get_cache_hits={} s3_puts={} s3_deletes={}",
+        metrics.version.tier.s3_gets,
+        metrics.version.tier.s3_get_cache_hits,
+        metrics.version.tier.s3_puts,
+        metrics.version.tier.s3_deletes,
     );
 
     Ok(())

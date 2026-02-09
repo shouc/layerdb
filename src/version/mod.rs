@@ -28,15 +28,45 @@ pub struct LevelMetricsSnapshot {
     pub overlap_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TierMetricsSnapshot {
+    pub s3_gets: u64,
+    pub s3_get_cache_hits: u64,
+    pub s3_puts: u64,
+    pub s3_deletes: u64,
+}
+
+#[derive(Debug, Default)]
+struct TierCounters {
+    s3_gets: AtomicU64,
+    s3_get_cache_hits: AtomicU64,
+    s3_puts: AtomicU64,
+    s3_deletes: AtomicU64,
+}
+
+impl TierCounters {
+    fn snapshot(&self) -> TierMetricsSnapshot {
+        TierMetricsSnapshot {
+            s3_gets: self.s3_gets.load(Ordering::Relaxed),
+            s3_get_cache_hits: self.s3_get_cache_hits.load(Ordering::Relaxed),
+            s3_puts: self.s3_puts.load(Ordering::Relaxed),
+            s3_deletes: self.s3_deletes.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct VersionMetrics {
     pub reader_cache: crate::cache::CacheStats,
     pub data_block_cache: Option<crate::cache::CacheStats>,
     pub levels: BTreeMap<u8, LevelMetricsSnapshot>,
+    pub compaction_debt_bytes_by_level: BTreeMap<u8, u64>,
+    pub l0_file_debt: usize,
     pub compaction_candidate_level: Option<u8>,
     pub compaction_candidate_score: Option<f64>,
     pub should_compact: bool,
     pub frozen_s3_files: usize,
+    pub tier: TierMetricsSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +93,7 @@ pub struct VersionSet {
     branches: RwLock<std::collections::BTreeMap<String, u64>>,
     current_branch: RwLock<String>,
     frozen_objects: RwLock<std::collections::BTreeMap<u64, FrozenObjectMeta>>,
+    tier_counters: TierCounters,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -144,6 +175,7 @@ impl VersionSet {
             branches: RwLock::new(branches),
             current_branch: RwLock::new("main".to_string()),
             frozen_objects: RwLock::new(frozen_objects),
+            tier_counters: TierCounters::default(),
         })
     }
 
@@ -328,6 +360,11 @@ impl VersionSet {
 
         let cache = self.sst_cache_path(file_id);
         if cache.exists() {
+            if s3.exists() {
+                self.tier_counters
+                    .s3_get_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(cache);
         }
 
@@ -363,6 +400,9 @@ impl VersionSet {
     fn hydrate_s3_to_cache(&self, file_id: u64, s3_path: &Path) -> anyhow::Result<PathBuf> {
         let cache = self.sst_cache_path(file_id);
         if cache.exists() {
+            self.tier_counters
+                .s3_get_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(cache);
         }
 
@@ -372,6 +412,7 @@ impl VersionSet {
 
         let tmp = cache.with_extension("tmp");
         std::fs::copy(s3_path, &tmp)?;
+        self.tier_counters.s3_gets.fetch_add(1, Ordering::Relaxed);
         {
             let fd = std::fs::OpenOptions::new()
                 .read(true)
@@ -416,6 +457,7 @@ impl VersionSet {
 
     pub fn metrics(&self) -> VersionMetrics {
         let mut levels = BTreeMap::new();
+        let mut compaction_debt_bytes_by_level = BTreeMap::new();
         let mut compaction_level_metrics = BTreeMap::new();
 
         {
@@ -449,10 +491,30 @@ impl VersionSet {
             &compaction_options,
         );
 
+        for (level, metrics) in &compaction_level_metrics {
+            let target = compaction_options
+                .target_level_bytes
+                .get(level)
+                .copied()
+                .unwrap_or(0);
+            let debt = metrics.bytes.saturating_sub(target);
+            compaction_debt_bytes_by_level.insert(*level, debt);
+        }
+
+        let l0_file_debt = compaction_level_metrics
+            .get(&0)
+            .map(|m| {
+                m.file_count
+                    .saturating_sub(compaction_options.l0_file_trigger)
+            })
+            .unwrap_or(0);
+
         VersionMetrics {
             reader_cache: self.reader_cache.stats(),
             data_block_cache: self.data_block_cache.as_ref().map(|cache| cache.stats()),
             levels,
+            compaction_debt_bytes_by_level,
+            l0_file_debt,
             compaction_candidate_level: candidate.as_ref().map(|c| c.level),
             compaction_candidate_score: candidate.as_ref().map(|c| c.score),
             should_compact: crate::compaction::CompactionPicker::should_compact(
@@ -460,6 +522,7 @@ impl VersionSet {
                 &compaction_options,
             ),
             frozen_s3_files: self.frozen_objects.read().len(),
+            tier: self.tier_counters.snapshot(),
         }
     }
 
@@ -701,6 +764,12 @@ impl VersionSet {
             removed += 1;
         }
 
+        if removed > 0 {
+            self.tier_counters
+                .s3_deletes
+                .fetch_add(removed as u64, Ordering::Relaxed);
+        }
+
         Ok(removed)
     }
 
@@ -714,6 +783,7 @@ impl VersionSet {
             }
             let dst_tmp = dst.with_extension("tmp");
             std::fs::copy(&src, &dst_tmp)?;
+            self.tier_counters.s3_puts.fetch_add(1, Ordering::Relaxed);
             {
                 let fd = std::fs::OpenOptions::new()
                     .read(true)

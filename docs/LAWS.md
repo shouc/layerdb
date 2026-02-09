@@ -113,7 +113,9 @@ Kinds:
 - `layerdb verify --db <path>` is an alias for `db-check`.
 - `layerdb metrics --db <path>` prints runtime counters including WAL durability
   progress, retention floor, branch head, cache hit/miss rates, level bytes,
-  overlap estimates, compaction candidate score, and frozen S3 file count.
+  overlap estimates, compaction debt, compaction candidate score, S3 tier
+  operation counters (`s3_gets`, `s3_get_cache_hits`, `s3_puts`, `s3_deletes`),
+  and frozen S3 file count.
 - `layerdb scrub --db <path>` scans all active SSTs and reports entry totals by
   level.
 - `layerdb bench --db <path> --workload <...>` supports `smoke`, `fill`,

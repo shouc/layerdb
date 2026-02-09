@@ -397,6 +397,9 @@ impl VersionSet {
                 idx += 1;
             }
         }
+
+        out_entries = drop_obsolete_range_tombstones_bottommost(out_entries, min_snapshot_seqno);
+
         if out_entries.is_empty() {
             return Ok(());
         }
@@ -571,6 +574,41 @@ fn find_l1_file<'a>(l1: &'a [AddFile], key: &[u8]) -> Option<&'a AddFile> {
 
 fn overlaps(a_smallest: &[u8], a_largest: &[u8], b_smallest: &[u8], b_largest: &[u8]) -> bool {
     !(a_largest < b_smallest || b_largest < a_smallest)
+}
+
+fn drop_obsolete_range_tombstones_bottommost(
+    entries: Vec<(InternalKey, Bytes)>,
+    min_snapshot_seqno: u64,
+) -> Vec<(InternalKey, Bytes)> {
+    let droppable: Vec<RangeTombstone> = entries
+        .iter()
+        .filter_map(|(key, value)| {
+            (key.kind == KeyKind::RangeDel && key.seqno < min_snapshot_seqno).then(|| {
+                RangeTombstone::new(key.user_key.clone(), value.clone(), key.seqno)
+            })
+        })
+        .collect();
+
+    if droppable.is_empty() {
+        return entries;
+    }
+
+    entries
+        .into_iter()
+        .filter(|(key, value)| match key.kind {
+            KeyKind::RangeDel => !droppable.iter().any(|t| {
+                t.seqno == key.seqno
+                    && t.start_key == key.user_key
+                    && t.end_key.as_ref() == value.as_ref()
+            }),
+            KeyKind::Put | KeyKind::Del => !droppable.iter().any(|t| {
+                key.seqno < t.seqno
+                    && t.start_key.as_ref() <= key.user_key.as_ref()
+                    && key.user_key.as_ref() < t.end_key.as_ref()
+            }),
+            _ => true,
+        })
+        .collect()
 }
 
 pub struct SstIter {

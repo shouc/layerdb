@@ -13,6 +13,24 @@ fn small_options() -> DbOptions {
     }
 }
 
+fn total_range_tombstones_in_sst_dir(db_dir: &std::path::Path) -> anyhow::Result<usize> {
+    let sst_dir = db_dir.join("sst");
+    if !sst_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut total = 0usize;
+    for entry in std::fs::read_dir(&sst_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sst") {
+            continue;
+        }
+        let reader = layerdb::sst::SstReader::open(&path)?;
+        total += reader.properties().range_tombstones.len();
+    }
+    Ok(total)
+}
+
 #[test]
 fn recover_from_wal_and_manifest() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
@@ -164,6 +182,67 @@ fn range_tombstones_hide_keys_across_snapshots() -> anyhow::Result<()> {
         )?,
         Some(bytes::Bytes::from("2"))
     );
+
+    Ok(())
+}
+
+#[test]
+fn compaction_drops_obsolete_range_tombstones_without_snapshots() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db = Db::open(dir.path(), small_options())?;
+
+    db.put(&b"a"[..], &b"1"[..], WriteOptions { sync: true })?;
+    db.put(&b"b"[..], &b"2"[..], WriteOptions { sync: true })?;
+    db.put(&b"c"[..], &b"3"[..], WriteOptions { sync: true })?;
+
+    db.delete_range(&b"b"[..], &b"d"[..], WriteOptions { sync: true })?;
+    db.put(&b"z"[..], &b"9"[..], WriteOptions { sync: true })?;
+    db.compact_range(None)?;
+
+    assert_eq!(db.get(b"a", ReadOptions::default())?, Some(bytes::Bytes::from("1")));
+    assert_eq!(db.get(b"b", ReadOptions::default())?, None);
+    assert_eq!(db.get(b"c", ReadOptions::default())?, None);
+    assert_eq!(db.get(b"z", ReadOptions::default())?, Some(bytes::Bytes::from("9")));
+
+    assert_eq!(total_range_tombstones_in_sst_dir(dir.path())?, 0);
+
+    Ok(())
+}
+
+#[test]
+fn compaction_keeps_range_tombstones_when_snapshot_is_pinned() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db = Db::open(dir.path(), small_options())?;
+
+    db.put(&b"b"[..], &b"2"[..], WriteOptions { sync: true })?;
+    db.put(&b"c"[..], &b"3"[..], WriteOptions { sync: true })?;
+    let snap_before_delete = db.create_snapshot()?;
+
+    db.delete_range(&b"b"[..], &b"d"[..], WriteOptions { sync: true })?;
+    db.compact_range(None)?;
+
+    assert_eq!(db.get(b"b", ReadOptions::default())?, None);
+    assert_eq!(db.get(b"c", ReadOptions::default())?, None);
+    assert_eq!(
+        db.get(
+            b"b",
+            ReadOptions {
+                snapshot: Some(snap_before_delete),
+            },
+        )?,
+        Some(bytes::Bytes::from("2"))
+    );
+    assert_eq!(
+        db.get(
+            b"c",
+            ReadOptions {
+                snapshot: Some(snap_before_delete),
+            },
+        )?,
+        Some(bytes::Bytes::from("3"))
+    );
+
+    assert!(total_range_tombstones_in_sst_dir(dir.path())? > 0);
 
     Ok(())
 }

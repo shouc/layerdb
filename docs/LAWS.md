@@ -11,6 +11,7 @@ Implementation details may evolve, but these invariants must remain true.
 - `get(key, ReadOptions { snapshot })`
 - `iter(range, ReadOptions { snapshot })`
 - `create_snapshot() -> SnapshotId`
+- `release_snapshot(snapshot)`
 - `create_branch(name, from_snapshot)` (optional)
 - `checkout(branch)` (optional)
 - `compact_range(optional range)` (manual trigger)
@@ -26,6 +27,8 @@ Implementation details may evolve, but these invariants must remain true.
 - **Read-your-writes per handle**: A `Db` handle uses an acknowledged seqno as
   the default read snapshot.
 - **Snapshots**: A snapshot is a consistent read at a seqno.
+- **Snapshot release**: Releasing a snapshot unpins it for future compaction
+  safety calculations.
 - **Deletes**: Deletes are tombstones; visibility depends on snapshot seqno.
 - **Range deletes**: Implemented conservatively. Tombstones are represented as
   `RangeDel` internal entries where key=`start`, value=`end` (`[start, end)`).

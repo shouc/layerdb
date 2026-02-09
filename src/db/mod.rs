@@ -160,6 +160,10 @@ impl Db {
             .create_snapshot_at(self.default_read_snapshot())
     }
 
+    pub fn release_snapshot(&self, snapshot: SnapshotId) {
+        self.inner.versions.snapshots().drop_snapshot(snapshot);
+    }
+
     pub fn create_branch(
         &self,
         name: impl AsRef<str>,

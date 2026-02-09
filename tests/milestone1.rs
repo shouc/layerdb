@@ -303,3 +303,33 @@ fn compact_range_only_compacts_overlapping_l0_inputs() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn releasing_snapshot_allows_later_tombstone_drop() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db = Db::open(dir.path(), small_options())?;
+
+    db.put(&b"b"[..], &b"2"[..], WriteOptions { sync: true })?;
+    db.put(&b"c"[..], &b"3"[..], WriteOptions { sync: true })?;
+    let snap = db.create_snapshot()?;
+
+    db.delete_range(&b"b"[..], &b"d"[..], WriteOptions { sync: true })?;
+    db.compact_range(None)?;
+    assert!(total_range_tombstones_in_sst_dir(dir.path())? > 0);
+
+    db.release_snapshot(snap);
+    db.put(&b"b"[..], &b"new-b"[..], WriteOptions { sync: true })?;
+    db.compact_range(Some(Range {
+        start: Bound::Included(bytes::Bytes::from("b")),
+        end: Bound::Excluded(bytes::Bytes::from("d")),
+    }))?;
+
+    assert_eq!(total_range_tombstones_in_sst_dir(dir.path())?, 0);
+    assert_eq!(
+        db.get(b"b", ReadOptions::default())?,
+        Some(bytes::Bytes::from("new-b"))
+    );
+    assert_eq!(db.get(b"c", ReadOptions::default())?, None);
+
+    Ok(())
+}

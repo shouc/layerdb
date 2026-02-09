@@ -103,3 +103,21 @@ Kinds:
 
 - Manual scrub: `Db::scrub_integrity()` and `layerdb scrub` verify all readable SST blocks.
 - Background scrubber: `Db::spawn_background_scrubber(interval)` runs periodic integrity scans and reports latest status.
+
+## Operational tooling
+
+- `layerdb manifest-dump --db <path>` replays and prints manifest records.
+- `layerdb sst-dump --sst <file>` prints table properties and sampled entries.
+- `layerdb db-check --db <path>` verifies manifest references, table roots, and
+  checksum-decoded readability.
+- `layerdb scrub --db <path>` scans all active SSTs and reports entry totals by
+  level.
+- `layerdb bench --db <path> --workload <...>` supports `smoke`, `fill`,
+  `readrandom`, `readseq`, `overwrite`, `delete-heavy`, `scan-heavy`, and
+  `compact`.
+- `layerdb compact-range --db <path> [--start k] [--end k]` triggers manual
+  compaction globally or over a bounded key range.
+- `layerdb ingest-sst --db <path> --sst <file>` installs an external SST using
+  manifest-safe durability ordering.
+- `layerdb rebalance-tiers --db <path>`, `freeze-level`, `thaw-level`,
+  `frozen-objects`, and `gc-s3` support local/HDD/S3 lifecycle workflows.

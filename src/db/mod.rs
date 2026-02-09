@@ -191,6 +191,15 @@ impl Db {
         Ok(())
     }
 
+    pub fn drop_branch(&self, name: impl AsRef<str>) -> anyhow::Result<()> {
+        self.inner.versions.delete_branch(name.as_ref())?;
+        self.read_snapshot.store(
+            self.inner.versions.current_branch_seqno(),
+            Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
     pub fn list_branches(&self) -> Vec<(String, u64)> {
         self.inner.versions.list_branches()
     }

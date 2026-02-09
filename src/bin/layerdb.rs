@@ -372,6 +372,7 @@ fn manifest_adds(db: &Path) -> anyhow::Result<Vec<(usize, layerdb::version::mani
                 }
             }
             layerdb::version::manifest::ManifestRecord::BranchHead(_) => {}
+            layerdb::version::manifest::ManifestRecord::DropBranch(_) => {}
         }
         offset += len;
     }

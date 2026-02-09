@@ -17,7 +17,7 @@ use crate::range_tombstone::RangeTombstone;
 use crate::sst::{SstProperties, SstReader};
 use crate::tier::StorageTier;
 use crate::version::manifest::{
-    AddFile, DeleteFile, FreezeFile, Manifest, ManifestRecord, MoveFile, VersionEdit,
+    AddFile, DeleteFile, DropBranch, FreezeFile, Manifest, ManifestRecord, MoveFile, VersionEdit,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +163,38 @@ impl VersionSet {
         }
 
         self.branches.write().insert(name.to_string(), from_seqno);
+        Ok(())
+    }
+
+    pub fn delete_branch(&self, name: &str) -> anyhow::Result<()> {
+        if name == "main" {
+            anyhow::bail!("cannot delete main branch");
+        }
+
+        {
+            let branches = self.branches.read();
+            if !branches.contains_key(name) {
+                anyhow::bail!("unknown branch: {name}");
+            }
+        }
+
+        {
+            let mut manifest = self.manifest.lock();
+            manifest.append(
+                &ManifestRecord::DropBranch(DropBranch {
+                    name: name.to_string(),
+                }),
+                true,
+            )?;
+            manifest.sync_dir()?;
+        }
+
+        self.branches.write().remove(name);
+
+        if self.current_branch() == name {
+            *self.current_branch.write() = "main".to_string();
+        }
+
         Ok(())
     }
 

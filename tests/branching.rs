@@ -187,3 +187,66 @@ fn create_branch_without_snapshot_uses_handle_default_snapshot() -> anyhow::Resu
 
     Ok(())
 }
+
+#[test]
+fn drop_branch_removes_and_persists() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+
+    {
+        let db = Db::open(dir.path(), options())?;
+        db.put(&b"k"[..], &b"v1"[..], WriteOptions { sync: true })?;
+        let snap = db.create_snapshot()?;
+        db.create_branch("feature", Some(snap))?;
+        assert!(db.list_branches().iter().any(|(name, _)| name == "feature"));
+
+        db.drop_branch("feature")?;
+        assert!(db.list_branches().iter().all(|(name, _)| name != "feature"));
+    }
+
+    {
+        let db = Db::open(dir.path(), options())?;
+        assert!(db.list_branches().iter().all(|(name, _)| name != "feature"));
+        let err = db
+            .checkout("feature")
+            .expect_err("deleted branch should not exist");
+        assert!(format!("{err:#}").contains("unknown branch"));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn drop_current_branch_switches_handle_to_main() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db = Db::open(dir.path(), options())?;
+
+    db.put(&b"k"[..], &b"v1"[..], WriteOptions { sync: true })?;
+    let snap_v1 = db.create_snapshot()?;
+    db.create_branch("feature", Some(snap_v1))?;
+    db.checkout("feature")?;
+    db.put(&b"k"[..], &b"v2"[..], WriteOptions { sync: true })?;
+
+    assert_eq!(db.current_branch(), "feature");
+    db.drop_branch("feature")?;
+
+    assert_eq!(db.current_branch(), "main");
+    assert_eq!(
+        db.get(b"k", ReadOptions::default())?,
+        Some(bytes::Bytes::from("v1"))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn drop_main_branch_is_rejected() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db = Db::open(dir.path(), options())?;
+
+    let err = db
+        .drop_branch("main")
+        .expect_err("main branch deletion must fail");
+    assert!(format!("{err:#}").contains("cannot delete main branch"));
+
+    Ok(())
+}

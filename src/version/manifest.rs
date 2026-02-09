@@ -16,6 +16,7 @@ pub enum ManifestRecord {
     FreezeFile(FreezeFile),
     VersionEdit(VersionEdit),
     BranchHead(BranchHead),
+    DropBranch(DropBranch),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -81,6 +82,11 @@ pub struct FreezeFile {
 pub struct BranchHead {
     pub name: String,
     pub seqno: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DropBranch {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -205,6 +211,9 @@ fn apply_record(state: &mut ManifestState, record: ManifestRecord) {
         }
         ManifestRecord::BranchHead(branch) => {
             state.branches.insert(branch.name, branch.seqno);
+        }
+        ManifestRecord::DropBranch(drop_branch) => {
+            state.branches.remove(&drop_branch.name);
         }
     }
 }

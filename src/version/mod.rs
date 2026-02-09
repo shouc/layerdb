@@ -16,7 +16,9 @@ use crate::internal_key::{InternalKey, KeyKind};
 use crate::range_tombstone::RangeTombstone;
 use crate::sst::{SstProperties, SstReader};
 use crate::tier::StorageTier;
-use crate::version::manifest::{AddFile, DeleteFile, Manifest, ManifestRecord, VersionEdit};
+use crate::version::manifest::{
+    AddFile, DeleteFile, Manifest, ManifestRecord, MoveFile, VersionEdit,
+};
 
 /// Version set + manifest.
 #[derive(Debug)]
@@ -242,6 +244,15 @@ impl VersionSet {
             .join(format!("sst_{file_id:016x}.sst"))
     }
 
+    fn sst_path_for_tier(&self, tier: StorageTier, file_id: u64) -> PathBuf {
+        let dir = match tier {
+            StorageTier::Nvme => self.dir.join("sst"),
+            StorageTier::Hdd => self.dir.join("sst_hdd"),
+            StorageTier::S3 => self.dir.join("sst_s3"),
+        };
+        dir.join(format!("sst_{file_id:016x}.sst"))
+    }
+
     pub fn snapshots(&self) -> &SnapshotTracker {
         &self.snapshots
     }
@@ -327,6 +338,100 @@ impl VersionSet {
         };
 
         Ok(Some(result))
+    }
+
+    pub fn rebalance_level_tiers(&self) -> anyhow::Result<usize> {
+        let mut moves = Vec::new();
+        {
+            let guard = self.levels.read();
+            for file in guard.l0.iter().chain(guard.l1.iter()) {
+                let target_tier = self.tier_for_level(file.level);
+                if file.tier != target_tier {
+                    moves.push((file.file_id, file.level, file.tier, target_tier));
+                }
+            }
+        }
+
+        for (file_id, level, from_tier, to_tier) in &moves {
+            self.move_file_between_tiers(*file_id, *level, *from_tier, *to_tier)?;
+        }
+
+        Ok(moves.len())
+    }
+
+    fn move_file_between_tiers(
+        &self,
+        file_id: u64,
+        level: u8,
+        from_tier: StorageTier,
+        to_tier: StorageTier,
+    ) -> anyhow::Result<()> {
+        let src = self.sst_path_for_tier(from_tier, file_id);
+        if !src.exists() {
+            // Recovery fallback: if file already moved, do not fail hard.
+            if self.sst_path_for_tier(to_tier, file_id).exists() {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "cannot move missing sst file_id={} from tier {:?}: {}",
+                file_id,
+                from_tier,
+                src.display()
+            );
+        }
+
+        let dst = self.sst_path_for_tier(to_tier, file_id);
+        let dst_tmp = dst.with_extension("tmp");
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        std::fs::copy(&src, &dst_tmp)?;
+        {
+            let fd = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&dst_tmp)?;
+            fd.sync_data()?;
+        }
+        std::fs::rename(&dst_tmp, &dst)?;
+        {
+            let parent = dst
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("destination has no parent"))?;
+            let dir_fd = std::fs::File::open(parent)?;
+            dir_fd.sync_all()?;
+        }
+
+        {
+            let mut manifest = self.manifest.lock();
+            manifest.append(
+                &ManifestRecord::MoveFile(MoveFile {
+                    file_id,
+                    level,
+                    tier: to_tier,
+                }),
+                true,
+            )?;
+            manifest.sync_dir()?;
+        }
+
+        {
+            let mut levels = self.levels.write();
+            for file in levels.l0.iter_mut() {
+                if file.file_id == file_id && file.level == level {
+                    file.tier = to_tier;
+                }
+            }
+            for file in levels.l1.iter_mut() {
+                if file.file_id == file_id && file.level == level {
+                    file.tier = to_tier;
+                }
+            }
+        }
+
+        let _ = std::fs::remove_file(src);
+        Ok(())
     }
 
     pub(crate) fn range_tombstones(

@@ -12,6 +12,7 @@ use crate::tier::StorageTier;
 pub enum ManifestRecord {
     AddFile(AddFile),
     DeleteFile(DeleteFile),
+    MoveFile(MoveFile),
     VersionEdit(VersionEdit),
     BranchHead(BranchHead),
 }
@@ -57,6 +58,13 @@ fn default_sst_format_version() -> u32 {
 pub struct DeleteFile {
     pub file_id: u64,
     pub level: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveFile {
+    pub file_id: u64,
+    pub level: u8,
+    pub tier: StorageTier,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +154,13 @@ fn apply_record(state: &mut ManifestState, record: ManifestRecord) {
         ManifestRecord::DeleteFile(del) => {
             if let Some(level) = state.levels.get_mut(&del.level) {
                 level.remove(&del.file_id);
+            }
+        }
+        ManifestRecord::MoveFile(mv) => {
+            if let Some(level) = state.levels.get_mut(&mv.level) {
+                if let Some(add) = level.get_mut(&mv.file_id) {
+                    add.tier = mv.tier;
+                }
             }
         }
         ManifestRecord::VersionEdit(edit) => {

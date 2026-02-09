@@ -37,6 +37,10 @@ enum Command {
         #[arg(long, default_value_t = 50_000)]
         keys: usize,
     },
+    RebalanceTiers {
+        #[arg(long)]
+        db: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -47,6 +51,7 @@ fn main() -> anyhow::Result<()> {
         Command::DbCheck { db } => db_check(&db),
         Command::Scrub { db } => scrub(&db),
         Command::Bench { db, keys } => bench(&db, keys),
+        Command::RebalanceTiers { db } => rebalance_tiers(&db),
     }
 }
 
@@ -264,6 +269,18 @@ fn bench(db: &Path, keys: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn rebalance_tiers(db: &Path) -> anyhow::Result<()> {
+    let options = layerdb::DbOptions {
+        enable_hdd_tier: true,
+        hot_levels_max: 0,
+        ..Default::default()
+    };
+    let db = layerdb::Db::open(db, options)?;
+    let moved = db.rebalance_tiers()?;
+    println!("rebalance_tiers moved={moved}");
+    Ok(())
+}
+
 fn manifest_adds(db: &Path) -> anyhow::Result<Vec<(usize, layerdb::version::manifest::AddFile)>> {
     let data = std::fs::read(db.join("MANIFEST"))?;
     let mut offset = 0usize;
@@ -290,6 +307,11 @@ fn manifest_adds(db: &Path) -> anyhow::Result<Vec<(usize, layerdb::version::mani
                 }
                 for del in edit.deletes {
                     adds.remove(&del.file_id);
+                }
+            }
+            layerdb::version::manifest::ManifestRecord::MoveFile(mv) => {
+                if let Some(add) = adds.get_mut(&mv.file_id) {
+                    add.tier = mv.tier;
                 }
             }
             layerdb::version::manifest::ManifestRecord::BranchHead(_) => {}

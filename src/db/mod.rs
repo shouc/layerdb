@@ -276,6 +276,10 @@ impl Db {
         Ok(())
     }
 
+    pub fn rebalance_tiers(&self) -> anyhow::Result<usize> {
+        self.inner.versions.rebalance_level_tiers()
+    }
+
     fn default_read_snapshot(&self) -> u64 {
         self.read_snapshot.load(Ordering::Relaxed)
     }

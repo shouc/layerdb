@@ -333,3 +333,22 @@ fn releasing_snapshot_allows_later_tombstone_drop() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn compact_range_with_no_overlap_is_noop() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db = Db::open(dir.path(), small_options())?;
+
+    db.put(&b"a"[..], &b"1"[..], WriteOptions { sync: true })?;
+    db.compact_range(Some(Range {
+        start: Bound::Included(bytes::Bytes::from("x")),
+        end: Bound::Excluded(bytes::Bytes::from("z")),
+    }))?;
+
+    assert_eq!(
+        db.get(b"a", ReadOptions::default())?,
+        Some(bytes::Bytes::from("1"))
+    );
+
+    Ok(())
+}

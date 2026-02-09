@@ -280,3 +280,24 @@ fn compaction_preserves_branch_history_without_pinned_snapshot() -> anyhow::Resu
 
     Ok(())
 }
+
+#[test]
+fn retention_floor_advances_after_drop_branch() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db = Db::open(dir.path(), options())?;
+
+    db.put(&b"k"[..], &b"v1"[..], WriteOptions { sync: true })?;
+    let snap_v1 = db.create_snapshot()?;
+    db.create_branch("feature", Some(snap_v1))?;
+    db.release_snapshot(snap_v1);
+
+    db.put(&b"k"[..], &b"v2"[..], WriteOptions { sync: true })?;
+
+    assert_eq!(db.retention_floor_seqno(), 1);
+
+    db.drop_branch("feature")?;
+
+    assert_eq!(db.retention_floor_seqno(), 2);
+
+    Ok(())
+}

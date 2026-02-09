@@ -67,6 +67,24 @@ pub struct SstProperties {
     pub data_bytes: u64,
     pub index_bytes: u64,
     pub table_root: TableRoot,
+
+    /// SST format version.
+    ///
+    /// - v1: range tombstones are stored as point entries only.
+    /// - v2: `range_tombstones` is populated from the write path.
+    #[serde(default = "default_sst_format_version")]
+    pub format_version: u32,
+
+    /// Range tombstones stored as metadata (v2+).
+    ///
+    /// When present, readers can avoid scanning the full table to discover
+    /// tombstones.
+    #[serde(default)]
+    pub range_tombstones: Vec<RangeTombstone>,
+}
+
+fn default_sst_format_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -117,6 +135,14 @@ pub struct SstBuilder {
     entries: u64,
     data_bytes: u64,
     table_hasher: blake3::Hasher,
+    range_tombstones: Vec<RangeTombstone>,
+}
+
+fn max_bytes(a: Option<Bytes>, b: Bytes) -> Bytes {
+    match a {
+        Some(current) => std::cmp::max(current, b),
+        None => b,
+    }
 }
 
 impl SstBuilder {
@@ -145,6 +171,7 @@ impl SstBuilder {
             entries: 0,
             data_bytes: 0,
             table_hasher: blake3::Hasher::new(),
+            range_tombstones: Vec::new(),
         })
     }
 
@@ -160,7 +187,28 @@ impl SstBuilder {
         if self.smallest_user_key.is_none() {
             self.smallest_user_key = Some(key.user_key.clone());
         }
-        self.largest_user_key = Some(key.user_key.clone());
+
+        match key.kind {
+            KeyKind::RangeDel => {
+                let end_key = Bytes::copy_from_slice(value);
+                self.range_tombstones.push(RangeTombstone {
+                    start_key: key.user_key.clone(),
+                    end_key: end_key.clone(),
+                    seqno: key.seqno,
+                });
+                self.smallest_user_key = Some(std::cmp::min(
+                    self.smallest_user_key.clone().unwrap_or_else(Bytes::new),
+                    key.user_key.clone(),
+                ));
+                self.largest_user_key = Some(max_bytes(self.largest_user_key.take(), end_key));
+            }
+            _ => {
+                self.largest_user_key = Some(max_bytes(
+                    self.largest_user_key.take(),
+                    key.user_key.clone(),
+                ));
+            }
+        }
         self.last_key = Some(key.clone());
         self.max_seqno = self.max_seqno.max(key.seqno);
         self.entries += 1;
@@ -210,6 +258,8 @@ impl SstBuilder {
             data_bytes: self.data_bytes,
             index_bytes: index_bytes.len() as u64,
             table_root,
+            format_version: 2,
+            range_tombstones: self.range_tombstones.clone(),
         };
         let props_bytes =
             bincode::serialize(&props).map_err(|_| SstError::Corrupt("props serialize"))?;
@@ -308,12 +358,19 @@ impl SstReader {
             return Err(SstError::Corrupt("table root mismatch"));
         }
 
+        let mut range_tombstones_cache = None;
+        if props.format_version >= 2 {
+            let mut cached = props.range_tombstones.clone();
+            cached.sort_by(|a, b| b.seqno.cmp(&a.seqno));
+            range_tombstones_cache = Some(cached);
+        }
+
         Ok(Self {
             path,
             mmap,
             index,
             props,
-            range_tombstones_cache: parking_lot::Mutex::new(None),
+            range_tombstones_cache: parking_lot::Mutex::new(range_tombstones_cache),
         })
     }
 
@@ -333,26 +390,22 @@ impl SstReader {
             snapshot_seqno,
             KeyKind::Meta,
         );
-        let block = match self.find_block(&target) {
-            None => return Ok(None),
-            Some(h) => h,
-        };
-        let entries = self.read_block(block)?;
+        let candidate = if let Some(block) = self.find_block(&target) {
+            let entries = self.read_block(block)?;
 
-        let pos = match entries.binary_search_by(|(k, _)| k.cmp(&target)) {
-            Ok(i) | Err(i) => i,
-        };
-        let (k, v) = match entries.get(pos) {
-            None => return Ok(None),
-            Some(entry) => entry.clone(),
-        };
-        if k.user_key.as_ref() != user_key {
-            return Ok(None);
-        }
-        let candidate = match k.kind {
-            KeyKind::Put => Some((k.seqno, Some(v))),
-            KeyKind::Del => Some((k.seqno, None)),
-            _ => None,
+            let pos = match entries.binary_search_by(|(k, _)| k.cmp(&target)) {
+                Ok(i) | Err(i) => i,
+            };
+            match entries.get(pos).cloned() {
+                Some((k, v)) if k.user_key.as_ref() == user_key => match k.kind {
+                    KeyKind::Put => Some((k.seqno, Some(v))),
+                    KeyKind::Del => Some((k.seqno, None)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        } else {
+            None
         };
 
         match (candidate, tombstone_seq) {
@@ -398,6 +451,13 @@ impl SstReader {
     fn load_range_tombstones_all(&self) -> Result<Vec<RangeTombstone>, SstError> {
         if let Some(cached) = self.range_tombstones_cache.lock().as_ref() {
             return Ok(cached.clone());
+        }
+
+        if self.props.format_version >= 2 {
+            let mut cached = self.props.range_tombstones.clone();
+            cached.sort_by(|a, b| b.seqno.cmp(&a.seqno));
+            *self.range_tombstones_cache.lock() = Some(cached.clone());
+            return Ok(cached);
         }
 
         let mut out = Vec::new();

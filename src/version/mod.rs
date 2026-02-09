@@ -256,7 +256,34 @@ impl VersionSet {
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let out_entries = entries;
+        let min_snapshot_seqno = self.snapshots.min_pinned_seqno();
+        let mut out_entries = Vec::with_capacity(entries.len());
+        let mut idx = 0usize;
+        while idx < entries.len() {
+            let user_key = entries[idx].0.user_key.clone();
+            let mut kept_point_below_min = false;
+            while idx < entries.len() && entries[idx].0.user_key == user_key {
+                let (ikey, value) = &entries[idx];
+                match ikey.kind {
+                    KeyKind::Put | KeyKind::Del => {
+                        if ikey.seqno >= min_snapshot_seqno {
+                            out_entries.push((ikey.clone(), value.clone()));
+                        } else if !kept_point_below_min {
+                            kept_point_below_min = true;
+                            if ikey.kind == KeyKind::Put {
+                                out_entries.push((ikey.clone(), value.clone()));
+                            }
+                        }
+                    }
+                    KeyKind::RangeDel => {
+                        // Range tombstones are not dropped yet (v2).
+                        out_entries.push((ikey.clone(), value.clone()));
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+        }
         if out_entries.is_empty() {
             return Ok(());
         }

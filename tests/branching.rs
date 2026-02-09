@@ -157,3 +157,33 @@ fn reopen_defaults_to_main_branch_head() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn create_branch_without_snapshot_uses_handle_default_snapshot() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db = Db::open(dir.path(), options())?;
+
+    db.put(&b"k"[..], &b"v1"[..], WriteOptions { sync: true })?;
+    let snap_v1 = db.create_snapshot()?;
+    db.create_branch("from_v1", Some(snap_v1))?;
+
+    db.put(&b"k"[..], &b"v2"[..], WriteOptions { sync: true })?;
+
+    // Move this handle's default snapshot back to v1.
+    db.checkout("from_v1")?;
+    assert_eq!(
+        db.get(b"k", ReadOptions::default())?,
+        Some(bytes::Bytes::from("v1"))
+    );
+
+    // Branch with `None` should use this handle default (v1), not global latest (v2).
+    db.create_branch("from_current", None)?;
+
+    db.checkout("from_current")?;
+    assert_eq!(
+        db.get(b"k", ReadOptions::default())?,
+        Some(bytes::Bytes::from("v1"))
+    );
+
+    Ok(())
+}

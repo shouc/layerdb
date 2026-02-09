@@ -169,11 +169,14 @@ impl Db {
         name: impl AsRef<str>,
         from_snapshot: Option<SnapshotId>,
     ) -> anyhow::Result<()> {
-        let seqno = self
-            .inner
-            .versions
-            .snapshots()
-            .resolve_read_snapshot(from_snapshot)?;
+        let seqno = match from_snapshot {
+            Some(snapshot) => self
+                .inner
+                .versions
+                .snapshots()
+                .resolve_read_snapshot(Some(snapshot))?,
+            None => self.default_read_snapshot(),
+        };
         self.inner.versions.create_branch(name.as_ref(), seqno)
     }
 

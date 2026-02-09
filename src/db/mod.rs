@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
+use rayon::prelude::*;
 
 use crate::memtable::MemTableManager;
 use crate::version::VersionSet;
@@ -280,6 +281,43 @@ impl Db {
         self.inner.versions.rebalance_level_tiers()
     }
 
+    pub fn scrub_integrity(&self) -> anyhow::Result<ScrubReport> {
+        let files = self.inner.versions.all_files_snapshot();
+
+        let results: Vec<anyhow::Result<(u8, u64)>> = files
+            .par_iter()
+            .map(|add| {
+                let path = self
+                    .inner
+                    .versions
+                    .resolve_sst_path(add.level, add.file_id)
+                    .with_context(|| {
+                        format!("resolve sst for scrub file_id={}", add.file_id)
+                    })?;
+                let reader = crate::sst::SstReader::open(&path)
+                    .with_context(|| format!("open sst for scrub {}", path.display()))?;
+
+                let mut iter = reader.iter(u64::MAX)?;
+                iter.seek_to_first();
+                let mut entries = 0u64;
+                while let Some(next) = iter.next() {
+                    let _ = next?;
+                    entries += 1;
+                }
+
+                Ok((add.level, entries))
+            })
+            .collect();
+
+        let mut report = ScrubReport::default();
+        for result in results {
+            let (level, entries) = result?;
+            *report.entries_by_level.entry(level).or_default() += entries;
+            report.files_checked += 1;
+        }
+        Ok(report)
+    }
+
     fn default_read_snapshot(&self) -> u64 {
         self.read_snapshot.load(Ordering::Relaxed)
     }
@@ -288,3 +326,9 @@ impl Db {
 pub mod iterator;
 
 pub use iterator::DbIterator;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrubReport {
+    pub files_checked: usize,
+    pub entries_by_level: std::collections::BTreeMap<u8, u64>,
+}

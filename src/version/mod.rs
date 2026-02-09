@@ -44,7 +44,20 @@ struct Levels {
     l1: Vec<AddFile>,
 }
 
+impl Levels {
+    pub(crate) fn all_files(&self) -> Vec<AddFile> {
+        let mut out = Vec::with_capacity(self.l0.len() + self.l1.len());
+        out.extend(self.l0.clone());
+        out.extend(self.l1.clone());
+        out
+    }
+}
+
 impl VersionSet {
+    pub(crate) fn all_files_snapshot(&self) -> Vec<AddFile> {
+        self.levels.read().all_files()
+    }
+
     pub fn recover(dir: &Path, options: &DbOptions) -> anyhow::Result<Self> {
         let (manifest, state) = Manifest::open(dir)?;
         let mut l0 = Vec::new();
@@ -218,7 +231,7 @@ impl VersionSet {
         }
     }
 
-    fn resolve_sst_path(&self, level: u8, file_id: u64) -> anyhow::Result<PathBuf> {
+    pub(crate) fn resolve_sst_path(&self, level: u8, file_id: u64) -> anyhow::Result<PathBuf> {
         let primary = self.sst_path(level, file_id);
         if primary.exists() {
             return Ok(primary);

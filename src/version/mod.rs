@@ -501,7 +501,7 @@ impl VersionSet {
         Ok(())
     }
 
-    pub fn ingest_external_sst(&self, source_path: &Path) -> anyhow::Result<u64> {
+    pub fn ingest_external_sst(&self, source_path: &Path) -> anyhow::Result<(u64, u64)> {
         let source_reader = SstReader::open(source_path)
             .with_context(|| format!("open source sst {}", source_path.display()))?;
         let props = source_reader.properties().clone();
@@ -542,7 +542,7 @@ impl VersionSet {
 
         self.install_sst(file_id, &props)?;
         self.advance_current_branch(props.max_seqno)?;
-        Ok(file_id)
+        Ok((file_id, props.max_seqno))
     }
 
     fn apply_compaction_edit(

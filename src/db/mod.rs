@@ -264,10 +264,13 @@ impl Db {
 
     pub fn ingest_sst(&self, sst_path: impl AsRef<Path>) -> anyhow::Result<()> {
         let path = sst_path.as_ref();
-        self.inner
+        let (_file_id, max_seqno) = self
+            .inner
             .versions
             .ingest_external_sst(path)
             .with_context(|| format!("ingest sst {}", path.display()))?;
+
+        self.inner.wal.ensure_next_seqno_at_least(max_seqno.saturating_add(1));
         self.read_snapshot
             .store(self.inner.versions.latest_seqno(), Ordering::Relaxed);
         Ok(())

@@ -28,7 +28,7 @@ pub enum WalError {
 pub struct Wal {
     tx: mpsc::UnboundedSender<WalRequest>,
     flush_tx: mpsc::UnboundedSender<FlushSignal>,
-    _next_seqno: Arc<AtomicU64>,
+    next_seqno: Arc<AtomicU64>,
     last_ack_seqno: Arc<AtomicU64>,
     last_durable_seqno: Arc<AtomicU64>,
     wal_thread: Option<thread::JoinHandle<()>>,
@@ -130,7 +130,7 @@ impl Wal {
         Ok(Self {
             tx,
             flush_tx,
-            _next_seqno: next_seqno,
+            next_seqno,
             last_ack_seqno,
             last_durable_seqno,
             wal_thread: Some(wal_thread),
@@ -167,6 +167,21 @@ impl Wal {
 
     pub fn last_acknowledged_seqno(&self) -> u64 {
         self.last_ack_seqno.load(Ordering::Relaxed)
+    }
+
+    pub fn ensure_next_seqno_at_least(&self, min_next_seqno: u64) {
+        let mut current = self.next_seqno.load(Ordering::Relaxed);
+        while current < min_next_seqno {
+            match self.next_seqno.compare_exchange_weak(
+                current,
+                min_next_seqno,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     pub(crate) fn force_rotate_for_flush(&self) -> anyhow::Result<()> {

@@ -32,6 +32,16 @@ fn build_external_sst(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn build_external_high_seq_sst(path: &std::path::Path) -> anyhow::Result<()> {
+    let mut builder = SstBuilder::create(path, 99, 4 * 1024)?;
+    builder.add(
+        &InternalKey::new(Bytes::from("k"), 100, KeyKind::Put),
+        b"old-high",
+    )?;
+    let _props = builder.finish()?;
+    Ok(())
+}
+
 #[test]
 fn ingest_sst_makes_data_visible_and_persists_manifest() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
@@ -109,6 +119,27 @@ fn ingest_sst_assigns_new_file_id_and_keeps_source() -> anyhow::Result<()> {
         .join(format!("sst_{:016x}.sst", file_ids[0]));
     assert!(ingested_path.exists());
     assert!(source_path.exists(), "source sst should be preserved");
+
+    Ok(())
+}
+
+#[test]
+fn writes_after_ingest_get_higher_seqnos() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let ext_dir = TempDir::new()?;
+
+    let source_path = ext_dir.path().join("sst_0000000000000063.sst");
+    build_external_high_seq_sst(ext_dir.path())?;
+
+    let db = Db::open(dir.path(), options())?;
+    db.ingest_sst(&source_path)?;
+
+    db.put(&b"k"[..], &b"new"[..], layerdb::WriteOptions { sync: true })?;
+
+    assert_eq!(
+        db.get(b"k", ReadOptions::default())?,
+        Some(Bytes::from("new"))
+    );
 
     Ok(())
 }

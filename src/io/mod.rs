@@ -477,6 +477,32 @@ mod tests {
         assert_eq!(got.as_ref(), b"abcdef");
     }
 
+    #[tokio::test]
+    async fn executor_append_many_handles_large_chunk_sets() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("data_many_large.bin");
+        let io = UringExecutor::new(8);
+
+        let mut expected = Vec::new();
+        let mut chunks = Vec::new();
+        for i in 0..128u16 {
+            let len = 1024 + (i as usize % 31);
+            let byte = (i % 251) as u8;
+            let chunk = vec![byte; len];
+            expected.extend_from_slice(&chunk);
+            chunks.push(chunk);
+        }
+
+        let offset0 = io.append_many(&path, chunks).await.expect("append_many");
+        assert_eq!(offset0, 0);
+
+        let got = io
+            .read_exact_at(&path, 0, expected.len())
+            .await
+            .expect("read");
+        assert_eq!(got.as_ref(), expected.as_slice());
+    }
+
     #[test]
     fn buf_pool_reuses_bucketed_buffers() {
         let pool = BufPool::new([16, 64], 8);

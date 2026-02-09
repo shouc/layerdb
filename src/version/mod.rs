@@ -1,6 +1,7 @@
 pub mod manifest;
 
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use bytes::Bytes;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
 use crate::cache::BlockCacheKey;
 use crate::db::iterator::range_contains;
@@ -15,7 +17,7 @@ use crate::db::snapshot::SnapshotTracker;
 use crate::db::{DbOptions, LookupResult, OpKind, Range, Value};
 use crate::internal_key::{InternalKey, KeyKind};
 use crate::range_tombstone::RangeTombstone;
-use crate::sst::{SstProperties, SstReader};
+use crate::sst::{SstIoContext, SstProperties, SstReader};
 use crate::tier::StorageTier;
 use crate::version::manifest::{
     AddFile, DeleteFile, DropBranch, FreezeFile, Manifest, ManifestRecord, MoveFile, VersionEdit,
@@ -78,6 +80,23 @@ pub struct FrozenObjectMeta {
     pub superblock_bytes: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct S3SuperblockMeta {
+    id: u32,
+    len: u32,
+    hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct S3ObjectMetaFile {
+    file_id: u64,
+    level: u8,
+    object_id: String,
+    superblock_bytes: u32,
+    total_bytes: u64,
+    superblocks: Vec<S3SuperblockMeta>,
+}
+
 /// Version set + manifest.
 #[derive(Debug)]
 pub struct VersionSet {
@@ -90,6 +109,7 @@ pub struct VersionSet {
     reader_cache: crate::cache::ClockProCache<PathBuf, SstReader>,
     data_block_cache:
         Option<Arc<crate::cache::ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
+    sst_io_ctx: Option<Arc<SstIoContext>>,
     branches: RwLock<std::collections::BTreeMap<String, u64>>,
     current_branch: RwLock<String>,
     frozen_objects: RwLock<std::collections::BTreeMap<u64, FrozenObjectMeta>>,
@@ -159,6 +179,15 @@ impl VersionSet {
             );
         }
 
+        let sst_io_ctx = if options.sst_use_io_executor_reads || options.sst_use_io_executor_writes {
+            Some(Arc::new(SstIoContext::new(
+                crate::io::UringExecutor::new(options.io_max_in_flight.max(1)),
+                crate::io::BufPool::default(),
+            )))
+        } else {
+            None
+        };
+
         Ok(Self {
             dir: dir.to_path_buf(),
             options: options.clone(),
@@ -172,6 +201,7 @@ impl VersionSet {
                     options.block_cache_entries,
                 ))
             }),
+            sst_io_ctx,
             branches: RwLock::new(branches),
             current_branch: RwLock::new("main".to_string()),
             frozen_objects: RwLock::new(frozen_objects),
@@ -314,10 +344,24 @@ impl VersionSet {
         if let Some(reader) = self.reader_cache.get(&key) {
             return Ok(reader);
         }
-        let reader = Arc::new(SstReader::open_with_cache(
-            path,
-            self.data_block_cache.clone(),
-        )?);
+
+        let reader = if self.options.sst_use_io_executor_reads {
+            let io_ctx = self
+                .sst_io_ctx
+                .as_ref()
+                .context("sst io executor requested but not configured")?;
+            Arc::new(SstReader::open_with_io(
+                path,
+                io_ctx.clone(),
+                self.data_block_cache.clone(),
+            )?)
+        } else {
+            Arc::new(SstReader::open_with_cache(
+                path,
+                self.data_block_cache.clone(),
+            )?)
+        };
+
         self.reader_cache.insert(key, reader.clone());
         Ok(reader)
     }
@@ -347,7 +391,7 @@ impl VersionSet {
                 .join("sst_hdd")
                 .join(format!("sst_{file_id:016x}.sst"))
         };
-        let s3 = self
+        let legacy_s3 = self
             .dir
             .join("sst_s3")
             .join(format!("sst_{file_id:016x}.sst"));
@@ -360,7 +404,12 @@ impl VersionSet {
 
         let cache = self.sst_cache_path(file_id);
         if cache.exists() {
-            if s3.exists() {
+            let has_s3 = legacy_s3.exists() || self
+                .frozen_objects
+                .read()
+                .get(&file_id)
+                .is_some_and(|frozen| self.s3_object_meta_path(frozen.level, &frozen.object_id).exists());
+            if has_s3 {
                 self.tier_counters
                     .s3_get_cache_hits
                     .fetch_add(1, Ordering::Relaxed);
@@ -368,12 +417,21 @@ impl VersionSet {
             return Ok(cache);
         }
 
-        if s3.exists() {
-            return self.hydrate_s3_to_cache(file_id, &s3);
+        if let Some(frozen) = self.frozen_objects.read().get(&file_id).cloned() {
+            if self
+                .s3_object_meta_path(frozen.level, &frozen.object_id)
+                .exists()
+            {
+                return self.hydrate_s3_object_to_cache(&frozen);
+            }
+        }
+
+        if legacy_s3.exists() {
+            return self.hydrate_legacy_s3_to_cache(file_id, &legacy_s3);
         }
 
         anyhow::bail!(
-            "manifest references missing sst file_id={file_id} level={level}: primary={primary:?} secondary={secondary:?} s3={s3:?} cache={cache:?}"
+            "manifest references missing sst file_id={file_id} level={level}: primary={primary:?} secondary={secondary:?} s3={legacy_s3:?} cache={cache:?}"
         )
     }
 
@@ -397,7 +455,7 @@ impl VersionSet {
             .join(format!("sst_{file_id:016x}.sst"))
     }
 
-    fn hydrate_s3_to_cache(&self, file_id: u64, s3_path: &Path) -> anyhow::Result<PathBuf> {
+    fn hydrate_legacy_s3_to_cache(&self, file_id: u64, s3_path: &Path) -> anyhow::Result<PathBuf> {
         let cache = self.sst_cache_path(file_id);
         if cache.exists() {
             self.tier_counters
@@ -429,6 +487,246 @@ impl VersionSet {
         dir_fd.sync_all()?;
 
         Ok(cache)
+    }
+
+    fn hydrate_s3_object_to_cache(&self, frozen: &FrozenObjectMeta) -> anyhow::Result<PathBuf> {
+        let cache = self.sst_cache_path(frozen.file_id);
+        if cache.exists() {
+            self.tier_counters
+                .s3_get_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(cache);
+        }
+
+        if let Some(parent) = cache.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let tmp = cache.with_extension("tmp");
+        let _ = std::fs::remove_file(&tmp);
+        let meta = self.load_s3_object_meta(frozen.level, &frozen.object_id)?;
+        if meta.file_id != frozen.file_id {
+            anyhow::bail!(
+                "s3 meta file_id mismatch for {}: expected {} got {}",
+                frozen.object_id,
+                frozen.file_id,
+                meta.file_id
+            );
+        }
+
+        let mut out = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&tmp)
+            .with_context(|| format!("open cache tmp {}", tmp.display()))?;
+
+        for sb in &meta.superblocks {
+            let path = self.s3_superblock_path(meta.level, &meta.object_id, sb.id);
+            let data = std::fs::read(&path)
+                .with_context(|| format!("read superblock {}", path.display()))?;
+            if data.len() != sb.len as usize {
+                anyhow::bail!(
+                    "superblock length mismatch for {} sb={} expected {} got {}",
+                    meta.object_id,
+                    sb.id,
+                    sb.len,
+                    data.len()
+                );
+            }
+            let hash = blake3::hash(&data);
+            if hash.as_bytes() != sb.hash.as_slice() {
+                anyhow::bail!(
+                    "superblock hash mismatch for {} sb={}",
+                    meta.object_id,
+                    sb.id
+                );
+            }
+            out.write_all(&data)
+                .with_context(|| format!("write cache tmp {}", tmp.display()))?;
+            self.tier_counters.s3_gets.fetch_add(1, Ordering::Relaxed);
+        }
+
+        out.sync_data()
+            .with_context(|| format!("sync cache tmp {}", tmp.display()))?;
+        drop(out);
+
+        std::fs::rename(&tmp, &cache)
+            .with_context(|| format!("rename cache {} -> {}", tmp.display(), cache.display()))?;
+
+        let parent = cache
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("cache file has no parent"))?;
+        let dir_fd = std::fs::File::open(parent)?;
+        dir_fd.sync_all()?;
+
+        Ok(cache)
+    }
+
+    fn s3_level_dir(&self, level: u8) -> PathBuf {
+        self.dir.join("sst_s3").join(format!("L{level}"))
+    }
+
+    fn s3_object_dir(&self, level: u8, object_id: &str) -> PathBuf {
+        self.s3_level_dir(level).join(object_id)
+    }
+
+    fn s3_object_tmp_dir(&self, level: u8, object_id: &str) -> PathBuf {
+        self.s3_level_dir(level).join(format!("{object_id}.tmp"))
+    }
+
+    fn s3_object_meta_path(&self, level: u8, object_id: &str) -> PathBuf {
+        self.s3_object_dir(level, object_id).join("meta.bin")
+    }
+
+    fn s3_superblock_path(&self, level: u8, object_id: &str, superblock_id: u32) -> PathBuf {
+        self.s3_object_dir(level, object_id)
+            .join(format!("sb_{superblock_id:08}.bin"))
+    }
+
+    fn load_s3_object_meta(&self, level: u8, object_id: &str) -> anyhow::Result<S3ObjectMetaFile> {
+        let path = self.s3_object_meta_path(level, object_id);
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read s3 meta {}", path.display()))?;
+        let meta: S3ObjectMetaFile = bincode::deserialize(&bytes)
+            .with_context(|| format!("decode s3 meta {}", path.display()))?;
+        Ok(meta)
+    }
+
+    fn write_s3_object_from_file(
+        &self,
+        frozen: &FrozenObjectMeta,
+        src: &Path,
+    ) -> anyhow::Result<()> {
+        let level_dir = self.s3_level_dir(frozen.level);
+        std::fs::create_dir_all(&level_dir)
+            .with_context(|| format!("create s3 level dir {}", level_dir.display()))?;
+
+        let object_dir = self.s3_object_dir(frozen.level, &frozen.object_id);
+        let tmp_dir = self.s3_object_tmp_dir(frozen.level, &frozen.object_id);
+        if object_dir.exists() {
+            std::fs::remove_dir_all(&object_dir).with_context(|| {
+                format!("remove existing s3 object dir {}", object_dir.display())
+            })?;
+        }
+        if tmp_dir.exists() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+        std::fs::create_dir_all(&tmp_dir)
+            .with_context(|| format!("create s3 tmp dir {}", tmp_dir.display()))?;
+
+        let mut file = std::fs::File::open(src)
+            .with_context(|| format!("open sst for freeze {}", src.display()))?;
+        let mut superblocks = Vec::new();
+        let mut total_bytes = 0u64;
+        let chunk_len: usize = frozen
+            .superblock_bytes
+            .try_into()
+            .context("superblock_bytes overflow")?;
+        if chunk_len == 0 {
+            anyhow::bail!("superblock_bytes must be > 0");
+        }
+
+        let mut id = 0u32;
+        loop {
+            let mut buf = vec![0u8; chunk_len];
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            buf.truncate(n);
+
+            let hash = blake3::hash(&buf);
+            let tmp_path = tmp_dir.join(format!("sb_{id:08}.tmp"));
+            let final_path = tmp_dir.join(format!("sb_{id:08}.bin"));
+            {
+                let mut out = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .read(true)
+                    .open(&tmp_path)
+                    .with_context(|| format!("open sb tmp {}", tmp_path.display()))?;
+                out.write_all(&buf)
+                    .with_context(|| format!("write sb tmp {}", tmp_path.display()))?;
+                out.sync_data()
+                    .with_context(|| format!("sync sb tmp {}", tmp_path.display()))?;
+            }
+            std::fs::rename(&tmp_path, &final_path).with_context(|| {
+                format!(
+                    "rename superblock {} -> {}",
+                    tmp_path.display(),
+                    final_path.display()
+                )
+            })?;
+
+            superblocks.push(S3SuperblockMeta {
+                id,
+                len: n as u32,
+                hash: *hash.as_bytes(),
+            });
+            total_bytes = total_bytes.saturating_add(n as u64);
+            id = id.saturating_add(1);
+
+            self.tier_counters.s3_puts.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let meta = S3ObjectMetaFile {
+            file_id: frozen.file_id,
+            level: frozen.level,
+            object_id: frozen.object_id.clone(),
+            superblock_bytes: frozen.superblock_bytes,
+            total_bytes,
+            superblocks,
+        };
+        let meta_bytes = bincode::serialize(&meta).context("encode s3 meta")?;
+        let meta_tmp = tmp_dir.join("meta.tmp");
+        let meta_final = tmp_dir.join("meta.bin");
+        {
+            let mut out = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .read(true)
+                .open(&meta_tmp)
+                .with_context(|| format!("open meta tmp {}", meta_tmp.display()))?;
+            out.write_all(&meta_bytes)
+                .with_context(|| format!("write meta tmp {}", meta_tmp.display()))?;
+            out.sync_data()
+                .with_context(|| format!("sync meta tmp {}", meta_tmp.display()))?;
+        }
+        std::fs::rename(&meta_tmp, &meta_final).with_context(|| {
+            format!("rename meta {} -> {}", meta_tmp.display(), meta_final.display())
+        })?;
+        self.tier_counters.s3_puts.fetch_add(1, Ordering::Relaxed);
+
+        // Ensure all files created in tmp_dir are durable before renaming.
+        {
+            let dir_fd = std::fs::File::open(&tmp_dir)
+                .with_context(|| format!("open tmp dir {}", tmp_dir.display()))?;
+            dir_fd
+                .sync_all()
+                .with_context(|| format!("sync tmp dir {}", tmp_dir.display()))?;
+        }
+
+        std::fs::rename(&tmp_dir, &object_dir).with_context(|| {
+            format!(
+                "rename object dir {} -> {}",
+                tmp_dir.display(),
+                object_dir.display()
+            )
+        })?;
+
+        {
+            let dir_fd = std::fs::File::open(&level_dir)
+                .with_context(|| format!("open level dir {}", level_dir.display()))?;
+            dir_fd
+                .sync_all()
+                .with_context(|| format!("sync level dir {}", level_dir.display()))?;
+        }
+
+        Ok(())
     }
 
     pub fn snapshots(&self) -> &SnapshotTracker {
@@ -535,12 +833,15 @@ impl VersionSet {
         key: &[u8],
         snapshot_seqno: u64,
     ) -> anyhow::Result<Option<LookupResult>> {
-        let levels = self.levels.read();
+        let (l0_files, l1_files) = {
+            let levels = self.levels.read();
+            (levels.l0.clone(), levels.l1.clone())
+        };
 
         let mut candidate: Option<(u64, Option<Value>)> = None;
 
         // L0: searched newest-first; may overlap.
-        for add in levels.l0.iter().rev() {
+        for add in l0_files.iter().rev() {
             if !range_contains(
                 &(
                     std::ops::Bound::Included(add.smallest_user_key.clone()),
@@ -561,7 +862,7 @@ impl VersionSet {
         }
 
         // L1: non-overlapping; binary search by key range.
-        if let Some(add) = find_l1_file(&levels.l1, key) {
+        if let Some(add) = find_l1_file(&l1_files, key) {
             let path = self.resolve_sst_path(add.level, add.file_id)?;
             let reader = self.cached_reader(&path)?;
             if let Some((seqno, v)) = reader.get(key, snapshot_seqno)? {
@@ -616,11 +917,16 @@ impl VersionSet {
             }
         }
 
-        for (file_id, level, from_tier, to_tier) in &moves {
+        let max_moves = self.options.tier_rebalance_max_moves;
+        if max_moves == 0 {
+            return Ok(0);
+        }
+
+        for (file_id, level, from_tier, to_tier) in moves.iter().take(max_moves) {
             self.move_file_between_tiers(*file_id, *level, *from_tier, *to_tier)?;
         }
 
-        Ok(moves.len())
+        Ok(moves.len().min(max_moves))
     }
 
     pub fn freeze_level_to_s3(&self, level: u8, max_files: Option<usize>) -> anyhow::Result<usize> {
@@ -743,6 +1049,8 @@ impl VersionSet {
         }
 
         let mut removed = 0usize;
+
+        // Backward-compatible GC for legacy `sst_s3/sst_{id}.sst` objects.
         for entry in std::fs::read_dir(&s3_dir)? {
             let path = entry?.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("sst") {
@@ -764,6 +1072,50 @@ impl VersionSet {
             removed += 1;
         }
 
+        // GC for superblock-based objects under `sst_s3/L*/<object_id>/...`.
+        for entry in std::fs::read_dir(&s3_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(level_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !level_name.starts_with('L') {
+                continue;
+            }
+
+            for obj in std::fs::read_dir(&path)? {
+                let obj = obj?;
+                let obj_path = obj.path();
+                if !obj_path.is_dir() {
+                    continue;
+                }
+                let Some(object_id) = obj_path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+
+                if object_id.ends_with(".tmp") {
+                    let _ = std::fs::remove_dir_all(&obj_path);
+                    continue;
+                }
+
+                let file_id = parse_object_file_id(object_id);
+                let Some(file_id) = file_id else {
+                    continue;
+                };
+
+                if referenced.contains(&file_id) {
+                    continue;
+                }
+
+                std::fs::remove_dir_all(&obj_path)?;
+                let _ = std::fs::remove_file(self.sst_cache_path(file_id));
+                removed += 1;
+            }
+        }
+
         if removed > 0 {
             self.tier_counters
                 .s3_deletes
@@ -775,43 +1127,23 @@ impl VersionSet {
 
     fn freeze_file_to_s3(&self, add: &AddFile) -> anyhow::Result<()> {
         let src = self.resolve_sst_path(add.level, add.file_id)?;
-        let dst = self.sst_path_for_tier(StorageTier::S3, add.file_id);
+        let frozen = FrozenObjectMeta {
+            file_id: add.file_id,
+            level: add.level,
+            object_id: format!("L{}-{:016x}", add.level, add.file_id),
+            object_version: None,
+            superblock_bytes: 8 * 1024 * 1024,
+        };
 
-        if src != dst {
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let dst_tmp = dst.with_extension("tmp");
-            std::fs::copy(&src, &dst_tmp)?;
-            self.tier_counters.s3_puts.fetch_add(1, Ordering::Relaxed);
-            {
-                let fd = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&dst_tmp)?;
-                fd.sync_data()?;
-            }
-            std::fs::rename(&dst_tmp, &dst)?;
-            {
-                let parent = dst
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("destination has no parent"))?;
-                let dir_fd = std::fs::File::open(parent)?;
-                dir_fd.sync_all()?;
-            }
-        }
-
+        self.write_s3_object_from_file(&frozen, &src)?;
         self.mark_file_frozen(
             add.file_id,
-            format!("L{}-{:016x}", add.level, add.file_id),
-            None,
-            8 * 1024 * 1024,
+            frozen.object_id.clone(),
+            frozen.object_version.clone(),
+            frozen.superblock_bytes,
         )?;
 
-        if src != dst {
-            let _ = std::fs::remove_file(src);
-        }
-
+        let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(self.sst_cache_path(add.file_id));
 
         Ok(())
@@ -888,19 +1220,28 @@ impl VersionSet {
         from_tier: StorageTier,
         to_tier: StorageTier,
     ) -> anyhow::Result<()> {
-        let src = self.sst_path_for_tier(from_tier, file_id);
-        if !src.exists() {
-            // Recovery fallback: if file already moved, do not fail hard.
-            if self.sst_path_for_tier(to_tier, file_id).exists() {
-                return Ok(());
+        if to_tier == StorageTier::S3 {
+            let add = {
+                let guard = self.levels.read();
+                guard
+                    .l0
+                    .iter()
+                    .chain(guard.l1.iter())
+                    .find(|f| f.file_id == file_id && f.level == level)
+                    .cloned()
+            };
+            let Some(add) = add else {
+                anyhow::bail!("unknown sst for freeze file_id={file_id} level={level}");
+            };
+            if add.tier != StorageTier::S3 {
+                self.freeze_file_to_s3(&add)?;
             }
-            anyhow::bail!(
-                "cannot move missing sst file_id={} from tier {:?}: {}",
-                file_id,
-                from_tier,
-                src.display()
-            );
+            return Ok(());
         }
+
+        let frozen = (from_tier == StorageTier::S3)
+            .then(|| self.frozen_objects.read().get(&file_id).cloned())
+            .flatten();
 
         let dst = self.sst_path_for_tier(to_tier, file_id);
         let dst_tmp = dst.with_extension("tmp");
@@ -908,14 +1249,97 @@ impl VersionSet {
             std::fs::create_dir_all(parent)?;
         }
 
-        std::fs::copy(&src, &dst_tmp)?;
-        {
-            let fd = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&dst_tmp)?;
-            fd.sync_data()?;
+        let legacy_src = self.sst_path_for_tier(from_tier, file_id);
+
+        if from_tier == StorageTier::S3 {
+            if let Some(frozen) = frozen.as_ref() {
+                if self
+                    .s3_object_meta_path(frozen.level, &frozen.object_id)
+                    .exists()
+                {
+                    let meta = self.load_s3_object_meta(frozen.level, &frozen.object_id)?;
+                    let mut out = std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .read(true)
+                        .open(&dst_tmp)
+                        .with_context(|| format!("open dst tmp {}", dst_tmp.display()))?;
+                    for sb in &meta.superblocks {
+                        let path = self.s3_superblock_path(meta.level, &meta.object_id, sb.id);
+                        let data = std::fs::read(&path)
+                            .with_context(|| format!("read superblock {}", path.display()))?;
+                        if data.len() != sb.len as usize {
+                            anyhow::bail!(
+                                "superblock length mismatch for {} sb={} expected {} got {}",
+                                meta.object_id,
+                                sb.id,
+                                sb.len,
+                                data.len()
+                            );
+                        }
+                        let hash = blake3::hash(&data);
+                        if hash.as_bytes() != sb.hash.as_slice() {
+                            anyhow::bail!(
+                                "superblock hash mismatch for {} sb={}",
+                                meta.object_id,
+                                sb.id
+                            );
+                        }
+                        out.write_all(&data).with_context(|| {
+                            format!("write dst tmp {}", dst_tmp.display())
+                        })?;
+                        self.tier_counters.s3_gets.fetch_add(1, Ordering::Relaxed);
+                    }
+                    out.sync_data()?;
+                } else {
+                    // Legacy fallback.
+                    std::fs::copy(&legacy_src, &dst_tmp)?;
+                    {
+                        let fd = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&dst_tmp)?;
+                        fd.sync_data()?;
+                    }
+                    self.tier_counters.s3_gets.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                // Legacy fallback (no frozen metadata).
+                std::fs::copy(&legacy_src, &dst_tmp)?;
+                {
+                    let fd = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&dst_tmp)?;
+                    fd.sync_data()?;
+                }
+                self.tier_counters.s3_gets.fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            if !legacy_src.exists() {
+                // Recovery fallback: if file already moved, do not fail hard.
+                if self.sst_path_for_tier(to_tier, file_id).exists() {
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "cannot move missing sst file_id={} from tier {:?}: {}",
+                    file_id,
+                    from_tier,
+                    legacy_src.display()
+                );
+            }
+
+            std::fs::copy(&legacy_src, &dst_tmp)?;
+            {
+                let fd = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&dst_tmp)?;
+                fd.sync_data()?;
+            }
         }
+
         std::fs::rename(&dst_tmp, &dst)?;
         {
             let parent = dst
@@ -956,7 +1380,15 @@ impl VersionSet {
             self.frozen_objects.write().remove(&file_id);
         }
 
-        let _ = std::fs::remove_file(src);
+        if from_tier == StorageTier::S3 {
+            let _ = std::fs::remove_file(&legacy_src);
+            if let Some(frozen) = frozen.as_ref() {
+                let dir = self.s3_object_dir(frozen.level, &frozen.object_id);
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        } else {
+            let _ = std::fs::remove_file(legacy_src);
+        }
         let _ = std::fs::remove_file(self.sst_cache_path(file_id));
         Ok(())
     }
@@ -990,7 +1422,7 @@ impl VersionSet {
     pub fn compact_l0_to_l1(
         &self,
         range: Option<&Range>,
-        _options: &DbOptions,
+        options: &DbOptions,
     ) -> anyhow::Result<()> {
         let (l0, l1) = {
             let guard = self.levels.read();
@@ -1014,6 +1446,41 @@ impl VersionSet {
         } else {
             l0
         };
+
+        let target_tier = self.tier_for_level(1);
+        if target_tier == StorageTier::Hdd {
+            let budget = options.hdd_compaction_budget_bytes;
+            if budget == 0 {
+                return Ok(());
+            }
+
+            let mut total = 0u64;
+            let mut limited = Vec::new();
+            for add in l0_in_range {
+                if !limited.is_empty() && total >= budget {
+                    break;
+                }
+
+                limited.push(add.clone());
+                total = total.saturating_add(add.size_bytes);
+            }
+
+            if limited.is_empty() {
+                return Ok(());
+            }
+
+            return self.compact_l0_to_l1_inputs(limited, l1, range);
+        }
+
+        self.compact_l0_to_l1_inputs(l0_in_range, l1, range)
+    }
+
+    fn compact_l0_to_l1_inputs(
+        &self,
+        l0_in_range: Vec<AddFile>,
+        l1: Vec<AddFile>,
+        _range: Option<&Range>,
+    ) -> anyhow::Result<()> {
 
         if l0_in_range.is_empty() {
             return Ok(());
@@ -1103,7 +1570,17 @@ impl VersionSet {
 
         let out_file_id = self.allocate_file_id();
         let sst_dir = self.sst_root_dir(1);
-        let mut builder = crate::sst::SstBuilder::create(&sst_dir, out_file_id, 64 * 1024)?;
+        let mut builder = if self.options.sst_use_io_executor_writes {
+            let io = self
+                .sst_io_ctx
+                .as_ref()
+                .context("sst io executor writes requested but not configured")?
+                .io()
+                .clone();
+            crate::sst::SstBuilder::create_with_io(&sst_dir, out_file_id, 64 * 1024, io)?
+        } else {
+            crate::sst::SstBuilder::create(&sst_dir, out_file_id, 64 * 1024)?
+        };
         for (key, value) in &out_entries {
             builder.add(key, value.as_ref())?;
         }
@@ -1194,6 +1671,14 @@ impl VersionSet {
         inputs: Vec<AddFile>,
         outputs: Vec<(u64, SstProperties)>,
     ) -> anyhow::Result<()> {
+        let frozen_to_remove: Vec<FrozenObjectMeta> = {
+            let frozen = self.frozen_objects.read();
+            inputs
+                .iter()
+                .filter_map(|input| frozen.get(&input.file_id).cloned())
+                .collect()
+        };
+
         let mut adds = Vec::new();
         for (file_id, props) in outputs {
             adds.push(AddFile {
@@ -1254,6 +1739,11 @@ impl VersionSet {
             }
         }
 
+        for frozen in frozen_to_remove {
+            let dir = self.s3_object_dir(frozen.level, &frozen.object_id);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
         // Once manifest deletions are durable, remove old files from disk.
         for input in &inputs {
             let path_nvme = self
@@ -1279,6 +1769,11 @@ impl VersionSet {
         }
         Ok(())
     }
+}
+
+fn parse_object_file_id(object_id: &str) -> Option<u64> {
+    let (_prefix, hex) = object_id.rsplit_once('-')?;
+    u64::from_str_radix(hex, 16).ok()
 }
 
 fn range_overlaps_file(

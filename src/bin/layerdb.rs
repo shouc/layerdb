@@ -6,6 +6,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use layerdb::internal_key::{InternalKey, KeyKind};
 use rayon::prelude::*;
+use serde::Deserialize;
 
 #[derive(Debug, Parser)]
 #[command(name = "layerdb")]
@@ -345,18 +346,11 @@ fn db_check(db: &Path) -> anyhow::Result<()> {
         anyhow::bail!("missing MANIFEST: {}", manifest_path.display());
     }
 
-    let records = manifest_adds(db)?;
+    let records = manifest_files(db)?;
     let results: Vec<anyhow::Result<(u8, u64)>> = records
         .par_iter()
-        .map(|(_, add)| {
-            let tier_dir = match add.tier {
-                layerdb::tier::StorageTier::Nvme => "sst",
-                layerdb::tier::StorageTier::Hdd => "sst_hdd",
-                layerdb::tier::StorageTier::S3 => "sst_s3",
-            };
-            let path = db
-                .join(tier_dir)
-                .join(format!("sst_{:016x}.sst", add.file_id));
+        .map(|(_, add, freeze)| {
+            let path = resolve_sst_for_check(db, add, freeze.as_ref())?;
             if !path.exists() {
                 anyhow::bail!("missing referenced sst: {}", path.display());
             }
@@ -438,40 +432,27 @@ fn verify(db: &Path) -> anyhow::Result<()> {
 }
 
 fn scrub(db: &Path) -> anyhow::Result<()> {
-    let records = manifest_adds(db)?;
-    let results: Vec<anyhow::Result<(u8, u64)>> = records
-        .par_iter()
-        .map(|(_, add)| {
-            let tier_dir = match add.tier {
-                layerdb::tier::StorageTier::Nvme => "sst",
-                layerdb::tier::StorageTier::Hdd => "sst_hdd",
-                layerdb::tier::StorageTier::S3 => "sst_s3",
-            };
-            let path = db
-                .join(tier_dir)
-                .join(format!("sst_{:016x}.sst", add.file_id));
-            let reader = layerdb::sst::SstReader::open(&path)?;
-            let mut iter = reader.iter(u64::MAX)?;
-            iter.seek_to_first();
-            let mut n = 0u64;
-            while let Some(next) = iter.next() {
-                let _ = next?;
-                n += 1;
-            }
-            Ok((add.level, n))
-        })
-        .collect();
-
-    let mut totals: BTreeMap<u8, u64> = BTreeMap::new();
-    for result in results {
-        let (level, n) = result?;
-        *totals.entry(level).or_default() += n;
-    }
-
-    for (level, n) in totals {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    let report = db.scrub_integrity()?;
+    for (level, n) in report.entries_by_level {
         println!("scrub: level={level} entries={n}");
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct S3SuperblockMeta {
+    id: u32,
+    len: u32,
+    hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct S3ObjectMetaFile {
+    file_id: u64,
+    level: u8,
+    superblock_bytes: u32,
+    superblocks: Vec<S3SuperblockMeta>,
 }
 
 fn bench(db: &Path, keys: usize, workload: BenchWorkload) -> anyhow::Result<()> {
@@ -1113,10 +1094,19 @@ fn metrics_cmd(db: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn manifest_adds(db: &Path) -> anyhow::Result<Vec<(usize, layerdb::version::manifest::AddFile)>> {
+fn manifest_files(
+    db: &Path,
+) -> anyhow::Result<
+    Vec<(
+        usize,
+        layerdb::version::manifest::AddFile,
+        Option<layerdb::version::manifest::FreezeFile>,
+    )>,
+> {
     let data = std::fs::read(db.join("MANIFEST"))?;
     let mut offset = 0usize;
     let mut adds: BTreeMap<u64, layerdb::version::manifest::AddFile> = BTreeMap::new();
+    let mut freezes: BTreeMap<u64, layerdb::version::manifest::FreezeFile> = BTreeMap::new();
     while offset + 4 <= data.len() {
         let len = u32::from_le_bytes(data[offset..(offset + 4)].try_into().unwrap()) as usize;
         offset += 4;
@@ -1128,28 +1118,38 @@ fn manifest_adds(db: &Path) -> anyhow::Result<Vec<(usize, layerdb::version::mani
 
         match rec {
             layerdb::version::manifest::ManifestRecord::AddFile(add) => {
-                adds.insert(add.file_id, add);
+                let file_id = add.file_id;
+                adds.insert(file_id, add);
+                freezes.remove(&file_id);
             }
             layerdb::version::manifest::ManifestRecord::DeleteFile(del) => {
                 adds.remove(&del.file_id);
+                freezes.remove(&del.file_id);
             }
             layerdb::version::manifest::ManifestRecord::VersionEdit(edit) => {
                 for add in edit.adds {
-                    adds.insert(add.file_id, add);
+                    let file_id = add.file_id;
+                    adds.insert(file_id, add);
+                    freezes.remove(&file_id);
                 }
                 for del in edit.deletes {
                     adds.remove(&del.file_id);
+                    freezes.remove(&del.file_id);
                 }
             }
             layerdb::version::manifest::ManifestRecord::MoveFile(mv) => {
                 if let Some(add) = adds.get_mut(&mv.file_id) {
                     add.tier = mv.tier;
                 }
+                if mv.tier != layerdb::tier::StorageTier::S3 {
+                    freezes.remove(&mv.file_id);
+                }
             }
             layerdb::version::manifest::ManifestRecord::FreezeFile(freeze) => {
                 if let Some(add) = adds.get_mut(&freeze.file_id) {
                     add.tier = layerdb::tier::StorageTier::S3;
                 }
+                freezes.insert(freeze.file_id, freeze);
             }
             layerdb::version::manifest::ManifestRecord::BranchHead(_) => {}
             layerdb::version::manifest::ManifestRecord::DropBranch(_) => {}
@@ -1157,5 +1157,132 @@ fn manifest_adds(db: &Path) -> anyhow::Result<Vec<(usize, layerdb::version::mani
         offset += len;
     }
 
-    Ok(adds.into_values().enumerate().collect())
+    Ok(adds
+        .into_values()
+        .map(|add| {
+            let freeze = freezes.get(&add.file_id).cloned();
+            (add, freeze)
+        })
+        .enumerate()
+        .map(|(idx, (add, freeze))| (idx, add, freeze))
+        .collect())
+}
+
+fn resolve_sst_for_check(
+    db: &Path,
+    add: &layerdb::version::manifest::AddFile,
+    freeze: Option<&layerdb::version::manifest::FreezeFile>,
+) -> anyhow::Result<PathBuf> {
+    let cache_path = db
+        .join("sst_cache")
+        .join(format!("sst_{:016x}.sst", add.file_id));
+    if cache_path.exists() {
+        return Ok(cache_path);
+    }
+
+    let tier_dir = match add.tier {
+        layerdb::tier::StorageTier::Nvme => "sst",
+        layerdb::tier::StorageTier::Hdd => "sst_hdd",
+        layerdb::tier::StorageTier::S3 => "sst_s3",
+    };
+    let legacy_path = db
+        .join(tier_dir)
+        .join(format!("sst_{:016x}.sst", add.file_id));
+    if add.tier != layerdb::tier::StorageTier::S3 {
+        return Ok(legacy_path);
+    }
+    if legacy_path.exists() {
+        return Ok(legacy_path);
+    }
+
+    let object_id = freeze
+        .map(|f| f.object_id.as_str())
+        .unwrap_or_else(|| "");
+    let object_id = if object_id.is_empty() {
+        format!("L{}-{:016x}", add.level, add.file_id)
+    } else {
+        object_id.to_string()
+    };
+
+    let object_dir = db
+        .join("sst_s3")
+        .join(format!("L{}", add.level))
+        .join(&object_id);
+    let meta_path = object_dir.join("meta.bin");
+    if !meta_path.exists() {
+        anyhow::bail!("missing referenced s3 meta: {}", meta_path.display());
+    }
+    let meta_bytes = std::fs::read(&meta_path)
+        .with_context(|| format!("read s3 meta {}", meta_path.display()))?;
+    let meta: S3ObjectMetaFile =
+        bincode::deserialize(&meta_bytes).context("decode s3 meta")?;
+    if meta.file_id != add.file_id || meta.level != add.level {
+        anyhow::bail!(
+            "s3 meta mismatch for file_id={} expected_level={} got_file_id={} got_level={}",
+            add.file_id,
+            add.level,
+            meta.file_id,
+            meta.level
+        );
+    }
+
+    if meta.superblock_bytes == 0 {
+        anyhow::bail!("s3 meta has invalid superblock_bytes=0");
+    }
+
+    std::fs::create_dir_all(db.join("sst_cache"))?;
+    let tmp = cache_path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+
+    {
+        let mut out = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&tmp)
+            .with_context(|| format!("open cache tmp {}", tmp.display()))?;
+
+        for sb in &meta.superblocks {
+            let path = object_dir.join(format!("sb_{:08}.bin", sb.id));
+            let data = std::fs::read(&path)
+                .with_context(|| format!("read superblock {}", path.display()))?;
+            if data.len() != sb.len as usize {
+                anyhow::bail!(
+                    "superblock length mismatch for file_id={} sb={} expected {} got {}",
+                    add.file_id,
+                    sb.id,
+                    sb.len,
+                    data.len()
+                );
+            }
+            let hash = blake3::hash(&data);
+            if hash.as_bytes() != sb.hash.as_slice() {
+                anyhow::bail!(
+                    "superblock hash mismatch for file_id={} sb={}",
+                    add.file_id,
+                    sb.id
+                );
+            }
+            use std::io::Write;
+            out.write_all(&data)
+                .with_context(|| format!("write cache tmp {}", tmp.display()))?;
+        }
+
+        out.sync_data()
+            .with_context(|| format!("sync cache tmp {}", tmp.display()))?;
+    }
+
+    std::fs::rename(&tmp, &cache_path).with_context(|| {
+        format!(
+            "rename cache tmp {} -> {}",
+            tmp.display(),
+            cache_path.display()
+        )
+    })?;
+
+    let dir_fd = std::fs::File::open(db.join("sst_cache"))?;
+    dir_fd.sync_all()?;
+
+    Ok(cache_path)
 }

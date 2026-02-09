@@ -11,7 +11,17 @@ fn options() -> DbOptions {
     }
 }
 
-fn s3_sst_path(root: &std::path::Path, file_id: u64) -> std::path::PathBuf {
+fn s3_object_dir(root: &std::path::Path, level: u8, object_id: &str) -> std::path::PathBuf {
+    root.join("sst_s3")
+        .join(format!("L{level}"))
+        .join(object_id)
+}
+
+fn s3_meta_path(root: &std::path::Path, level: u8, object_id: &str) -> std::path::PathBuf {
+    s3_object_dir(root, level, object_id).join("meta.bin")
+}
+
+fn legacy_s3_sst_path(root: &std::path::Path, file_id: u64) -> std::path::PathBuf {
     root.join("sst_s3").join(format!("sst_{file_id:016x}.sst"))
 }
 
@@ -50,9 +60,10 @@ fn freeze_level_moves_files_and_recovers() -> anyhow::Result<()> {
 
         for frozen in db.frozen_objects() {
             assert!(
-                s3_sst_path(dir.path(), frozen.file_id).exists(),
-                "frozen file missing in sst_s3 for file_id={}",
-                frozen.file_id
+                s3_meta_path(dir.path(), frozen.level, &frozen.object_id).exists(),
+                "frozen meta missing in sst_s3 for file_id={} object_id={}",
+                frozen.file_id,
+                frozen.object_id
             );
         }
     }
@@ -62,7 +73,7 @@ fn freeze_level_moves_files_and_recovers() -> anyhow::Result<()> {
         let frozen = db.frozen_objects();
         assert!(!frozen.is_empty(), "frozen metadata should recover");
         for entry in &frozen {
-            assert!(s3_sst_path(dir.path(), entry.file_id).exists());
+            assert!(s3_meta_path(dir.path(), entry.level, &entry.object_id).exists());
         }
 
         assert_eq!(
@@ -107,8 +118,17 @@ fn compaction_cleans_up_frozen_inputs() -> anyhow::Result<()> {
             "stale frozen metadata for file_id={file_id}"
         );
         assert!(
-            !s3_sst_path(dir.path(), *file_id).exists(),
-            "stale frozen file should be removed file_id={file_id}"
+            !legacy_s3_sst_path(dir.path(), *file_id).exists(),
+            "stale legacy frozen file should be removed file_id={file_id}"
+        );
+        // Superblock-based object dirs should be removed as well.
+        assert!(
+            !dir.path()
+                .join("sst_s3")
+                .join("L1")
+                .join(format!("L1-{file_id:016x}"))
+                .exists(),
+            "stale frozen object dir should be removed file_id={file_id}"
         );
     }
 
@@ -169,7 +189,15 @@ fn thaw_level_moves_back_to_local_tier() -> anyhow::Result<()> {
     assert!(db.frozen_objects().is_empty());
 
     for file_id in frozen_ids {
-        assert!(!s3_sst_path(dir.path(), file_id).exists());
+        assert!(!legacy_s3_sst_path(dir.path(), file_id).exists());
+        assert!(
+            !dir.path()
+                .join("sst_s3")
+                .join("L1")
+                .join(format!("L1-{file_id:016x}"))
+                .exists(),
+            "frozen object dir should be removed after thaw file_id={file_id}"
+        );
         assert!(nvme_sst_path(dir.path(), file_id).exists());
     }
 
@@ -191,14 +219,24 @@ fn gc_orphaned_s3_removes_unreferenced_files() -> anyhow::Result<()> {
     db.freeze_level_to_s3(1, None)?;
 
     let orphan_id = 0xDEADBEEFu64;
-    let orphan_path = s3_sst_path(dir.path(), orphan_id);
+    let orphan_path = legacy_s3_sst_path(dir.path(), orphan_id);
     std::fs::create_dir_all(orphan_path.parent().expect("parent"))?;
     std::fs::write(&orphan_path, b"orphan")?;
     assert!(orphan_path.exists());
 
+    let orphan_object = dir
+        .path()
+        .join("sst_s3")
+        .join("L1")
+        .join("L1-deadbeef00000001");
+    std::fs::create_dir_all(&orphan_object)?;
+    std::fs::write(orphan_object.join("meta.bin"), b"orphan-meta")?;
+    assert!(orphan_object.exists());
+
     let removed = db.gc_orphaned_s3_files()?;
     assert!(removed >= 1, "expected orphan cleanup to remove files");
     assert!(!orphan_path.exists());
+    assert!(!orphan_object.exists());
 
     Ok(())
 }

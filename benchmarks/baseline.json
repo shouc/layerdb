@@ -1,0 +1,39 @@
+{
+  "benchmarks": {
+    "compact/10k": {
+      "baseline_ns": 9862243.4,
+      "criterion": "compact_10k",
+      "max_regression_factor": 1.3
+    },
+    "delete-heavy/5k": {
+      "baseline_ns": 436826958.3,
+      "criterion": "delete-heavy_5k",
+      "max_regression_factor": 1.3
+    },
+    "fill/5k": {
+      "baseline_ns": 375015553.1,
+      "criterion": "fill_5k",
+      "max_regression_factor": 1.3
+    },
+    "overwrite/5k": {
+      "baseline_ns": 449026593.9,
+      "criterion": "overwrite_5k",
+      "max_regression_factor": 1.3
+    },
+    "readrandom/5k": {
+      "baseline_ns": 365170057.2,
+      "criterion": "readrandom_5k",
+      "max_regression_factor": 1.3
+    },
+    "readseq/5k": {
+      "baseline_ns": 2532118.3,
+      "criterion": "readseq_5k",
+      "max_regression_factor": 1.3
+    },
+    "scan-heavy/5x": {
+      "baseline_ns": 6557631.3,
+      "criterion": "scan-heavy_5x",
+      "max_regression_factor": 1.3
+    }
+  }
+}

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::thread;
 
 use bytes::Bytes;
+use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::db::{DbOptions, Op, OpKind, WriteOptions};
@@ -47,10 +48,12 @@ struct WalState {
     options: DbOptions,
     memtables: Arc<MemTableManager>,
     versions: Arc<VersionSet>,
+    io: crate::io::UringExecutor,
+    io_rt: Runtime,
     next_seqno: Arc<AtomicU64>,
     last_durable_seqno: Arc<AtomicU64>,
     segment_id: u64,
-    segment: std::fs::File,
+    segment_path: PathBuf,
     segment_bytes: u64,
     flush_tx: mpsc::UnboundedSender<FlushSignal>,
 }
@@ -283,22 +286,34 @@ impl WalState {
         let wal_dir = dir.join("wal");
         std::fs::create_dir_all(&wal_dir)?;
         let segment_path = wal_dir.join(format!("wal_{segment_id:016x}.log"));
-        let segment = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&segment_path)?;
-        let segment_bytes = segment.metadata().map(|m| m.len()).unwrap_or(0);
+        let io_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let io = crate::io::UringExecutor::new(options.io_max_in_flight);
+        io_rt.block_on(async {
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&segment_path)
+                .await
+                .map(|_| ())
+        })?;
+        let segment_bytes = std::fs::metadata(&segment_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         sync_dir(&wal_dir)?;
         Ok(Self {
             dir,
             options,
             memtables,
             versions,
+            io,
+            io_rt,
             next_seqno,
             last_durable_seqno,
             segment_id,
-            segment,
+            segment_path,
             segment_bytes,
             flush_tx,
         })
@@ -313,17 +328,24 @@ impl WalState {
     }
 
     fn rotate_segment(&mut self) -> anyhow::Result<()> {
-        self.segment.sync_data()?;
+        self.io_rt.block_on(self.io.sync_file(&self.segment_path))?;
         self.segment_id += 1;
 
         let wal_dir = self.dir.join("wal");
         let segment_path = wal_dir.join(format!("wal_{:016x}.log", self.segment_id));
-        self.segment = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&segment_path)?;
-        self.segment_bytes = self.segment.metadata().map(|m| m.len()).unwrap_or(0);
+        self.io_rt.block_on(async {
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&segment_path)
+                .await
+                .map(|_| ())
+        })?;
+        self.segment_path = segment_path;
+        self.segment_bytes = std::fs::metadata(&self.segment_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         sync_dir(&wal_dir)?;
 
         self.memtables.rotate_memtable(self.segment_id);
@@ -352,13 +374,13 @@ impl WalState {
         let record = encode_wal_record(seqno_base, &ops)?;
         self.rotate_segment_if_needed(record.len() as u64)?;
 
-        use std::io::Write;
-        self.segment.write_all(&record)?;
+        self.io_rt
+            .block_on(self.io.append(&self.segment_path, &record))?;
         self.segment_bytes += record.len() as u64;
 
         let do_sync = opts.sync || self.options.fsync_writes;
         if do_sync {
-            self.segment.sync_data()?;
+            self.io_rt.block_on(self.io.sync_file(&self.segment_path))?;
         }
 
         self.memtables.apply_batch(seqno_base, &ops)?;

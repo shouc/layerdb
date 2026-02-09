@@ -20,6 +20,9 @@ pub struct DbOptions {
     ///
     /// Currently unused; reserved for milestone 5.
     pub block_cache_entries: usize,
+
+    /// Maximum in-flight operations for the async IO executor.
+    pub io_max_in_flight: usize,
 }
 
 impl Default for DbOptions {
@@ -34,6 +37,7 @@ impl Default for DbOptions {
             hot_levels_max: 2,
             sst_reader_cache_entries: 128,
             block_cache_entries: 0,
+            io_max_in_flight: 256,
         }
     }
 }

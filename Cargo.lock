@@ -354,6 +354,7 @@ dependencies = [
  "crc32c",
  "crossbeam-channel",
  "crossbeam-skiplist",
+ "memmap2",
  "parking_lot",
  "proptest",
  "rand 0.8.5",
@@ -383,6 +384,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
+]
+
+[[package]]
+name = "memmap2"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "744133e4a0e0a658e1374cf3bf8e415c4052a15a111acd372764c55b4177d490"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -16,10 +16,30 @@ use parking_lot::{Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+#[cfg(all(feature = "native-uring", target_os = "linux"))]
+mod native_uring;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoBackend {
+    Tokio,
+    Blocking,
+    Uring,
+}
+
+impl Default for IoBackend {
+    fn default() -> Self {
+        Self::Tokio
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UringExecutor {
     max_in_flight: usize,
     permits: Arc<Semaphore>,
+    backend: IoBackend,
+
+    #[cfg(all(feature = "native-uring", target_os = "linux"))]
+    native: Option<Arc<native_uring::NativeUring>>,
 }
 
 impl Default for UringExecutor {
@@ -30,15 +50,57 @@ impl Default for UringExecutor {
 
 impl UringExecutor {
     pub fn new(max_in_flight: usize) -> Self {
+        Self::with_backend(max_in_flight, IoBackend::Tokio)
+    }
+
+    pub fn with_backend(max_in_flight: usize, backend: IoBackend) -> Self {
         assert!(max_in_flight > 0, "max_in_flight must be > 0");
+
+        let backend = normalize_backend(backend);
+
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        let native = match backend {
+            IoBackend::Uring => native_uring::NativeUring::new(max_in_flight)
+                .ok()
+                .map(Arc::new),
+            _ => None,
+        };
+
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        let backend = if backend == IoBackend::Uring && native.is_none() {
+            IoBackend::Blocking
+        } else {
+            backend
+        };
+
         Self {
             max_in_flight,
             permits: Arc::new(Semaphore::new(max_in_flight)),
+            backend,
+
+            #[cfg(all(feature = "native-uring", target_os = "linux"))]
+            native,
         }
     }
 
     pub fn max_in_flight(&self) -> usize {
         self.max_in_flight
+    }
+
+    pub fn backend(&self) -> IoBackend {
+        self.backend
+    }
+
+    pub fn supports_native_uring() -> bool {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        {
+            true
+        }
+
+        #[cfg(not(all(feature = "native-uring", target_os = "linux")))]
+        {
+            false
+        }
     }
 
     async fn acquire_permit(&self) -> anyhow::Result<OwnedSemaphorePermit> {
@@ -228,6 +290,13 @@ impl UringExecutor {
     }
 
     pub fn append_blocking(&self, path: impl AsRef<Path>, data: &[u8]) -> anyhow::Result<u64> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.append(path.as_ref(), data);
+            }
+        }
+
         let path = path.as_ref();
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -249,6 +318,13 @@ impl UringExecutor {
         path: impl AsRef<Path>,
         chunks: &[Vec<u8>],
     ) -> anyhow::Result<u64> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.append_many(path.as_ref(), chunks);
+            }
+        }
+
         let path = path.as_ref();
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -301,6 +377,13 @@ impl UringExecutor {
         offset: u64,
         data: &[u8],
     ) -> anyhow::Result<()> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.write_all_at(path.as_ref(), offset, data);
+            }
+        }
+
         let path = path.as_ref();
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -321,6 +404,13 @@ impl UringExecutor {
         offset: u64,
         buf: &mut [u8],
     ) -> anyhow::Result<()> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.read_into_at(path.as_ref(), offset, buf);
+            }
+        }
+
         let path = path.as_ref();
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -334,6 +424,13 @@ impl UringExecutor {
     }
 
     pub fn sync_file_blocking(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.sync_file(path.as_ref());
+            }
+        }
+
         let path = path.as_ref();
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -353,6 +450,24 @@ impl UringExecutor {
             .with_context(|| format!("open dir: {}", parent.display()))?;
         dir.sync_all()
             .with_context(|| format!("sync dir: {}", parent.display()))
+    }
+}
+
+fn normalize_backend(backend: IoBackend) -> IoBackend {
+    match backend {
+        IoBackend::Tokio => IoBackend::Tokio,
+        IoBackend::Blocking => IoBackend::Blocking,
+        IoBackend::Uring => {
+            #[cfg(all(feature = "native-uring", target_os = "linux"))]
+            {
+                IoBackend::Uring
+            }
+
+            #[cfg(not(all(feature = "native-uring", target_os = "linux")))]
+            {
+                IoBackend::Blocking
+            }
+        }
     }
 }
 

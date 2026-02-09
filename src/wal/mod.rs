@@ -325,7 +325,10 @@ fn flush_one(state: &mut FlushState, mem: &crate::memtable::MemTable) -> anyhow:
     let file_id = state.versions.allocate_file_id();
     let sst_dir = state.dir.join("sst");
     let mut builder = if state.options.sst_use_io_executor_writes {
-        let io = crate::io::UringExecutor::new(state.options.io_max_in_flight.max(1));
+        let io = crate::io::UringExecutor::with_backend(
+            state.options.io_max_in_flight.max(1),
+            state.options.io_backend,
+        );
         crate::sst::SstBuilder::create_with_io(&sst_dir, file_id, 64 * 1024, io)?
     } else {
         crate::sst::SstBuilder::create(&sst_dir, file_id, 64 * 1024)?
@@ -358,7 +361,10 @@ impl WalState {
         let wal_dir = dir.join("wal");
         std::fs::create_dir_all(&wal_dir)?;
         let segment_path = wal_dir.join(format!("wal_{segment_id:016x}.log"));
-        let io = crate::io::UringExecutor::new(options.io_max_in_flight);
+        let io = crate::io::UringExecutor::with_backend(
+            options.io_max_in_flight,
+            options.io_backend,
+        );
         {
             let _ = std::fs::OpenOptions::new()
                 .create(true)
@@ -725,7 +731,10 @@ fn recover_from_wal(
         memtables.reset_for_wal_recovery(*first_id);
     }
 
-    let io = crate::io::UringExecutor::new(options.io_max_in_flight.max(1));
+    let io = crate::io::UringExecutor::with_backend(
+        options.io_max_in_flight.max(1),
+        options.io_backend,
+    );
 
     for (idx, (segment_id, path)) in entries.iter().enumerate() {
         let file_len = std::fs::metadata(path)

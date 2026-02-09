@@ -185,7 +185,10 @@ impl VersionSet {
 
         let sst_io_ctx = if options.sst_use_io_executor_reads || options.sst_use_io_executor_writes {
             Some(Arc::new(SstIoContext::new(
-                crate::io::UringExecutor::new(options.io_max_in_flight.max(1)),
+                crate::io::UringExecutor::with_backend(
+                    options.io_max_in_flight.max(1),
+                    options.io_backend,
+                ),
                 crate::io::BufPool::default(),
             )))
         } else {

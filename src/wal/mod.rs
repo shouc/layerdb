@@ -26,7 +26,7 @@ pub enum WalError {
 #[derive(Debug)]
 pub struct Wal {
     tx: mpsc::UnboundedSender<WalRequest>,
-    next_seqno: Arc<AtomicU64>,
+    _next_seqno: Arc<AtomicU64>,
     last_durable_seqno: Arc<AtomicU64>,
 }
 
@@ -100,7 +100,7 @@ impl Wal {
 
         Ok(Self {
             tx,
-            next_seqno,
+            _next_seqno: next_seqno,
             last_durable_seqno,
         })
     }

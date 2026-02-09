@@ -56,7 +56,10 @@ fn ref_apply(points: &mut PointModel, ranges: &mut RangeModel, seqno: u64, op: &
                 .push((seqno, Some(value_bytes(*value))));
         }
         MiniOp::Del { key } => {
-            points.entry(key_bytes(*key)).or_default().push((seqno, None));
+            points
+                .entry(key_bytes(*key))
+                .or_default()
+                .push((seqno, None));
         }
         MiniOp::RangeDel { start, end } => {
             ranges.push((seqno, key_bound_bytes(*start), key_bound_bytes(*end)));
@@ -78,11 +81,7 @@ fn ref_latest_point(
     None
 }
 
-fn ref_covering_tombstone_seq(
-    ranges: &RangeModel,
-    key: &[u8],
-    snapshot_seqno: u64,
-) -> Option<u64> {
+fn ref_covering_tombstone_seq(ranges: &RangeModel, key: &[u8], snapshot_seqno: u64) -> Option<u64> {
     ranges
         .iter()
         .filter(|(seqno, start, end)| {

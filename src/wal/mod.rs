@@ -48,6 +48,7 @@ struct WalState {
     segment_id: u64,
     segment: std::fs::File,
     segment_bytes: u64,
+    flush_tx: mpsc::UnboundedSender<()>,
 }
 
 const WAL_RECORD_HEADER_BYTES: usize = 4 + 4 + 8 + 4;
@@ -67,14 +68,31 @@ impl Wal {
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir.join("wal"))?;
 
+        let (flush_tx, flush_rx) = mpsc::unbounded_channel();
+        let flush_tx_for_wal = flush_tx.clone();
+        let flush_state = FlushState {
+            dir: dir.to_path_buf(),
+            memtables: memtables.clone(),
+            versions: versions.clone(),
+        };
+        thread::Builder::new()
+            .name("layerdb-flush".to_string())
+            .spawn(move || flush_thread_main(flush_state, flush_rx))
+            .expect("spawn flush thread");
+
         let next_seqno = Arc::new(AtomicU64::new(1));
         let last_durable_seqno = Arc::new(AtomicU64::new(0));
         let snapshot_tracker = versions.snapshots_handle();
 
         let recovered = recover_from_wal(&dir.join("wal"), options, &memtables, &snapshot_tracker)?;
-        next_seqno.store(recovered.next_seqno, Ordering::Relaxed);
-        last_durable_seqno.store(recovered.last_durable_seqno, Ordering::Relaxed);
-        snapshot_tracker.set_latest_seqno(recovered.last_durable_seqno);
+        let _ = flush_tx.send(());
+        let base_seqno = versions.latest_seqno().saturating_add(1);
+        let next_seqno_value = recovered.next_seqno.max(base_seqno).max(1);
+        let last_durable = recovered.last_durable_seqno.max(base_seqno.saturating_sub(1));
+
+        next_seqno.store(next_seqno_value, Ordering::Relaxed);
+        last_durable_seqno.store(last_durable, Ordering::Relaxed);
+        snapshot_tracker.set_latest_seqno(last_durable);
 
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -85,6 +103,7 @@ impl Wal {
             versions,
             next_seqno.clone(),
             last_durable_seqno.clone(),
+            flush_tx_for_wal,
             recovered.last_segment_id + 1,
         )?;
 
@@ -124,11 +143,73 @@ struct RecoveredWal {
     last_segment_id: u64,
 }
 
+#[derive(Debug, Clone)]
+struct FlushState {
+    dir: PathBuf,
+    memtables: Arc<MemTableManager>,
+    versions: Arc<VersionSet>,
+}
+
 fn wal_thread_main(state: &mut WalState, mut rx: mpsc::UnboundedReceiver<WalRequest>) {
     while let Some(req) = rx.blocking_recv() {
         let result = state.handle_request(req.ops, req.opts);
         let _ = req.done.send(result);
     }
+}
+
+fn flush_thread_main(mut state: FlushState, mut rx: mpsc::UnboundedReceiver<()>) {
+    while rx.blocking_recv().is_some() {
+        loop {
+            let mem = match state.memtables.take_oldest_immutable() {
+                None => break,
+                Some(m) => m,
+            };
+
+            match flush_one(&mut state, &mem) {
+                Ok(()) => {
+                    maybe_delete_wal_segment(&state.dir, mem.wal_segment_id);
+                }
+                Err(e) => {
+                    eprintln!("layerdb: flush failed: {e:?}");
+                    state.memtables.requeue_immutable_oldest(mem);
+                    break;
+                }
+            }
+        }
+    }
+
+    while let Some(mem) = state.memtables.take_oldest_immutable() {
+        if flush_one(&mut state, &mem).is_ok() {
+            maybe_delete_wal_segment(&state.dir, mem.wal_segment_id);
+        } else {
+            state.memtables.requeue_immutable_oldest(mem);
+            break;
+        }
+    }
+}
+
+fn flush_one(state: &mut FlushState, mem: &crate::memtable::MemTable) -> anyhow::Result<()> {
+    let entries = mem.to_sorted_entries();
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let file_id = state.versions.allocate_file_id();
+    let sst_dir = state.dir.join("sst");
+    let mut builder = crate::sst::SstBuilder::create(&sst_dir, file_id, 64 * 1024)?;
+    for (key, value) in &entries {
+        builder.add(key, value.as_ref())?;
+    }
+    let props = builder.finish()?;
+    state.versions.install_sst(file_id, &props)?;
+    Ok(())
+}
+
+fn maybe_delete_wal_segment(dir: &Path, segment_id: u64) {
+    let wal_path = dir
+        .join("wal")
+        .join(format!("wal_{segment_id:016x}.log"));
+    let _ = std::fs::remove_file(wal_path);
 }
 
 impl WalState {
@@ -139,6 +220,7 @@ impl WalState {
         versions: Arc<VersionSet>,
         next_seqno: Arc<AtomicU64>,
         last_durable_seqno: Arc<AtomicU64>,
+        flush_tx: mpsc::UnboundedSender<()>,
         segment_id: u64,
     ) -> anyhow::Result<Self> {
         let wal_dir = dir.join("wal");
@@ -149,6 +231,8 @@ impl WalState {
             .append(true)
             .read(true)
             .open(&segment_path)?;
+        let segment_bytes = segment.metadata().map(|m| m.len()).unwrap_or(0);
+        sync_dir(&wal_dir)?;
         Ok(Self {
             dir,
             options,
@@ -158,7 +242,8 @@ impl WalState {
             last_durable_seqno,
             segment_id,
             segment,
-            segment_bytes: 0,
+            segment_bytes,
+            flush_tx,
         })
     }
 
@@ -167,9 +252,13 @@ impl WalState {
             return Ok(());
         }
 
-        self.segment.sync_all()?;
+        self.rotate_segment()
+    }
+
+    fn rotate_segment(&mut self) -> anyhow::Result<()> {
+        self.segment.sync_data()?;
         self.segment_id += 1;
-        self.segment_bytes = 0;
+
         let wal_dir = self.dir.join("wal");
         let segment_path = wal_dir.join(format!("wal_{:016x}.log", self.segment_id));
         self.segment = std::fs::OpenOptions::new()
@@ -177,7 +266,11 @@ impl WalState {
             .append(true)
             .read(true)
             .open(&segment_path)?;
+        self.segment_bytes = self.segment.metadata().map(|m| m.len()).unwrap_or(0);
+        sync_dir(&wal_dir)?;
+
         self.memtables.rotate_memtable(self.segment_id);
+        let _ = self.flush_tx.send(());
         Ok(())
     }
 
@@ -204,17 +297,22 @@ impl WalState {
 
         self.memtables.apply_batch(seqno_base, &ops)?;
         let last_seqno = seqno_base + ops.len() as u64 - 1;
+        self.versions.snapshots().set_latest_seqno(last_seqno);
         if do_sync {
             self.last_durable_seqno.store(last_seqno, Ordering::Relaxed);
-            self.versions.snapshots().set_latest_seqno(last_seqno);
         }
 
-        if self.memtables.approximate_bytes() > self.options.memtable_bytes {
-            // v1: rotate memtable; background flush is wired later.
-            self.memtables.rotate_memtable(self.segment_id);
+        if self.memtables.mutable_approximate_bytes() > self.options.memtable_bytes {
+            self.rotate_segment()?;
         }
         Ok(())
     }
+}
+
+fn sync_dir(path: &Path) -> anyhow::Result<()> {
+    let dir_fd = std::fs::File::open(path)?;
+    dir_fd.sync_all()?;
+    Ok(())
 }
 
 fn encode_wal_record(seqno_base: u64, ops: &[Op]) -> anyhow::Result<Vec<u8>> {
@@ -291,10 +389,13 @@ fn recover_from_wal(
 
     let mut next_seqno = 1u64;
     let mut last_durable = 0u64;
-    let mut last_segment_id = 0u64;
+    let last_segment_id = entries.last().map(|(id, _)| *id).unwrap_or(0);
 
-    for (segment_id, path) in &entries {
-        last_segment_id = last_segment_id.max(*segment_id);
+    if let Some((first_id, _)) = entries.first() {
+        memtables.reset_for_wal_recovery(*first_id);
+    }
+
+    for (idx, (segment_id, path)) in entries.iter().enumerate() {
         let data = std::fs::read(path)?;
         let mut offset = 0usize;
         while offset + WAL_RECORD_HEADER_BYTES <= data.len() {
@@ -317,10 +418,18 @@ fn recover_from_wal(
             let record_last = seqno_base + ops.len() as u64 - 1;
             last_durable = last_durable.max(record_last);
             next_seqno = next_seqno.max(record_last + 1);
-            snapshots.set_latest_seqno(last_durable);
-
             offset = end;
         }
+
+        snapshots.set_latest_seqno(last_durable);
+
+        // Rotate between WAL segments so each segment maps to a single immutable memtable.
+        // This allows flushing + WAL garbage collection to operate safely.
+        let next_id = entries
+            .get(idx + 1)
+            .map(|(id, _)| *id)
+            .unwrap_or(segment_id.saturating_add(1));
+        memtables.rotate_memtable(next_id);
     }
 
     Ok(RecoveredWal {

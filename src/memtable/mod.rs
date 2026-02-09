@@ -56,6 +56,11 @@ impl MemTableManager {
         self.mutable.read().wal_segment_id
     }
 
+    pub(crate) fn reset_for_wal_recovery(&self, wal_segment_id: u64) {
+        *self.mutable.write() = Arc::new(MemTable::new(self.shard_count, wal_segment_id));
+        self.immutables.lock().clear();
+    }
+
     pub(crate) fn rotate_memtable(&self, new_wal_segment_id: u64) -> Arc<MemTable> {
         let mut guard = self.mutable.write();
         let old = std::mem::replace(

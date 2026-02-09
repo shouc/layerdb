@@ -41,6 +41,14 @@ enum Command {
         #[arg(long)]
         db: PathBuf,
     },
+    FreezeLevel {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        level: u8,
+        #[arg(long)]
+        max_files: Option<usize>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -52,6 +60,11 @@ fn main() -> anyhow::Result<()> {
         Command::Scrub { db } => scrub(&db),
         Command::Bench { db, keys } => bench(&db, keys),
         Command::RebalanceTiers { db } => rebalance_tiers(&db),
+        Command::FreezeLevel {
+            db,
+            level,
+            max_files,
+        } => freeze_level(&db, level, max_files),
     }
 }
 
@@ -278,6 +291,13 @@ fn rebalance_tiers(db: &Path) -> anyhow::Result<()> {
     let db = layerdb::Db::open(db, options)?;
     let moved = db.rebalance_tiers()?;
     println!("rebalance_tiers moved={moved}");
+    Ok(())
+}
+
+fn freeze_level(db: &Path, level: u8, max_files: Option<usize>) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    let moved = db.freeze_level_to_s3(level, max_files)?;
+    println!("freeze_level level={level} moved={moved}");
     Ok(())
 }
 

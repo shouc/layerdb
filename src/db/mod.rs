@@ -271,7 +271,9 @@ impl Db {
             .ingest_external_sst(path)
             .with_context(|| format!("ingest sst {}", path.display()))?;
 
-        self.inner.wal.ensure_next_seqno_at_least(max_seqno.saturating_add(1));
+        self.inner
+            .wal
+            .ensure_next_seqno_at_least(max_seqno.saturating_add(1));
         self.read_snapshot
             .store(self.inner.versions.latest_seqno(), Ordering::Relaxed);
         Ok(())
@@ -279,6 +281,14 @@ impl Db {
 
     pub fn rebalance_tiers(&self) -> anyhow::Result<usize> {
         self.inner.versions.rebalance_level_tiers()
+    }
+
+    pub fn freeze_level_to_s3(&self, level: u8, max_files: Option<usize>) -> anyhow::Result<usize> {
+        self.inner.versions.freeze_level_to_s3(level, max_files)
+    }
+
+    pub fn frozen_objects(&self) -> Vec<crate::version::FrozenObjectMeta> {
+        self.inner.versions.frozen_objects_snapshot()
     }
 
     pub fn scrub_integrity(&self) -> anyhow::Result<ScrubReport> {
@@ -291,9 +301,7 @@ impl Db {
                     .inner
                     .versions
                     .resolve_sst_path(add.level, add.file_id)
-                    .with_context(|| {
-                        format!("resolve sst for scrub file_id={}", add.file_id)
-                    })?;
+                    .with_context(|| format!("resolve sst for scrub file_id={}", add.file_id))?;
                 let reader = crate::sst::SstReader::open(&path)
                     .with_context(|| format!("open sst for scrub {}", path.display()))?;
 

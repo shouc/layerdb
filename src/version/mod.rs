@@ -201,12 +201,7 @@ impl VersionSet {
 
     pub fn advance_current_branch(&self, seqno: u64) -> anyhow::Result<()> {
         let branch_name = self.current_branch();
-        let current_head = self
-            .branches
-            .read()
-            .get(&branch_name)
-            .copied()
-            .unwrap_or(0);
+        let current_head = self.branches.read().get(&branch_name).copied().unwrap_or(0);
         if seqno <= current_head {
             return Ok(());
         }
@@ -262,22 +257,26 @@ impl VersionSet {
 
     pub(crate) fn resolve_sst_path(&self, level: u8, file_id: u64) -> anyhow::Result<PathBuf> {
         let primary = self.sst_path(level, file_id);
-        if primary.exists() {
-            return Ok(primary);
-        }
-
-        let alt_dir = if primary.parent().is_some_and(|p| p.ends_with("sst_hdd")) {
-            self.dir.join("sst")
+        let secondary = if primary.parent().is_some_and(|p| p.ends_with("sst_hdd")) {
+            self.dir.join("sst").join(format!("sst_{file_id:016x}.sst"))
         } else {
-            self.dir.join("sst_hdd")
+            self.dir
+                .join("sst_hdd")
+                .join(format!("sst_{file_id:016x}.sst"))
         };
-        let secondary = alt_dir.join(format!("sst_{file_id:016x}.sst"));
-        if secondary.exists() {
-            return Ok(secondary);
+        let s3 = self
+            .dir
+            .join("sst_s3")
+            .join(format!("sst_{file_id:016x}.sst"));
+
+        for candidate in [&primary, &secondary, &s3] {
+            if candidate.exists() {
+                return Ok(candidate.clone());
+            }
         }
 
         anyhow::bail!(
-            "manifest references missing sst file_id={file_id} level={level}: primary={primary:?} secondary={secondary:?}"
+            "manifest references missing sst file_id={file_id} level={level}: primary={primary:?} secondary={secondary:?} s3={s3:?}"
         )
     }
 
@@ -387,6 +386,9 @@ impl VersionSet {
         {
             let guard = self.levels.read();
             for file in guard.l0.iter().chain(guard.l1.iter()) {
+                if file.tier == StorageTier::S3 {
+                    continue;
+                }
                 let target_tier = self.tier_for_level(file.level);
                 if file.tier != target_tier {
                     moves.push((file.file_id, file.level, file.tier, target_tier));
@@ -399,6 +401,73 @@ impl VersionSet {
         }
 
         Ok(moves.len())
+    }
+
+    pub fn freeze_level_to_s3(&self, level: u8, max_files: Option<usize>) -> anyhow::Result<usize> {
+        let files = {
+            let guard = self.levels.read();
+            match level {
+                0 => guard.l0.clone(),
+                1 => guard.l1.clone(),
+                _ => anyhow::bail!("unsupported level for freeze: {level}"),
+            }
+        };
+
+        let limit = max_files.unwrap_or(usize::MAX);
+        let mut moved = 0usize;
+        for add in files {
+            if moved >= limit {
+                break;
+            }
+            if add.tier == StorageTier::S3 {
+                continue;
+            }
+            self.freeze_file_to_s3(&add)?;
+            moved += 1;
+        }
+
+        Ok(moved)
+    }
+
+    fn freeze_file_to_s3(&self, add: &AddFile) -> anyhow::Result<()> {
+        let src = self.resolve_sst_path(add.level, add.file_id)?;
+        let dst = self.sst_path_for_tier(StorageTier::S3, add.file_id);
+
+        if src != dst {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let dst_tmp = dst.with_extension("tmp");
+            std::fs::copy(&src, &dst_tmp)?;
+            {
+                let fd = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&dst_tmp)?;
+                fd.sync_data()?;
+            }
+            std::fs::rename(&dst_tmp, &dst)?;
+            {
+                let parent = dst
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("destination has no parent"))?;
+                let dir_fd = std::fs::File::open(parent)?;
+                dir_fd.sync_all()?;
+            }
+        }
+
+        self.mark_file_frozen(
+            add.file_id,
+            format!("L{}-{:016x}", add.level, add.file_id),
+            None,
+            8 * 1024 * 1024,
+        )?;
+
+        if src != dst {
+            let _ = std::fs::remove_file(src);
+        }
+
+        Ok(())
     }
 
     pub fn mark_file_frozen(
@@ -534,6 +603,10 @@ impl VersionSet {
                     file.tier = to_tier;
                 }
             }
+        }
+
+        if to_tier != StorageTier::S3 {
+            self.frozen_objects.write().remove(&file_id);
         }
 
         let _ = std::fs::remove_file(src);
@@ -754,8 +827,9 @@ impl VersionSet {
             .with_context(|| format!("sync tmp sst {}", tmp_path.display()))?;
         drop(tmp_fd);
 
-        std::fs::rename(&tmp_path, &final_path)
-            .with_context(|| format!("rename {} -> {}", tmp_path.display(), final_path.display()))?;
+        std::fs::rename(&tmp_path, &final_path).with_context(|| {
+            format!("rename {} -> {}", tmp_path.display(), final_path.display())
+        })?;
         let dir_fd = std::fs::File::open(&sst_dir)
             .with_context(|| format!("open sst dir {}", sst_dir.display()))?;
         dir_fd
@@ -825,6 +899,13 @@ impl VersionSet {
                 .sort_by(|a, b| a.smallest_user_key.cmp(&b.smallest_user_key));
         }
 
+        {
+            let mut frozen = self.frozen_objects.write();
+            for input in &inputs {
+                frozen.remove(&input.file_id);
+            }
+        }
+
         // Once manifest deletions are durable, remove old files from disk.
         for input in &inputs {
             let path_nvme = self
@@ -835,8 +916,13 @@ impl VersionSet {
                 .dir
                 .join("sst_hdd")
                 .join(format!("sst_{:016x}.sst", input.file_id));
+            let path_s3 = self
+                .dir
+                .join("sst_s3")
+                .join(format!("sst_{:016x}.sst", input.file_id));
             let _ = std::fs::remove_file(path_nvme);
             let _ = std::fs::remove_file(path_hdd);
+            let _ = std::fs::remove_file(path_s3);
         }
         Ok(())
     }
@@ -890,9 +976,8 @@ fn drop_obsolete_range_tombstones_bottommost(
     let droppable: Vec<RangeTombstone> = entries
         .iter()
         .filter_map(|(key, value)| {
-            (key.kind == KeyKind::RangeDel && key.seqno < min_snapshot_seqno).then(|| {
-                RangeTombstone::new(key.user_key.clone(), value.clone(), key.seqno)
-            })
+            (key.kind == KeyKind::RangeDel && key.seqno < min_snapshot_seqno)
+                .then(|| RangeTombstone::new(key.user_key.clone(), value.clone(), key.seqno))
         })
         .collect();
 

@@ -87,7 +87,8 @@ impl Db {
 
         let versions = Arc::new(VersionSet::recover(&dir, &options).context("recover versionset")?);
         let memtables = Arc::new(MemTableManager::new(options.memtable_shards));
-        let wal = Wal::open(&dir, &options, memtables.clone(), versions.clone()).context("open wal")?;
+        let wal =
+            Wal::open(&dir, &options, memtables.clone(), versions.clone()).context("open wal")?;
 
         Ok(Self {
             inner: Arc::new(DbInner {
@@ -121,12 +122,12 @@ impl Db {
         self.inner.versions.snapshots().create_snapshot()
     }
 
-    pub fn get(
-        &self,
-        key: impl AsRef<[u8]>,
-        opts: ReadOptions,
-    ) -> anyhow::Result<Option<Value>> {
-        let snapshot = self.inner.versions.snapshots().resolve_read_snapshot(opts.snapshot)?;
+    pub fn get(&self, key: impl AsRef<[u8]>, opts: ReadOptions) -> anyhow::Result<Option<Value>> {
+        let snapshot = self
+            .inner
+            .versions
+            .snapshots()
+            .resolve_read_snapshot(opts.snapshot)?;
 
         if let Some(value) = self
             .inner
@@ -150,7 +151,11 @@ impl Db {
     }
 
     pub fn iter(&self, range: Range, opts: ReadOptions) -> anyhow::Result<crate::db::DbIterator> {
-        let snapshot = self.inner.versions.snapshots().resolve_read_snapshot(opts.snapshot)?;
+        let snapshot = self
+            .inner
+            .versions
+            .snapshots()
+            .resolve_read_snapshot(opts.snapshot)?;
         crate::db::iterator::DbIterator::new(
             self.inner.memtables.iter(range.clone(), snapshot)?,
             self.inner.versions.iter(range, snapshot)?,

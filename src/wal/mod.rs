@@ -71,12 +71,7 @@ impl Wal {
         let last_durable_seqno = Arc::new(AtomicU64::new(0));
         let snapshot_tracker = versions.snapshots_handle();
 
-        let recovered = recover_from_wal(
-            &dir.join("wal"),
-            options,
-            &memtables,
-            &snapshot_tracker,
-        )?;
+        let recovered = recover_from_wal(&dir.join("wal"), options, &memtables, &snapshot_tracker)?;
         next_seqno.store(recovered.next_seqno, Ordering::Relaxed);
         last_durable_seqno.store(recovered.last_durable_seqno, Ordering::Relaxed);
         snapshot_tracker.set_latest_seqno(recovered.last_durable_seqno);
@@ -105,11 +100,7 @@ impl Wal {
         })
     }
 
-    pub fn write_batch(
-        &self,
-        ops: &[Op],
-        opts: WriteOptions,
-    ) -> anyhow::Result<()> {
+    pub fn write_batch(&self, ops: &[Op], opts: WriteOptions) -> anyhow::Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         self.tx
             .send(WalRequest {
@@ -233,13 +224,21 @@ fn encode_wal_record(seqno_base: u64, ops: &[Op]) -> anyhow::Result<Vec<u8>> {
             OpKind::Put => WalOpKind::Put as u8,
             OpKind::Del => WalOpKind::Del as u8,
         };
-        let key_len: u32 = op.key.len().try_into().map_err(|_| WalError::RecordTooLarge)?;
+        let key_len: u32 = op
+            .key
+            .len()
+            .try_into()
+            .map_err(|_| WalError::RecordTooLarge)?;
         ops_bytes.push(kind);
         ops_bytes.extend_from_slice(&key_len.to_le_bytes());
         ops_bytes.extend_from_slice(op.key.as_ref());
         match op.kind {
             OpKind::Put => {
-                let val_len: u32 = op.value.len().try_into().map_err(|_| WalError::RecordTooLarge)?;
+                let val_len: u32 = op
+                    .value
+                    .len()
+                    .try_into()
+                    .map_err(|_| WalError::RecordTooLarge)?;
                 ops_bytes.extend_from_slice(&val_len.to_le_bytes());
                 ops_bytes.extend_from_slice(op.value.as_ref());
             }
@@ -300,7 +299,8 @@ fn recover_from_wal(
         let mut offset = 0usize;
         while offset + WAL_RECORD_HEADER_BYTES <= data.len() {
             let len = u32::from_le_bytes(data[offset..(offset + 4)].try_into().unwrap()) as usize;
-            let crc_expected = u32::from_le_bytes(data[(offset + 4)..(offset + 8)].try_into().unwrap());
+            let crc_expected =
+                u32::from_le_bytes(data[(offset + 4)..(offset + 8)].try_into().unwrap());
             let start = offset + 8;
             let end = start + len;
             if end > data.len() {
@@ -344,14 +344,16 @@ fn decode_wal_payload(payload: &[u8]) -> anyhow::Result<(u64, Vec<Op>)> {
         }
         let kind = payload[offset];
         offset += 1;
-        let key_len = u32::from_le_bytes(payload[offset..(offset + 4)].try_into().unwrap()) as usize;
+        let key_len =
+            u32::from_le_bytes(payload[offset..(offset + 4)].try_into().unwrap()) as usize;
         offset += 4;
         if offset + key_len + 4 > payload.len() {
             anyhow::bail!("truncated wal key");
         }
         let key = Bytes::copy_from_slice(&payload[offset..(offset + key_len)]);
         offset += key_len;
-        let val_len = u32::from_le_bytes(payload[offset..(offset + 4)].try_into().unwrap()) as usize;
+        let val_len =
+            u32::from_le_bytes(payload[offset..(offset + 4)].try_into().unwrap()) as usize;
         offset += 4;
 
         let op_kind = match kind {

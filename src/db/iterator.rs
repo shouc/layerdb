@@ -33,10 +33,7 @@ impl DbIterator {
     }
 }
 
-pub fn range_contains(
-    range: &(Bound<bytes::Bytes>, Bound<bytes::Bytes>),
-    key: &[u8],
-) -> bool {
+pub fn range_contains(range: &(Bound<bytes::Bytes>, Bound<bytes::Bytes>), key: &[u8]) -> bool {
     let start_ok = match &range.0 {
         Bound::Unbounded => true,
         Bound::Included(k) => key >= k.as_ref(),
@@ -49,4 +46,3 @@ pub fn range_contains(
     };
     start_ok && end_ok
 }
-

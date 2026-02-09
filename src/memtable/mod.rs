@@ -58,7 +58,10 @@ impl MemTableManager {
 
     pub(crate) fn rotate_memtable(&self, new_wal_segment_id: u64) -> Arc<MemTable> {
         let mut guard = self.mutable.write();
-        let old = std::mem::replace(&mut *guard, Arc::new(MemTable::new(self.shard_count, new_wal_segment_id)));
+        let old = std::mem::replace(
+            &mut *guard,
+            Arc::new(MemTable::new(self.shard_count, new_wal_segment_id)),
+        );
         self.immutables.lock().push_front(old.clone());
         old
     }
@@ -136,7 +139,9 @@ impl MemTable {
         Self {
             wal_segment_id,
             shards: (0..shard_count)
-                .map(|_| MemTableShard { map: SkipMap::new() })
+                .map(|_| MemTableShard {
+                    map: SkipMap::new(),
+                })
                 .collect(),
             approximate_bytes: AtomicU64::new(0),
         }
@@ -267,7 +272,11 @@ impl MemTableIter {
     }
 
     pub fn seek(&mut self, key: &[u8]) {
-        let target = InternalKey::new(Bytes::copy_from_slice(key), self.snapshot_seqno, KeyKind::Meta);
+        let target = InternalKey::new(
+            Bytes::copy_from_slice(key),
+            self.snapshot_seqno,
+            KeyKind::Meta,
+        );
         self.index = match self
             .entries
             .binary_search_by(|entry| entry.key.cmp(&target))
@@ -288,12 +297,7 @@ impl MemTableIter {
                 )))
             }
         };
-        Some(Ok((
-            entry.key.user_key,
-            entry.key.seqno,
-            kind,
-            entry.value,
-        )))
+        Some(Ok((entry.key.user_key, entry.key.seqno, kind, entry.value)))
     }
 }
 
@@ -401,7 +405,10 @@ fn kind_rank(kind: OpKind) -> u8 {
     }
 }
 
-fn cmp_internal_tuple(a: &(Bytes, u64, OpKind, Bytes), b: &(Bytes, u64, OpKind, Bytes)) -> Ordering {
+fn cmp_internal_tuple(
+    a: &(Bytes, u64, OpKind, Bytes),
+    b: &(Bytes, u64, OpKind, Bytes),
+) -> Ordering {
     match a.0.cmp(&b.0) {
         Ordering::Equal => match b.1.cmp(&a.1) {
             Ordering::Equal => kind_rank(b.2).cmp(&kind_rank(a.2)),

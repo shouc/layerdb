@@ -100,11 +100,7 @@ impl InternalKey {
 
         let user_key = Bytes::copy_from_slice(&input[4..(4 + user_key_len)]);
         let seqno_offset = 4 + user_key_len;
-        let seqno = u64::from_le_bytes(
-            input[seqno_offset..(seqno_offset + 8)]
-                .try_into()
-                .unwrap(),
-        );
+        let seqno = u64::from_le_bytes(input[seqno_offset..(seqno_offset + 8)].try_into().unwrap());
         let kind = KeyKind::from_u8(input[seqno_offset + 8])?;
 
         Ok((
@@ -159,4 +155,3 @@ mod tests {
         assert_eq!(dec, key);
     }
 }
-

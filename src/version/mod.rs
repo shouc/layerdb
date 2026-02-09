@@ -7,10 +7,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::db::iterator::range_contains;
-use crate::db::{DbOptions, OpKind, Range, Value};
 use crate::db::snapshot::SnapshotTracker;
+use crate::db::{DbOptions, OpKind, Range, Value};
 use crate::internal_key::{InternalKey, KeyKind};
-use crate::sst::{SstReader, SstProperties};
+use crate::sst::{SstProperties, SstReader};
 use crate::version::manifest::{AddFile, Manifest, ManifestRecord};
 
 /// Placeholder for version set + manifest.
@@ -61,7 +61,10 @@ impl VersionSet {
         let files = self.files.read();
         for add in files.iter().rev() {
             if !range_contains(
-                &(std::ops::Bound::Included(add.smallest_user_key.clone()), std::ops::Bound::Included(add.largest_user_key.clone())),
+                &(
+                    std::ops::Bound::Included(add.smallest_user_key.clone()),
+                    std::ops::Bound::Included(add.largest_user_key.clone()),
+                ),
                 key,
             ) {
                 continue;
@@ -123,12 +126,19 @@ struct SstEntry {
 }
 
 impl SstIter {
-    fn new(dir: PathBuf, files: Vec<AddFile>, snapshot_seqno: u64, range: Range) -> anyhow::Result<Self> {
+    fn new(
+        dir: PathBuf,
+        files: Vec<AddFile>,
+        snapshot_seqno: u64,
+        range: Range,
+    ) -> anyhow::Result<Self> {
         let bounds = crate::memtable::bounds_from_range(&range);
         let mut entries = Vec::new();
 
         for file in files {
-            let path = dir.join("sst").join(format!("sst_{:016}.sst", file.file_id));
+            let path = dir
+                .join("sst")
+                .join(format!("sst_{:016}.sst", file.file_id));
             let reader = match SstReader::open(&path) {
                 Ok(r) => r,
                 Err(_) => continue,
@@ -166,7 +176,11 @@ impl SstIter {
     }
 
     pub fn seek(&mut self, user_key: &[u8]) {
-        let target = InternalKey::new(Bytes::copy_from_slice(user_key), self.snapshot_seqno, KeyKind::Meta);
+        let target = InternalKey::new(
+            Bytes::copy_from_slice(user_key),
+            self.snapshot_seqno,
+            KeyKind::Meta,
+        );
         self.index = match self
             .entries
             .binary_search_by(|entry| entry.key.cmp(&target))

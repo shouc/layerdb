@@ -468,6 +468,22 @@ fn db_check(db: &Path) -> anyhow::Result<()> {
     for (level, entries) in totals {
         println!("db_check: level={level} entries={entries}");
     }
+
+    let db_handle = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    let archives = db_handle.list_archives();
+    for archive in &archives {
+        let path = Path::new(&archive.archive_path);
+        if !path.exists() {
+            anyhow::bail!(
+                "missing referenced archive: id={} branch={} path={}",
+                archive.archive_id,
+                archive.branch,
+                path.display()
+            );
+        }
+    }
+    println!("db_check: archives={}", archives.len());
+
     println!("db_check ok: {} files referenced", records.len());
     Ok(())
 }

@@ -28,6 +28,8 @@ pub struct Wal {
     tx: mpsc::UnboundedSender<WalRequest>,
     _next_seqno: Arc<AtomicU64>,
     last_durable_seqno: Arc<AtomicU64>,
+    wal_thread: Option<thread::JoinHandle<()>>,
+    flush_thread: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -75,7 +77,7 @@ impl Wal {
             memtables: memtables.clone(),
             versions: versions.clone(),
         };
-        thread::Builder::new()
+        let flush_thread = thread::Builder::new()
             .name("layerdb-flush".to_string())
             .spawn(move || flush_thread_main(flush_state, flush_rx))
             .expect("spawn flush thread");
@@ -107,7 +109,7 @@ impl Wal {
             recovered.last_segment_id + 1,
         )?;
 
-        thread::Builder::new()
+        let wal_thread = thread::Builder::new()
             .name("layerdb-wal".to_string())
             .spawn(move || wal_thread_main(&mut state, rx))
             .expect("spawn wal thread");
@@ -116,6 +118,8 @@ impl Wal {
             tx,
             _next_seqno: next_seqno,
             last_durable_seqno,
+            wal_thread: Some(wal_thread),
+            flush_thread: Some(flush_thread),
         })
     }
 
@@ -134,6 +138,21 @@ impl Wal {
 
     pub fn last_durable_seqno(&self) -> u64 {
         self.last_durable_seqno.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Wal {
+    fn drop(&mut self) {
+        let (dummy_tx, _dummy_rx) = mpsc::unbounded_channel();
+        let old_tx = std::mem::replace(&mut self.tx, dummy_tx);
+        drop(old_tx);
+
+        if let Some(handle) = self.wal_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.flush_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 

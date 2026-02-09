@@ -7,6 +7,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parking_lot::RwLock;
 
+use crate::cache::BlockCacheKey;
 use crate::db::iterator::range_contains;
 use crate::db::snapshot::SnapshotTracker;
 use crate::db::{DbOptions, LookupResult, OpKind, Range, Value};
@@ -26,6 +27,8 @@ pub struct VersionSet {
     levels: parking_lot::RwLock<Levels>,
     manifest: parking_lot::Mutex<Manifest>,
     reader_cache: crate::cache::ClockProCache<PathBuf, SstReader>,
+    data_block_cache:
+        Option<Arc<crate::cache::ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
     branches: RwLock<std::collections::BTreeMap<String, u64>>,
     current_branch: RwLock<String>,
 }
@@ -74,6 +77,11 @@ impl VersionSet {
             levels: parking_lot::RwLock::new(Levels { l0, l1 }),
             manifest: parking_lot::Mutex::new(manifest),
             reader_cache: crate::cache::ClockProCache::new(options.sst_reader_cache_entries),
+            data_block_cache: (options.block_cache_entries > 0).then(|| {
+                Arc::new(crate::cache::ClockProCache::new(
+                    options.block_cache_entries,
+                ))
+            }),
             branches: RwLock::new(branches),
             current_branch: RwLock::new("main".to_string()),
         })
@@ -142,7 +150,10 @@ impl VersionSet {
         if let Some(reader) = self.reader_cache.get(&key) {
             return Ok(reader);
         }
-        let reader = Arc::new(SstReader::open(path)?);
+        let reader = Arc::new(SstReader::open_with_cache(
+            path,
+            self.data_block_cache.clone(),
+        )?);
         self.reader_cache.insert(key, reader.clone());
         Ok(reader)
     }

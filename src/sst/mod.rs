@@ -31,6 +31,7 @@
 use std::cmp::Ordering;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use memmap2::Mmap;
@@ -39,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::integrity::{BlockCrc32c, BlockHash, RecordHasher};
 use crate::internal_key::{InternalKey, KeyKind};
 use crate::range_tombstone::RangeTombstone;
+use crate::{cache::BlockCacheKey, cache::BlockKind, cache::ClockProCache};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SstError {
@@ -321,14 +323,23 @@ impl SstBuilder {
 
 pub struct SstReader {
     path: PathBuf,
+    sst_id: u64,
     mmap: Mmap,
     index: Vec<IndexEntry>,
     props: SstProperties,
     range_tombstones_cache: parking_lot::Mutex<Option<Vec<RangeTombstone>>>,
+    data_block_cache: Option<Arc<ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
 }
 
 impl SstReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SstError> {
+        Self::open_with_cache(path, None)
+    }
+
+    pub fn open_with_cache(
+        path: impl AsRef<Path>,
+        data_block_cache: Option<Arc<ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
+    ) -> Result<Self, SstError> {
         let path = path.as_ref().to_path_buf();
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -365,12 +376,16 @@ impl SstReader {
             range_tombstones_cache = Some(cached);
         }
 
+        let sst_id = file_id_from_path(&path).unwrap_or(0);
+
         Ok(Self {
             path,
+            sst_id,
             mmap,
             index,
             props,
             range_tombstones_cache: parking_lot::Mutex::new(range_tombstones_cache),
+            data_block_cache,
         })
     }
 
@@ -390,8 +405,8 @@ impl SstReader {
             snapshot_seqno,
             KeyKind::Meta,
         );
-        let candidate = if let Some(block) = self.find_block(&target) {
-            let entries = self.read_block(block)?;
+        let candidate = if let Some((block_no, block)) = self.find_block(&target) {
+            let entries = self.read_block(block_no, block)?;
 
             let pos = match entries.binary_search_by(|(k, _)| k.cmp(&target)) {
                 Ok(i) | Err(i) => i,
@@ -490,7 +505,7 @@ impl SstReader {
         })
     }
 
-    fn find_block(&self, target: &InternalKey) -> Option<BlockHandle> {
+    fn find_block(&self, target: &InternalKey) -> Option<(u32, BlockHandle)> {
         if self.index.is_empty() {
             return None;
         }
@@ -504,10 +519,31 @@ impl SstReader {
                 hi = mid;
             }
         }
-        self.index.get(lo).map(|e| e.handle)
+        self.index
+            .get(lo)
+            .map(|e| (lo.try_into().expect("sst block index fits u32"), e.handle))
     }
 
-    fn read_block(&self, handle: BlockHandle) -> Result<Vec<(InternalKey, Bytes)>, SstError> {
+    fn read_block(
+        &self,
+        block_no: u32,
+        handle: BlockHandle,
+    ) -> Result<Vec<(InternalKey, Bytes)>, SstError> {
+        if let Some(cache) = &self.data_block_cache {
+            let cache_key = BlockCacheKey::new(self.sst_id, BlockKind::Data, block_no);
+            if let Some(cached) = cache.get(&cache_key) {
+                return Ok((*cached).clone());
+            }
+
+            let decoded = self.decode_block(handle)?;
+            cache.insert(cache_key, Arc::new(decoded.clone()));
+            return Ok(decoded);
+        }
+
+        self.decode_block(handle)
+    }
+
+    fn decode_block(&self, handle: BlockHandle) -> Result<Vec<(InternalKey, Bytes)>, SstError> {
         let start = handle.offset as usize;
         let end = start + handle.len as usize;
         if end > self.mmap.len() {
@@ -602,9 +638,10 @@ impl<'a> SstIter<'a> {
                 if self.index_pos >= self.reader.index.len() {
                     return None;
                 }
+                let block_no: u32 = self.index_pos.try_into().expect("sst block index fits u32");
                 let handle = self.reader.index[self.index_pos].handle;
                 self.index_pos += 1;
-                match self.reader.read_block(handle) {
+                match self.reader.read_block(block_no, handle) {
                     Ok(entries) => {
                         self.entries = entries;
                         self.entry_pos = 0;

@@ -507,6 +507,16 @@ impl VersionSet {
             .with_context(|| format!("open source sst {}", source_path.display()))?;
         let props = source_reader.properties().clone();
 
+        if props.entries == 0 {
+            anyhow::bail!("cannot ingest empty sst: {}", source_path.display());
+        }
+        if props.smallest_user_key > props.largest_user_key {
+            anyhow::bail!(
+                "invalid sst key range: smallest > largest ({})",
+                source_path.display()
+            );
+        }
+
         let file_id = self.allocate_file_id();
         let sst_dir = self.sst_root_dir(0);
         std::fs::create_dir_all(&sst_dir)

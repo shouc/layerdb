@@ -42,6 +42,12 @@ fn build_external_high_seq_sst(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn build_empty_external_sst(path: &std::path::Path) -> anyhow::Result<()> {
+    let builder = SstBuilder::create(path, 77, 4 * 1024)?;
+    let _props = builder.finish()?;
+    Ok(())
+}
+
 #[test]
 fn ingest_sst_makes_data_visible_and_persists_manifest() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
@@ -140,6 +146,22 @@ fn writes_after_ingest_get_higher_seqnos() -> anyhow::Result<()> {
         db.get(b"k", ReadOptions::default())?,
         Some(Bytes::from("new"))
     );
+
+    Ok(())
+}
+
+#[test]
+fn ingest_rejects_empty_sst() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let ext_dir = TempDir::new()?;
+
+    let source_path = ext_dir.path().join("sst_000000000000004d.sst");
+    build_empty_external_sst(ext_dir.path())?;
+
+    let db = Db::open(dir.path(), options())?;
+    let err = db.ingest_sst(&source_path).expect_err("empty ingest should fail");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("empty sst"), "unexpected error: {msg}");
 
     Ok(())
 }

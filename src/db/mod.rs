@@ -1,5 +1,5 @@
 mod options;
-mod snapshot;
+pub(crate) mod snapshot;
 
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -129,20 +129,26 @@ impl Db {
         opts: ReadOptions,
     ) -> anyhow::Result<Option<Value>> {
         let snapshot = self.inner.versions.snapshots().resolve_read_snapshot(opts.snapshot)?;
-        self.inner
+
+        if let Some(value) = self
+            .inner
             .memtables
             .get(key.as_ref(), snapshot)
-            .context("memtable get")
-            .or_else(|| {
-                self.inner
-                    .versions
-                    .get(key.as_ref(), snapshot)
-                    .context("sst get")
-                    .transpose()
-                    .ok()
-                    .flatten()
-            })
-            .transpose()
+            .context("memtable get")?
+        {
+            return Ok(value);
+        }
+
+        if let Some(value) = self
+            .inner
+            .versions
+            .get(key.as_ref(), snapshot)
+            .context("sst get")?
+        {
+            return Ok(value);
+        }
+
+        Ok(None)
     }
 
     pub fn iter(&self, range: Range, opts: ReadOptions) -> anyhow::Result<crate::db::DbIterator> {
@@ -167,4 +173,3 @@ impl Db {
 pub mod iterator;
 
 pub use iterator::DbIterator;
-

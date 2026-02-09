@@ -118,6 +118,16 @@ enum Command {
         #[arg(long)]
         branch: Option<String>,
     },
+    Scan {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        start: Option<String>,
+        #[arg(long)]
+        end: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+    },
     Put {
         #[arg(long)]
         db: PathBuf,
@@ -216,6 +226,12 @@ fn main() -> anyhow::Result<()> {
         Command::Branches { db } => branches(&db),
         Command::FrozenObjects { db } => frozen_objects(&db),
         Command::Get { db, key, branch } => get_cmd(&db, &key, branch.as_deref()),
+        Command::Scan {
+            db,
+            start,
+            end,
+            branch,
+        } => scan_cmd(&db, start.as_deref(), end.as_deref(), branch.as_deref()),
         Command::Put {
             db,
             key,
@@ -733,6 +749,49 @@ fn get_cmd(db: &Path, key: &str, branch: Option<&str>) -> anyhow::Result<()> {
     match db.get(key.as_bytes(), layerdb::ReadOptions::default())? {
         Some(value) => println!("value={}", String::from_utf8_lossy(&value)),
         None => println!("not_found"),
+    }
+
+    Ok(())
+}
+
+fn scan_cmd(
+    db: &Path,
+    start: Option<&str>,
+    end: Option<&str>,
+    branch: Option<&str>,
+) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    if let Some(branch_name) = branch {
+        db.checkout(branch_name)?;
+    }
+
+    let range = match (start, end) {
+        (None, None) => layerdb::Range::all(),
+        (Some(s), None) => layerdb::Range {
+            start: Bound::Included(bytes::Bytes::copy_from_slice(s.as_bytes())),
+            end: Bound::Unbounded,
+        },
+        (None, Some(e)) => layerdb::Range {
+            start: Bound::Unbounded,
+            end: Bound::Excluded(bytes::Bytes::copy_from_slice(e.as_bytes())),
+        },
+        (Some(s), Some(e)) => layerdb::Range {
+            start: Bound::Included(bytes::Bytes::copy_from_slice(s.as_bytes())),
+            end: Bound::Excluded(bytes::Bytes::copy_from_slice(e.as_bytes())),
+        },
+    };
+
+    let mut iter = db.iter(range, layerdb::ReadOptions::default())?;
+    iter.seek_to_first();
+    while let Some(next) = iter.next() {
+        let (key, value) = next?;
+        if let Some(value) = value {
+            println!(
+                "{}={}",
+                String::from_utf8_lossy(&key),
+                String::from_utf8_lossy(&value)
+            );
+        }
     }
 
     Ok(())

@@ -40,6 +40,14 @@ enum Command {
         #[arg(long, value_enum, default_value_t = BenchWorkload::Smoke)]
         workload: BenchWorkload,
     },
+    CompactRange {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        start: Option<String>,
+        #[arg(long)]
+        end: Option<String>,
+    },
     RebalanceTiers {
         #[arg(long)]
         db: PathBuf,
@@ -106,6 +114,9 @@ fn main() -> anyhow::Result<()> {
         Command::DbCheck { db } => db_check(&db),
         Command::Scrub { db } => scrub(&db),
         Command::Bench { db, keys, workload } => bench(&db, keys, workload),
+        Command::CompactRange { db, start, end } => {
+            compact_range_cmd(&db, start.as_deref(), end.as_deref())
+        }
         Command::RebalanceTiers { db } => rebalance_tiers(&db),
         Command::FreezeLevel {
             db,
@@ -453,6 +464,34 @@ fn bench(db: &Path, keys: usize, workload: BenchWorkload) -> anyhow::Result<()> 
     };
     println!("bench workload={workload_name} keys={keys}");
     println!("elapsed={elapsed:?} qps={qps:.0}");
+    Ok(())
+}
+
+fn compact_range_cmd(db: &Path, start: Option<&str>, end: Option<&str>) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+
+    let range = match (start, end) {
+        (None, None) => None,
+        (Some(s), None) => Some(layerdb::Range {
+            start: Bound::Included(bytes::Bytes::copy_from_slice(s.as_bytes())),
+            end: Bound::Unbounded,
+        }),
+        (None, Some(e)) => Some(layerdb::Range {
+            start: Bound::Unbounded,
+            end: Bound::Excluded(bytes::Bytes::copy_from_slice(e.as_bytes())),
+        }),
+        (Some(s), Some(e)) => Some(layerdb::Range {
+            start: Bound::Included(bytes::Bytes::copy_from_slice(s.as_bytes())),
+            end: Bound::Excluded(bytes::Bytes::copy_from_slice(e.as_bytes())),
+        }),
+    };
+
+    db.compact_range(range)?;
+    println!(
+        "compact_range start={} end={}",
+        start.unwrap_or("-"),
+        end.unwrap_or("-")
+    );
     Ok(())
 }
 

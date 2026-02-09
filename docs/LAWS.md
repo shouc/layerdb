@@ -14,6 +14,7 @@ Implementation details may evolve, but these invariants must remain true.
 - `release_snapshot(snapshot)`
 - `create_branch(name, from_snapshot)` (optional)
 - `checkout(branch)` (optional)
+- `drop_branch(name)` (optional)
 - `compact_range(optional range)` (manual trigger)
 - `ingest_sst(sst_path)` (optional)
 - `freeze_level_to_s3(level, max_files)` (optional)
@@ -41,6 +42,8 @@ Implementation details may evolve, but these invariants must remain true.
 - **Snapshots**: A snapshot is a consistent read at a seqno.
 - **Snapshot release**: Releasing a snapshot unpins it for future compaction
   safety calculations.
+- **Branches**: Branch heads are persisted in the manifest; dropping a branch
+  removes it from recovery state (`main` is protected).
 - **Deletes**: Deletes are tombstones; visibility depends on snapshot seqno.
 - **Range deletes**: Implemented conservatively. Tombstones are represented as
   `RangeDel` internal entries where key=`start`, value=`end` (`[start, end)`).

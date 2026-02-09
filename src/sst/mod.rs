@@ -83,6 +83,12 @@ pub struct SstProperties {
     /// tombstones.
     #[serde(default)]
     pub range_tombstones: Vec<RangeTombstone>,
+
+    /// Optional bloom filter over point user keys.
+    ///
+    /// Encoded as bincode bytes for backward-compatible persistence.
+    #[serde(default)]
+    pub point_filter: Option<Vec<u8>>,
 }
 
 fn default_sst_format_version() -> u32 {
@@ -138,6 +144,7 @@ pub struct SstBuilder {
     data_bytes: u64,
     table_hasher: blake3::Hasher,
     range_tombstones: Vec<RangeTombstone>,
+    point_keys: Vec<Bytes>,
 }
 
 fn max_bytes(a: Option<Bytes>, b: Bytes) -> Bytes {
@@ -174,6 +181,7 @@ impl SstBuilder {
             data_bytes: 0,
             table_hasher: blake3::Hasher::new(),
             range_tombstones: Vec::new(),
+            point_keys: Vec::new(),
         })
     }
 
@@ -209,6 +217,7 @@ impl SstBuilder {
                     self.largest_user_key.take(),
                     key.user_key.clone(),
                 ));
+                self.point_keys.push(key.user_key.clone());
             }
         }
         self.last_key = Some(key.clone());
@@ -252,6 +261,7 @@ impl SstBuilder {
         let props_offset = self.file.stream_position()?;
         self.table_hasher.update(&index_bytes);
         let table_root = TableRoot(*self.table_hasher.finalize().as_bytes());
+        let point_filter = build_point_filter(&self.point_keys)?;
         let props = SstProperties {
             smallest_user_key: self.smallest_user_key.clone().unwrap_or_else(Bytes::new),
             largest_user_key: self.largest_user_key.clone().unwrap_or_else(Bytes::new),
@@ -262,6 +272,7 @@ impl SstBuilder {
             table_root,
             format_version: 2,
             range_tombstones: self.range_tombstones.clone(),
+            point_filter,
         };
         let props_bytes =
             bincode::serialize(&props).map_err(|_| SstError::Corrupt("props serialize"))?;
@@ -329,6 +340,7 @@ pub struct SstReader {
     props: SstProperties,
     range_tombstones_cache: parking_lot::Mutex<Option<Vec<RangeTombstone>>>,
     data_block_cache: Option<Arc<ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
+    point_filter: Option<bloomfilter::Bloom<Bytes>>,
 }
 
 impl SstReader {
@@ -377,6 +389,10 @@ impl SstReader {
         }
 
         let sst_id = file_id_from_path(&path).unwrap_or(0);
+        let point_filter = props
+            .point_filter
+            .as_ref()
+            .and_then(|raw| decode_point_filter(raw));
 
         Ok(Self {
             path,
@@ -386,6 +402,7 @@ impl SstReader {
             props,
             range_tombstones_cache: parking_lot::Mutex::new(range_tombstones_cache),
             data_block_cache,
+            point_filter,
         })
     }
 
@@ -399,6 +416,12 @@ impl SstReader {
         snapshot_seqno: u64,
     ) -> Result<Option<(u64, Option<Bytes>)>, SstError> {
         let tombstone_seq = self.max_covering_tombstone_seq(user_key, snapshot_seqno)?;
+        if self.point_filter.as_ref().is_some_and(|filter| {
+            let key = Bytes::copy_from_slice(user_key);
+            !filter.check(&key)
+        }) {
+            return Ok(tombstone_seq.map(|seq| (seq, None)));
+        }
 
         let target = InternalKey::new(
             Bytes::copy_from_slice(user_key),
@@ -722,4 +745,27 @@ pub fn file_id_from_path(path: &Path) -> Option<u64> {
 
 fn _cmp_internal(a: &InternalKey, b: &InternalKey) -> Ordering {
     a.cmp(b)
+}
+
+fn build_point_filter(point_keys: &[Bytes]) -> Result<Option<Vec<u8>>, SstError> {
+    if point_keys.is_empty() {
+        return Ok(None);
+    }
+
+    let seed = blake3::hash(b"layerdb_point_filter_seed");
+    let mut seed_bytes = [0u8; 32];
+    seed_bytes.copy_from_slice(seed.as_bytes());
+
+    let mut bloom =
+        bloomfilter::Bloom::new_for_fp_rate_with_seed(point_keys.len(), 0.01, &seed_bytes);
+    for key in point_keys {
+        bloom.set(key);
+    }
+
+    let raw = bincode::serialize(&bloom).map_err(|_| SstError::Corrupt("point filter encode"))?;
+    Ok(Some(raw))
+}
+
+fn decode_point_filter(raw: &[u8]) -> Option<bloomfilter::Bloom<Bytes>> {
+    bincode::deserialize(raw).ok()
 }

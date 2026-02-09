@@ -9,6 +9,7 @@ use crate::range_tombstone::RangeTombstone;
 pub struct DbIterator {
     merged: crate::memtable::MergedMemAndSstIter,
     range_tombstones: Vec<RangeTombstone>,
+    snapshot_seqno: u64,
 }
 
 impl DbIterator {
@@ -22,6 +23,7 @@ impl DbIterator {
         Ok(Self {
             merged: crate::memtable::MergedMemAndSstIter::new(mem, sst, snapshot_seqno)?,
             range_tombstones,
+            snapshot_seqno,
         })
     }
 
@@ -35,22 +37,35 @@ impl DbIterator {
 
     pub fn next(&mut self) -> Option<anyhow::Result<(bytes::Bytes, Option<Value>)>> {
         loop {
-            let (key, value) = match self.merged.next()? {
+            let (key, seqno, value) = match self.merged.next()? {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
-            if is_deleted_by_range_tombstone(&self.range_tombstones, key.as_ref()) {
+            if is_deleted_by_range_tombstone(
+                &self.range_tombstones,
+                key.as_ref(),
+                seqno,
+                self.snapshot_seqno,
+            ) {
                 continue;
             }
-            return Some(Ok((key, value)));
+            return Some(Ok((key, Some(value))));
         }
     }
 }
 
-fn is_deleted_by_range_tombstone(tombstones: &[RangeTombstone], key: &[u8]) -> bool {
-    tombstones
-        .iter()
-        .any(|t| t.start_key.as_ref() <= key && key < t.end_key.as_ref())
+fn is_deleted_by_range_tombstone(
+    tombstones: &[RangeTombstone],
+    key: &[u8],
+    key_seqno: u64,
+    snapshot_seqno: u64,
+) -> bool {
+    tombstones.iter().any(|t| {
+        t.seqno <= snapshot_seqno
+            && t.seqno >= key_seqno
+            && t.start_key.as_ref() <= key
+            && key < t.end_key.as_ref()
+    })
 }
 
 pub fn range_contains(range: &(Bound<bytes::Bytes>, Bound<bytes::Bytes>), key: &[u8]) -> bool {

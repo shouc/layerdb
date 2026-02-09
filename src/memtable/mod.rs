@@ -427,7 +427,7 @@ impl MergedMemAndSstIter {
         self.skip_user_key = None;
     }
 
-    pub fn next(&mut self) -> Option<anyhow::Result<(Bytes, Option<Value>)>> {
+    pub fn next(&mut self) -> Option<anyhow::Result<(Bytes, u64, Value)>> {
         loop {
             if self.next_mem.is_none() {
                 match self.mem.next() {
@@ -471,7 +471,7 @@ impl MergedMemAndSstIter {
             self.skip_user_key = Some(user_key.clone());
 
             match kind {
-                OpKind::Put => return Some(Ok((user_key, Some(value)))),
+                OpKind::Put => return Some(Ok((user_key, _seqno, value))),
                 OpKind::Del => continue,
                 OpKind::RangeDel => {
                     // Range tombstones are handled by the DB-level iterator.

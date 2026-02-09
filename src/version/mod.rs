@@ -379,7 +379,7 @@ impl VersionSet {
         self.snapshots.latest_seqno()
     }
 
-    fn min_retained_seqno(&self) -> u64 {
+    pub(crate) fn min_retained_seqno(&self) -> u64 {
         let min_snapshot = self.snapshots.min_pinned_seqno();
         let min_branch = self
             .branches

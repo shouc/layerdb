@@ -110,6 +110,10 @@ enum Command {
         #[arg(long)]
         branch: Option<String>,
     },
+    RetentionFloor {
+        #[arg(long)]
+        db: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -154,6 +158,7 @@ fn main() -> anyhow::Result<()> {
         Command::Branches { db } => branches(&db),
         Command::FrozenObjects { db } => frozen_objects(&db),
         Command::Get { db, key, branch } => get_cmd(&db, &key, branch.as_deref()),
+        Command::RetentionFloor { db } => retention_floor_cmd(&db),
     }
 }
 
@@ -616,6 +621,12 @@ fn get_cmd(db: &Path, key: &str, branch: Option<&str>) -> anyhow::Result<()> {
         None => println!("not_found"),
     }
 
+    Ok(())
+}
+
+fn retention_floor_cmd(db: &Path) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    println!("retention_floor seqno={}", db.retention_floor_seqno());
     Ok(())
 }
 

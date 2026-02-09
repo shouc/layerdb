@@ -208,6 +208,10 @@ impl Db {
         self.inner.versions.current_branch()
     }
 
+    pub fn retention_floor_seqno(&self) -> u64 {
+        self.inner.versions.min_retained_seqno()
+    }
+
     pub fn get(&self, key: impl AsRef<[u8]>, opts: ReadOptions) -> anyhow::Result<Option<Value>> {
         let snapshot = match opts.snapshot {
             Some(snapshot) => self

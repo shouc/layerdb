@@ -110,6 +110,7 @@ Kinds:
 - `layerdb sst-dump --sst <file>` prints table properties and sampled entries.
 - `layerdb db-check --db <path>` verifies manifest references, table roots, and
   checksum-decoded readability.
+- `layerdb verify --db <path>` is an alias for `db-check`.
 - `layerdb scrub --db <path>` scans all active SSTs and reports entry totals by
   level.
 - `layerdb bench --db <path> --workload <...>` supports `smoke`, `fill`,

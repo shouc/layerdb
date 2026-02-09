@@ -28,6 +28,10 @@ enum Command {
         #[arg(long)]
         db: PathBuf,
     },
+    Verify {
+        #[arg(long)]
+        db: PathBuf,
+    },
     Scrub {
         #[arg(long)]
         db: PathBuf,
@@ -118,6 +122,7 @@ fn main() -> anyhow::Result<()> {
         Command::ManifestDump { db } => manifest_dump(&db),
         Command::SstDump { sst } => sst_dump(&sst),
         Command::DbCheck { db } => db_check(&db),
+        Command::Verify { db } => verify(&db),
         Command::Scrub { db } => scrub(&db),
         Command::Bench { db, keys, workload } => bench(&db, keys, workload),
         Command::CompactRange { db, start, end } => {
@@ -285,6 +290,10 @@ fn db_check(db: &Path) -> anyhow::Result<()> {
     }
     println!("db_check ok: {} files referenced", records.len());
     Ok(())
+}
+
+fn verify(db: &Path) -> anyhow::Result<()> {
+    db_check(db)
 }
 
 fn scrub(db: &Path) -> anyhow::Result<()> {

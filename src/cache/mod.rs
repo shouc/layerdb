@@ -42,9 +42,19 @@ impl BlockCacheKey {
 /// Stand-in for CLOCK-Pro.
 ///
 /// This implementation is a size-bounded LRU by entry count.
-#[derive(Debug)]
 pub struct ClockProCache<K: Eq + Hash, V> {
     inner: Mutex<LruCache<K, Arc<V>>>,
+}
+
+impl<K, V> std::fmt::Debug for ClockProCache<K, V>
+where
+    K: Eq + Hash,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClockProCache")
+            .field("len", &self.len())
+            .finish()
+    }
 }
 
 impl<K, V> ClockProCache<K, V>

@@ -3,10 +3,13 @@ pub(crate) mod snapshot;
 
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::Context;
+use parking_lot::RwLock;
 use rayon::prelude::*;
 
 use crate::memtable::MemTableManager;
@@ -89,6 +92,7 @@ impl Range {
 /// - Read-your-writes per handle: each handle tracks an acknowledged sequence
 ///   number and uses that as the default snapshot for reads.
 /// - Explicit snapshots provide consistent reads at a seqno.
+#[derive(Clone)]
 pub struct Db {
     inner: Arc<DbInner>,
     read_snapshot: Arc<AtomicU64>,
@@ -334,6 +338,67 @@ impl Db {
         Ok(report)
     }
 
+    pub fn spawn_background_scrubber(
+        &self,
+        interval: Duration,
+    ) -> anyhow::Result<BackgroundScrubber> {
+        if interval.is_zero() {
+            anyhow::bail!("scrubber interval must be > 0");
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(AtomicU64::new(0));
+        let last_report = Arc::new(RwLock::new(None));
+        let last_error = Arc::new(RwLock::new(None));
+
+        let db = self.clone();
+        let stop_thread = stop.clone();
+        let runs_thread = runs.clone();
+        let last_report_thread = last_report.clone();
+        let last_error_thread = last_error.clone();
+
+        let join = std::thread::Builder::new()
+            .name("layerdb-scrubber".to_string())
+            .spawn(move || loop {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                match db.scrub_integrity() {
+                    Ok(report) => {
+                        *last_report_thread.write() = Some(report);
+                        *last_error_thread.write() = None;
+                    }
+                    Err(err) => {
+                        *last_error_thread.write() = Some(format!("{err:#}"));
+                    }
+                }
+                runs_thread.fetch_add(1, Ordering::Relaxed);
+
+                let deadline = std::time::Instant::now() + interval;
+                loop {
+                    if stop_thread.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let remaining = deadline.saturating_duration_since(now);
+                    let sleep_for = remaining.min(Duration::from_millis(25));
+                    std::thread::sleep(sleep_for);
+                }
+            })?;
+
+        Ok(BackgroundScrubber {
+            stop,
+            runs,
+            last_report,
+            last_error,
+            join: Some(join),
+        })
+    }
+
     fn default_read_snapshot(&self) -> u64 {
         self.read_snapshot.load(Ordering::Relaxed)
     }
@@ -347,4 +412,48 @@ pub use iterator::DbIterator;
 pub struct ScrubReport {
     pub files_checked: usize,
     pub entries_by_level: std::collections::BTreeMap<u8, u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackgroundScrubberState {
+    pub runs: u64,
+    pub last_report: Option<ScrubReport>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct BackgroundScrubber {
+    stop: Arc<AtomicBool>,
+    runs: Arc<AtomicU64>,
+    last_report: Arc<RwLock<Option<ScrubReport>>>,
+    last_error: Arc<RwLock<Option<String>>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl BackgroundScrubber {
+    pub fn snapshot(&self) -> BackgroundScrubberState {
+        BackgroundScrubberState {
+            runs: self.runs.load(Ordering::Relaxed),
+            last_report: self.last_report.read().clone(),
+            last_error: self.last_error.read().clone(),
+        }
+    }
+
+    pub fn stop(mut self) -> anyhow::Result<BackgroundScrubberState> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            join.join()
+                .map_err(|_| anyhow::anyhow!("scrubber thread panicked"))?;
+        }
+        Ok(self.snapshot())
+    }
+}
+
+impl Drop for BackgroundScrubber {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }

@@ -488,7 +488,7 @@ impl WalState {
 
         if let Err(err) = self
             .io_rt
-            .block_on(self.io.append_many(&self.segment_path, &records))
+            .block_on(self.io.append_many(&self.segment_path, records))
         {
             let msg = format!("{err:#}");
             for write in staged {

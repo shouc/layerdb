@@ -5,6 +5,7 @@
 //! file APIs and bounded by a semaphore to model queue depth.
 
 use std::collections::HashMap;
+use std::io::{IoSlice, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -72,30 +73,58 @@ impl UringExecutor {
     pub async fn append_many(
         &self,
         path: impl AsRef<Path>,
-        chunks: &[Vec<u8>],
+        chunks: Vec<Vec<u8>>,
     ) -> anyhow::Result<u64> {
         let _permit = self.acquire_permit().await?;
-        let path = path.as_ref();
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)
-            .await
-            .with_context(|| format!("open for append_many: {}", path.display()))?;
-        let offset = file
-            .metadata()
-            .await
-            .with_context(|| format!("metadata: {}", path.display()))?
-            .len();
+        let path = path.as_ref().to_path_buf();
 
-        for chunk in chunks {
-            file.write_all(chunk)
-                .await
-                .with_context(|| format!("append_many write: {}", path.display()))?;
-        }
+        tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("open for append_many: {}", path.display()))?;
+            let offset = file
+                .metadata()
+                .with_context(|| format!("metadata: {}", path.display()))?
+                .len();
 
-        Ok(offset)
+            let mut chunk_idx = 0usize;
+            let mut chunk_off = 0usize;
+
+            while chunk_idx < chunks.len() {
+                let mut slices = Vec::with_capacity(chunks.len() - chunk_idx);
+                slices.push(IoSlice::new(&chunks[chunk_idx][chunk_off..]));
+                for chunk in chunks.iter().skip(chunk_idx + 1) {
+                    slices.push(IoSlice::new(chunk));
+                }
+
+                let written = file
+                    .write_vectored(&slices)
+                    .with_context(|| format!("append_many write_vectored: {}", path.display()))?;
+                if written == 0 {
+                    anyhow::bail!("append_many wrote zero bytes: {}", path.display());
+                }
+
+                let mut remaining = written;
+                while remaining > 0 && chunk_idx < chunks.len() {
+                    let available = chunks[chunk_idx].len() - chunk_off;
+                    if remaining < available {
+                        chunk_off += remaining;
+                        remaining = 0;
+                    } else {
+                        remaining -= available;
+                        chunk_idx += 1;
+                        chunk_off = 0;
+                    }
+                }
+            }
+
+            Ok(offset)
+        })
+        .await
+        .context("join append_many task")?
     }
 
     pub async fn write_all_at(
@@ -438,7 +467,7 @@ mod tests {
         let io = UringExecutor::new(8);
 
         let chunks = vec![b"ab".to_vec(), b"cd".to_vec()];
-        let offset0 = io.append_many(&path, &chunks).await.expect("append_many");
+        let offset0 = io.append_many(&path, chunks).await.expect("append_many");
         let offset1 = io.append(&path, b"ef").await.expect("append");
 
         assert_eq!(offset0, 0);

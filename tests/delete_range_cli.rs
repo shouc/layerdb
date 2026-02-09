@@ -131,3 +131,85 @@ fn delete_range_cli_tombstones_half_open_span() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+
+#[test]
+fn delete_range_cli_honors_branch_target() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+
+    for (key, value) in [("a", "1"), ("b", "2")] {
+        let put = Command::new(layerdb_bin()?)
+            .args([
+                "put",
+                "--db",
+                dir.path().to_str().expect("utf8 path"),
+                "--key",
+                key,
+                "--value",
+                value,
+                "--sync",
+            ])
+            .output()?;
+        assert!(put.status.success());
+    }
+
+    let create_branch = Command::new(layerdb_bin()?)
+        .args([
+            "create-branch",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--name",
+            "feature",
+        ])
+        .output()?;
+    assert!(create_branch.status.success());
+
+    let del_feature = Command::new(layerdb_bin()?)
+        .args([
+            "delete-range",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--branch",
+            "feature",
+            "--start",
+            "a",
+            "--end",
+            "z",
+            "--sync",
+        ])
+        .output()?;
+    assert!(
+        del_feature.status.success(),
+        "delete-range(feature) failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&del_feature.stdout),
+        String::from_utf8_lossy(&del_feature.stderr)
+    );
+
+    let get_main_a = Command::new(layerdb_bin()?)
+        .args(["get", "--db", dir.path().to_str().expect("utf8 path"), "--key", "a"])
+        .output()?;
+    assert!(get_main_a.status.success());
+    assert!(String::from_utf8_lossy(&get_main_a.stdout).contains("value=1"));
+
+    let get_feature_a = Command::new(layerdb_bin()?)
+        .args([
+            "get",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--key",
+            "a",
+            "--branch",
+            "feature",
+        ])
+        .output()?;
+    assert!(get_feature_a.status.success());
+    assert!(String::from_utf8_lossy(&get_feature_a.stdout).contains("not_found"));
+
+    let get_main_b = Command::new(layerdb_bin()?)
+        .args(["get", "--db", dir.path().to_str().expect("utf8 path"), "--key", "b"])
+        .output()?;
+    assert!(get_main_b.status.success());
+    assert!(String::from_utf8_lossy(&get_main_b.stdout).contains("value=2"));
+
+    Ok(())
+}

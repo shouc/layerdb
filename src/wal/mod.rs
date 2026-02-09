@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+use anyhow::Context;
 use bytes::Bytes;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
@@ -695,7 +696,7 @@ fn encode_wal_record(seqno_base: u64, ops: &[Op]) -> anyhow::Result<Vec<u8>> {
 
 fn recover_from_wal(
     dir: &Path,
-    _options: &DbOptions,
+    options: &DbOptions,
     memtables: &MemTableManager,
     snapshots: &crate::db::snapshot::SnapshotTracker,
 ) -> anyhow::Result<RecoveredWal> {
@@ -726,8 +727,23 @@ fn recover_from_wal(
         memtables.reset_for_wal_recovery(*first_id);
     }
 
+    let io_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create wal recovery io runtime")?;
+    let io = crate::io::UringExecutor::new(options.io_max_in_flight.max(1));
+
     for (idx, (segment_id, path)) in entries.iter().enumerate() {
-        let data = std::fs::read(path)?;
+        let file_len = std::fs::metadata(path)
+            .with_context(|| format!("wal metadata {}", path.display()))?
+            .len() as usize;
+        let data = if file_len == 0 {
+            bytes::Bytes::new()
+        } else {
+            io_rt
+                .block_on(io.read_exact_at(path, 0, file_len))
+                .with_context(|| format!("wal read {}", path.display()))?
+        };
         let mut offset = 0usize;
         while offset + WAL_RECORD_HEADER_BYTES <= data.len() {
             let len = u32::from_le_bytes(data[offset..(offset + 4)].try_into().unwrap()) as usize;

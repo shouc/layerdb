@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use anyhow::Context;
 use bytes::Bytes;
 use parking_lot::RwLock;
 
@@ -429,7 +430,51 @@ impl VersionSet {
             manifest.sync_dir()?;
         }
         self.levels.write().l0.push(add);
+        self.snapshots.set_latest_seqno(props.max_seqno);
         Ok(())
+    }
+
+    pub fn ingest_external_sst(&self, source_path: &Path) -> anyhow::Result<u64> {
+        let source_reader = SstReader::open(source_path)
+            .with_context(|| format!("open source sst {}", source_path.display()))?;
+        let props = source_reader.properties().clone();
+
+        let file_id = self.allocate_file_id();
+        let sst_dir = self.sst_root_dir(0);
+        std::fs::create_dir_all(&sst_dir)
+            .with_context(|| format!("create sst dir {}", sst_dir.display()))?;
+
+        let tmp_path = sst_dir.join(format!("sst_{file_id:016x}.tmp"));
+        let final_path = sst_dir.join(format!("sst_{file_id:016x}.sst"));
+
+        std::fs::copy(source_path, &tmp_path).with_context(|| {
+            format!(
+                "copy sst {} -> {}",
+                source_path.display(),
+                tmp_path.display()
+            )
+        })?;
+
+        let tmp_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tmp_path)
+            .with_context(|| format!("open tmp sst {}", tmp_path.display()))?;
+        tmp_fd
+            .sync_data()
+            .with_context(|| format!("sync tmp sst {}", tmp_path.display()))?;
+        drop(tmp_fd);
+
+        std::fs::rename(&tmp_path, &final_path)
+            .with_context(|| format!("rename {} -> {}", tmp_path.display(), final_path.display()))?;
+        let dir_fd = std::fs::File::open(&sst_dir)
+            .with_context(|| format!("open sst dir {}", sst_dir.display()))?;
+        dir_fd
+            .sync_all()
+            .with_context(|| format!("sync sst dir {}", sst_dir.display()))?;
+
+        self.install_sst(file_id, &props)?;
+        Ok(file_id)
     }
 
     fn apply_compaction_edit(

@@ -252,8 +252,15 @@ impl Db {
         self.inner.versions.compact_l0_to_l1(&self.inner.options)
     }
 
-    pub fn ingest_sst(&self, _sst_path: impl AsRef<Path>) -> anyhow::Result<()> {
-        anyhow::bail!("ingest_sst not implemented in v1")
+    pub fn ingest_sst(&self, sst_path: impl AsRef<Path>) -> anyhow::Result<()> {
+        let path = sst_path.as_ref();
+        self.inner
+            .versions
+            .ingest_external_sst(path)
+            .with_context(|| format!("ingest sst {}", path.display()))?;
+        self.read_snapshot
+            .store(self.inner.versions.latest_seqno(), Ordering::Relaxed);
+        Ok(())
     }
 
     fn default_read_snapshot(&self) -> u64 {

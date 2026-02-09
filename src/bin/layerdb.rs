@@ -67,6 +67,10 @@ enum Command {
         #[arg(long)]
         name: String,
     },
+    Branches {
+        #[arg(long)]
+        db: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -90,6 +94,7 @@ fn main() -> anyhow::Result<()> {
         } => thaw_level(&db, level, max_files),
         Command::GcS3 { db } => gc_s3(&db),
         Command::DropBranch { db, name } => drop_branch(&db, &name),
+        Command::Branches { db } => branches(&db),
     }
 }
 
@@ -344,6 +349,16 @@ fn drop_branch(db: &Path, name: &str) -> anyhow::Result<()> {
     let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
     db.drop_branch(name)?;
     println!("drop_branch name={name}");
+    Ok(())
+}
+
+fn branches(db: &Path) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    let current = db.current_branch();
+    for (name, seqno) in db.list_branches() {
+        let marker = if name == current { "*" } else { " " };
+        println!("{marker} {name} {seqno}");
+    }
     Ok(())
 }
 

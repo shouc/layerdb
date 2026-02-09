@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -36,6 +37,8 @@ enum Command {
         db: PathBuf,
         #[arg(long, default_value_t = 50_000)]
         keys: usize,
+        #[arg(long, value_enum, default_value_t = BenchWorkload::Smoke)]
+        workload: BenchWorkload,
     },
     RebalanceTiers {
         #[arg(long)]
@@ -83,6 +86,18 @@ enum Command {
     },
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum BenchWorkload {
+    Smoke,
+    Fill,
+    ReadRandom,
+    ReadSeq,
+    Overwrite,
+    DeleteHeavy,
+    ScanHeavy,
+    Compact,
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -90,7 +105,7 @@ fn main() -> anyhow::Result<()> {
         Command::SstDump { sst } => sst_dump(&sst),
         Command::DbCheck { db } => db_check(&db),
         Command::Scrub { db } => scrub(&db),
-        Command::Bench { db, keys } => bench(&db, keys),
+        Command::Bench { db, keys, workload } => bench(&db, keys, workload),
         Command::RebalanceTiers { db } => rebalance_tiers(&db),
         Command::FreezeLevel {
             db,
@@ -291,7 +306,7 @@ fn scrub(db: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn bench(db: &Path, keys: usize) -> anyhow::Result<()> {
+fn bench(db: &Path, keys: usize, workload: BenchWorkload) -> anyhow::Result<()> {
     let options = layerdb::DbOptions {
         fsync_writes: false,
         memtable_bytes: 8 * 1024 * 1024,
@@ -300,27 +315,144 @@ fn bench(db: &Path, keys: usize) -> anyhow::Result<()> {
     };
     let db = layerdb::Db::open(db, options)?;
 
-    let start = std::time::Instant::now();
-    for i in 0..keys {
-        let key = format!("k{:08}", i);
-        let val = format!("v{:08}", i);
-        db.put(key, val, layerdb::WriteOptions { sync: false })?;
-    }
-    let write_elapsed = start.elapsed();
+    let key = |i: usize| format!("k{:08}", i);
+    let value = |i: usize| format!("v{:08}", i);
+    let workload_name = match workload {
+        BenchWorkload::Smoke => "smoke",
+        BenchWorkload::Fill => "fill",
+        BenchWorkload::ReadRandom => "readrandom",
+        BenchWorkload::ReadSeq => "readseq",
+        BenchWorkload::Overwrite => "overwrite",
+        BenchWorkload::DeleteHeavy => "delete-heavy",
+        BenchWorkload::ScanHeavy => "scan-heavy",
+        BenchWorkload::Compact => "compact",
+    };
 
-    let start = std::time::Instant::now();
-    for i in 0..keys {
-        let key = format!("k{:08}", i);
-        let _ = db.get(key.as_bytes(), layerdb::ReadOptions::default())?;
-    }
-    let read_elapsed = start.elapsed();
+    let pseudo_random = |i: usize| -> usize {
+        if keys == 0 {
+            return 0;
+        }
+        (((i as u64)
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407))
+            % keys as u64) as usize
+    };
 
-    let write_qps = keys as f64 / write_elapsed.as_secs_f64();
-    let read_qps = keys as f64 / read_elapsed.as_secs_f64();
-    println!("bench keys={keys}");
-    println!("write elapsed={write_elapsed:?} qps={write_qps:.0}");
-    println!("read elapsed={read_elapsed:?} qps={read_qps:.0}");
+    let fill = |db: &layerdb::Db| -> anyhow::Result<()> {
+        for i in 0..keys {
+            db.put(key(i), value(i), layerdb::WriteOptions { sync: false })?;
+        }
+        Ok(())
+    };
 
+    let elapsed = match workload {
+        BenchWorkload::Smoke => {
+            let start = std::time::Instant::now();
+            fill(&db)?;
+            let write_elapsed = start.elapsed();
+
+            let start = std::time::Instant::now();
+            for i in 0..keys {
+                let _ = db.get(key(i).as_bytes(), layerdb::ReadOptions::default())?;
+            }
+            let read_elapsed = start.elapsed();
+
+            let write_qps = keys as f64 / write_elapsed.as_secs_f64();
+            let read_qps = keys as f64 / read_elapsed.as_secs_f64();
+            println!("bench workload={workload_name} keys={keys}");
+            println!("write elapsed={write_elapsed:?} qps={write_qps:.0}");
+            println!("read elapsed={read_elapsed:?} qps={read_qps:.0}");
+            return Ok(());
+        }
+        BenchWorkload::Fill => {
+            let start = std::time::Instant::now();
+            fill(&db)?;
+            start.elapsed()
+        }
+        BenchWorkload::ReadRandom => {
+            fill(&db)?;
+            let start = std::time::Instant::now();
+            for i in 0..keys {
+                let idx = pseudo_random(i);
+                let _ = db.get(key(idx).as_bytes(), layerdb::ReadOptions::default())?;
+            }
+            start.elapsed()
+        }
+        BenchWorkload::ReadSeq => {
+            fill(&db)?;
+            let start = std::time::Instant::now();
+            let mut iter = db.iter(
+                layerdb::Range {
+                    start: Bound::Included(bytes::Bytes::from_static(b"k")),
+                    end: Bound::Unbounded,
+                },
+                layerdb::ReadOptions::default(),
+            )?;
+            iter.seek_to_first();
+            while let Some(next) = iter.next() {
+                let _ = next?;
+            }
+            start.elapsed()
+        }
+        BenchWorkload::Overwrite => {
+            fill(&db)?;
+            let start = std::time::Instant::now();
+            for i in 0..keys {
+                db.put(
+                    key(i),
+                    value(i + keys),
+                    layerdb::WriteOptions { sync: false },
+                )?;
+            }
+            start.elapsed()
+        }
+        BenchWorkload::DeleteHeavy => {
+            fill(&db)?;
+            let start = std::time::Instant::now();
+            for i in 0..keys {
+                let idx = pseudo_random(i);
+                db.delete(key(idx), layerdb::WriteOptions { sync: false })?;
+            }
+            start.elapsed()
+        }
+        BenchWorkload::ScanHeavy => {
+            fill(&db)?;
+            let start = std::time::Instant::now();
+            let scans = 10usize.max((keys / 10).min(100));
+            for scan in 0..scans {
+                let window = (keys / scans).max(1);
+                let begin = scan * window;
+                let end = ((scan + 1) * window).min(keys);
+
+                let mut iter = db.iter(
+                    layerdb::Range {
+                        start: Bound::Included(bytes::Bytes::from(key(begin))),
+                        end: Bound::Excluded(bytes::Bytes::from(key(end))),
+                    },
+                    layerdb::ReadOptions::default(),
+                )?;
+                iter.seek_to_first();
+                while let Some(next) = iter.next() {
+                    let _ = next?;
+                }
+            }
+            start.elapsed()
+        }
+        BenchWorkload::Compact => {
+            fill(&db)?;
+            let start = std::time::Instant::now();
+            db.compact_range(None)?;
+            start.elapsed()
+        }
+    };
+
+    let qps = if elapsed.is_zero() {
+        f64::INFINITY
+    } else {
+        keys as f64 / elapsed.as_secs_f64()
+    };
+    println!("bench workload={workload_name} keys={keys}");
+    println!("elapsed={elapsed:?} qps={qps:.0}");
     Ok(())
 }
 

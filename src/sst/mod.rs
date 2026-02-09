@@ -26,7 +26,7 @@
 //! - crc32c(u32) over block payload (everything before trailer)
 //! - blake3(32 bytes) over block payload
 //!
-//! Index block entries map `last_user_key_in_block -> {offset,len}`.
+//! Index block entries map `last_internal_key_in_block -> {offset,len}`.
 
 use std::cmp::Ordering;
 use std::io::{Seek, Write};
@@ -74,7 +74,7 @@ struct BlockHandle {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IndexEntry {
-    last_user_key: Bytes,
+    last_key: InternalKey,
     handle: BlockHandle,
 }
 
@@ -98,19 +98,20 @@ pub struct SstBuilder {
     path_final: PathBuf,
     buf: Vec<u8>,
     entries_in_block: u32,
-    last_user_key: Option<Bytes>,
+    last_key: Option<InternalKey>,
     index: Vec<IndexEntry>,
     smallest_user_key: Option<Bytes>,
     largest_user_key: Option<Bytes>,
     entries: u64,
     data_bytes: u64,
+    table_hasher: blake3::Hasher,
 }
 
 impl SstBuilder {
     pub fn create(dir: &Path, file_id: u64, block_size: usize) -> Result<Self, SstError> {
         std::fs::create_dir_all(dir)?;
-        let path_tmp = dir.join(format!("sst_{file_id:016}.tmp"));
-        let path_final = dir.join(format!("sst_{file_id:016}.sst"));
+        let path_tmp = dir.join(format!("sst_{file_id:016x}.tmp"));
+        let path_final = dir.join(format!("sst_{file_id:016x}.sst"));
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -124,19 +125,22 @@ impl SstBuilder {
             path_final,
             buf: Vec::with_capacity(block_size + 256),
             entries_in_block: 0,
-            last_user_key: None,
+            last_key: None,
             index: Vec::new(),
             smallest_user_key: None,
             largest_user_key: None,
             entries: 0,
             data_bytes: 0,
+            table_hasher: blake3::Hasher::new(),
         })
     }
 
     pub fn add(&mut self, key: &InternalKey, value: &[u8]) -> Result<(), SstError> {
-        if let Some(last) = &self.last_user_key {
-            if key.user_key.as_ref() < last.as_ref() {
-                return Err(SstError::Corrupt("keys must be added in sorted order"));
+        if let Some(last) = &self.last_key {
+            if key < last {
+                return Err(SstError::Corrupt(
+                    "internal keys must be added in sorted order",
+                ));
             }
         }
 
@@ -144,7 +148,7 @@ impl SstBuilder {
             self.smallest_user_key = Some(key.user_key.clone());
         }
         self.largest_user_key = Some(key.user_key.clone());
-        self.last_user_key = Some(key.user_key.clone());
+        self.last_key = Some(key.clone());
         self.entries += 1;
 
         if self.entries_in_block == 0 {
@@ -173,27 +177,31 @@ impl SstBuilder {
         }
 
         let index_offset = self.file.stream_position()?;
-        let index_bytes = bincode::serialize(&self.index).map_err(|_| SstError::Corrupt("index serialize"))?;
+        let index_bytes =
+            bincode::serialize(&self.index).map_err(|_| SstError::Corrupt("index serialize"))?;
         self.file.write_all(&index_bytes)?;
-        let index_len: u32 = index_bytes.len().try_into().map_err(|_| SstError::Corrupt("index too large"))?;
+        let index_len: u32 = index_bytes
+            .len()
+            .try_into()
+            .map_err(|_| SstError::Corrupt("index too large"))?;
 
         let props_offset = self.file.stream_position()?;
-        let mut table_root_hasher = blake3::Hasher::new();
-        table_root_hasher.update(&index_bytes);
-        let table_root = TableRoot(*table_root_hasher.finalize().as_bytes());
+        self.table_hasher.update(&index_bytes);
+        let table_root = TableRoot(*self.table_hasher.finalize().as_bytes());
         let props = SstProperties {
-            smallest_user_key: self
-                .smallest_user_key
-                .clone()
-                .unwrap_or_else(Bytes::new),
+            smallest_user_key: self.smallest_user_key.clone().unwrap_or_else(Bytes::new),
             largest_user_key: self.largest_user_key.clone().unwrap_or_else(Bytes::new),
             entries: self.entries,
             data_bytes: self.data_bytes,
             index_bytes: index_bytes.len() as u64,
             table_root,
         };
-        let props_bytes = bincode::serialize(&props).map_err(|_| SstError::Corrupt("props serialize"))?;
-        let props_len: u32 = props_bytes.len().try_into().map_err(|_| SstError::Corrupt("props too large"))?;
+        let props_bytes =
+            bincode::serialize(&props).map_err(|_| SstError::Corrupt("props serialize"))?;
+        let props_len: u32 = props_bytes
+            .len()
+            .try_into()
+            .map_err(|_| SstError::Corrupt("props too large"))?;
         self.file.write_all(&props_bytes)?;
 
         let footer = Footer {
@@ -217,6 +225,7 @@ impl SstBuilder {
         let payload_len = self.buf.len();
         let crc = crc32c::crc32c(&self.buf);
         let hash = blake3::hash(&self.buf);
+        self.table_hasher.update(hash.as_bytes());
         self.buf.extend_from_slice(&crc.to_le_bytes());
         self.buf.extend_from_slice(hash.as_bytes());
 
@@ -229,11 +238,11 @@ impl SstBuilder {
             .map_err(|_| SstError::Corrupt("block too large"))?;
 
         let last_key = self
-            .last_user_key
+            .last_key
             .clone()
             .ok_or(SstError::Corrupt("missing last key"))?;
         self.index.push(IndexEntry {
-            last_user_key: last_key,
+            last_key,
             handle: BlockHandle { offset, len },
         });
 
@@ -274,41 +283,53 @@ impl SstReader {
             return Err(SstError::Corrupt("bad footer offsets"));
         }
 
-        let index: Vec<IndexEntry> =
-            bincode::deserialize(&mmap[index_start..index_end]).map_err(|_| SstError::Corrupt("index decode"))?;
-        let props: SstProperties =
-            bincode::deserialize(&mmap[props_start..props_end]).map_err(|_| SstError::Corrupt("props decode"))?;
+        let index: Vec<IndexEntry> = bincode::deserialize(&mmap[index_start..index_end])
+            .map_err(|_| SstError::Corrupt("index decode"))?;
+        let props: SstProperties = bincode::deserialize(&mmap[props_start..props_end])
+            .map_err(|_| SstError::Corrupt("props decode"))?;
         if props.table_root != footer.table_root {
             return Err(SstError::Corrupt("table root mismatch"));
         }
 
-        Ok(Self { path, mmap, index, props })
+        Ok(Self {
+            path,
+            mmap,
+            index,
+            props,
+        })
     }
 
     pub fn properties(&self) -> &SstProperties {
         &self.props
     }
 
-    pub fn get(&self, user_key: &[u8], snapshot_seqno: u64) -> Result<Option<Option<Bytes>>, SstError> {
-        let block = match self.find_block(user_key) {
+    pub fn get(
+        &self,
+        user_key: &[u8],
+        snapshot_seqno: u64,
+    ) -> Result<Option<Option<Bytes>>, SstError> {
+        let target = InternalKey::new(
+            Bytes::copy_from_slice(user_key),
+            snapshot_seqno,
+            KeyKind::Meta,
+        );
+        let block = match self.find_block(&target) {
             None => return Ok(None),
             Some(h) => h,
         };
         let entries = self.read_block(block)?;
-        let mut best: Option<(InternalKey, Bytes)> = None;
-        for (k, v) in entries {
-            if k.user_key.as_ref() != user_key {
-                continue;
-            }
-            if k.seqno > snapshot_seqno {
-                continue;
-            }
-            // Blocks are sorted, internal key ordering ensures first visible is the answer.
-            best = Some((k, v));
-            break;
-        }
 
-        Ok(best.map(|(k, v)| match k.kind {
+        let pos = match entries.binary_search_by(|(k, _)| k.cmp(&target)) {
+            Ok(i) | Err(i) => i,
+        };
+        let (k, v) = match entries.get(pos) {
+            None => return Ok(None),
+            Some(entry) => entry.clone(),
+        };
+        if k.user_key.as_ref() != user_key {
+            return Ok(None);
+        }
+        Ok(Some(match k.kind {
             KeyKind::Put => Some(v),
             KeyKind::Del => None,
             _ => None,
@@ -320,19 +341,27 @@ impl SstReader {
             reader: self,
             snapshot_seqno,
             index_pos: 0,
+            seek_target: None,
             entries: Vec::new(),
             entry_pos: 0,
         })
     }
 
-    fn find_block(&self, user_key: &[u8]) -> Option<BlockHandle> {
+    fn find_block(&self, target: &InternalKey) -> Option<BlockHandle> {
         if self.index.is_empty() {
             return None;
         }
-        let pos = match self.index.binary_search_by(|entry| entry.last_user_key.as_ref().cmp(user_key)) {
-            Ok(i) | Err(i) => i,
-        };
-        self.index.get(pos).map(|e| e.handle)
+        let mut lo = 0usize;
+        let mut hi = self.index.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if &self.index[mid].last_key < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        self.index.get(lo).map(|e| e.handle)
     }
 
     fn read_block(&self, handle: BlockHandle) -> Result<Vec<(InternalKey, Bytes)>, SstError> {
@@ -347,7 +376,11 @@ impl SstReader {
 
         let payload_end = end - BLOCK_TRAILER_SIZE;
         let payload = &self.mmap[start..payload_end];
-        let crc_expected = u32::from_le_bytes(self.mmap[payload_end..(payload_end + 4)].try_into().unwrap());
+        let crc_expected = u32::from_le_bytes(
+            self.mmap[payload_end..(payload_end + 4)]
+                .try_into()
+                .unwrap(),
+        );
         let hash_expected: [u8; 32] = self.mmap[(payload_end + 4)..end].try_into().unwrap();
 
         let crc_actual = crc32c::crc32c(payload);
@@ -371,7 +404,8 @@ impl SstReader {
             if offset + 4 > payload.len() {
                 return Err(SstError::Corrupt("truncated value"));
             }
-            let val_len = u32::from_le_bytes(payload[offset..(offset + 4)].try_into().unwrap()) as usize;
+            let val_len =
+                u32::from_le_bytes(payload[offset..(offset + 4)].try_into().unwrap()) as usize;
             offset += 4;
             if offset + val_len > payload.len() {
                 return Err(SstError::Corrupt("truncated value bytes"));
@@ -388,6 +422,7 @@ pub struct SstIter<'a> {
     reader: &'a SstReader,
     snapshot_seqno: u64,
     index_pos: usize,
+    seek_target: Option<InternalKey>,
     entries: Vec<(InternalKey, Bytes)>,
     entry_pos: usize,
 }
@@ -395,18 +430,27 @@ pub struct SstIter<'a> {
 impl<'a> SstIter<'a> {
     pub fn seek_to_first(&mut self) {
         self.index_pos = 0;
+        self.seek_target = None;
         self.entries.clear();
         self.entry_pos = 0;
     }
 
     pub fn seek(&mut self, user_key: &[u8]) {
-        self.index_pos = match self
-            .reader
-            .index
-            .binary_search_by(|entry| entry.last_user_key.as_ref().cmp(user_key))
-        {
-            Ok(i) | Err(i) => i,
+        let target = InternalKey::new(Bytes::copy_from_slice(user_key), u64::MAX, KeyKind::Meta);
+        self.index_pos = {
+            let mut lo = 0usize;
+            let mut hi = self.reader.index.len();
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.reader.index[mid].last_key < target {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
         };
+        self.seek_target = Some(target);
         self.entries.clear();
         self.entry_pos = 0;
     }
@@ -423,6 +467,12 @@ impl<'a> SstIter<'a> {
                     Ok(entries) => {
                         self.entries = entries;
                         self.entry_pos = 0;
+                        if let Some(target) = self.seek_target.take() {
+                            self.entry_pos =
+                                match self.entries.binary_search_by(|(k, _)| k.cmp(&target)) {
+                                    Ok(i) | Err(i) => i,
+                                };
+                        }
                     }
                     Err(e) => return Some(Err(e)),
                 }

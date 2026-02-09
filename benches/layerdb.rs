@@ -55,16 +55,16 @@ fn bench_readrandom(c: &mut Criterion) {
     c.bench_function("readrandom/100k", |b| {
         b.iter_batched(
             || {
-                let (_dir, db) = open_temp_db();
+                let (dir, db) = open_temp_db();
                 preload(&db, 100_000);
 
                 let mut keys: Vec<u32> = (0..100_000).collect();
                 let mut rng = StdRng::seed_from_u64(0x5eed);
                 keys.shuffle(&mut rng);
 
-                (db, keys)
+                (dir, db, keys)
             },
-            |(db, keys)| {
+            |(_dir, db, keys)| {
                 for k in keys {
                     let _ = db.get(key(k), ReadOptions::default()).expect("get");
                 }
@@ -78,11 +78,11 @@ fn bench_readseq(c: &mut Criterion) {
     c.bench_function("readseq/100k", |b| {
         b.iter_batched(
             || {
-                let (_dir, db) = open_temp_db();
+                let (dir, db) = open_temp_db();
                 preload(&db, 100_000);
-                db
+                (dir, db)
             },
-            |db| {
+            |(_dir, db)| {
                 let mut iter = db
                     .iter(
                         Range {
@@ -106,11 +106,11 @@ fn bench_overwrite(c: &mut Criterion) {
     c.bench_function("overwrite/100k", |b| {
         b.iter_batched(
             || {
-                let (_dir, db) = open_temp_db();
+                let (dir, db) = open_temp_db();
                 preload(&db, 100_000);
-                db
+                (dir, db)
             },
-            |db| {
+            |(_dir, db)| {
                 for i in 0..100_000 {
                     db.put(key(i), value(i + 1_000_000), WriteOptions { sync: false })
                         .expect("put");
@@ -125,11 +125,11 @@ fn bench_delete_heavy(c: &mut Criterion) {
     c.bench_function("delete-heavy/100k", |b| {
         b.iter_batched(
             || {
-                let (_dir, db) = open_temp_db();
+                let (dir, db) = open_temp_db();
                 preload(&db, 100_000);
-                db
+                (dir, db)
             },
-            |db| {
+            |(_dir, db)| {
                 let mut rng = StdRng::seed_from_u64(0xdead_beef);
                 for _ in 0..100_000 {
                     let i: u32 = rng.gen_range(0..100_000);
@@ -146,11 +146,11 @@ fn bench_scan_heavy(c: &mut Criterion) {
     c.bench_function("scan-heavy/10x", |b| {
         b.iter_batched(
             || {
-                let (_dir, db) = open_temp_db();
+                let (dir, db) = open_temp_db();
                 preload(&db, 200_000);
-                db
+                (dir, db)
             },
-            |db| {
+            |(_dir, db)| {
                 for scan in 0..10u32 {
                     let start = key(scan * 10_000);
                     let end = key((scan + 1) * 10_000);
@@ -178,11 +178,11 @@ fn bench_compact(c: &mut Criterion) {
     c.bench_function("compact/200k", |b| {
         b.iter_batched(
             || {
-                let (_dir, db) = open_temp_db();
+                let (dir, db) = open_temp_db();
                 preload(&db, 200_000);
-                db
+                (dir, db)
             },
-            |db| {
+            |(_dir, db)| {
                 db.compact_range(None).expect("compact");
             },
             BatchSize::LargeInput,

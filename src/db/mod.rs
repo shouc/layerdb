@@ -309,6 +309,18 @@ impl Db {
             .compact_l0_to_l1(range.as_ref(), &self.inner.options)
     }
 
+    pub fn compact_if_needed(&self) -> anyhow::Result<bool> {
+        self.inner.wal.force_rotate_for_flush()?;
+        let metrics = self.inner.versions.metrics();
+        if metrics.should_compact && metrics.compaction_candidate_level == Some(0) {
+            self.inner
+                .versions
+                .compact_l0_to_l1(None, &self.inner.options)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub fn ingest_sst(&self, sst_path: impl AsRef<Path>) -> anyhow::Result<()> {
         let path = sst_path.as_ref();
         let (_file_id, max_seqno) = self

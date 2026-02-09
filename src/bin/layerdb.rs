@@ -52,6 +52,10 @@ enum Command {
         #[arg(long)]
         end: Option<String>,
     },
+    CompactAuto {
+        #[arg(long)]
+        db: PathBuf,
+    },
     IngestSst {
         #[arg(long)]
         db: PathBuf,
@@ -212,6 +216,7 @@ fn main() -> anyhow::Result<()> {
         Command::CompactRange { db, start, end } => {
             compact_range_cmd(&db, start.as_deref(), end.as_deref())
         }
+        Command::CompactAuto { db } => compact_auto_cmd(&db),
         Command::IngestSst { db, sst } => ingest_sst_cmd(&db, &sst),
         Command::RebalanceTiers { db } => rebalance_tiers(&db),
         Command::FreezeLevel {
@@ -640,6 +645,13 @@ fn compact_range_cmd(db: &Path, start: Option<&str>, end: Option<&str>) -> anyho
         start.unwrap_or("-"),
         end.unwrap_or("-")
     );
+    Ok(())
+}
+
+fn compact_auto_cmd(db: &Path) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    let compacted = db.compact_if_needed()?;
+    println!("compact_auto compacted={compacted}");
     Ok(())
 }
 

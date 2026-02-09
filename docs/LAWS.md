@@ -123,6 +123,8 @@ Kinds:
   `compact`.
 - `layerdb compact-range --db <path> [--start k] [--end k]` triggers manual
   compaction globally or over a bounded key range.
+- `layerdb compact-auto --db <path>` evaluates compaction score/debt and runs
+  an automatic L0->L1 compaction when thresholds indicate compaction is needed.
 - `layerdb ingest-sst --db <path> --sst <file>` installs an external SST using
   manifest-safe durability ordering.
 - `layerdb rebalance-tiers --db <path>`, `freeze-level`, `thaw-level`,

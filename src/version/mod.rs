@@ -14,7 +14,7 @@ use crate::range_tombstone::RangeTombstone;
 use crate::sst::{SstProperties, SstReader};
 use crate::version::manifest::{AddFile, DeleteFile, Manifest, ManifestRecord, VersionEdit};
 
-/// Placeholder for version set + manifest.
+/// Version set + manifest.
 #[derive(Debug)]
 pub struct VersionSet {
     dir: PathBuf,
@@ -23,6 +23,7 @@ pub struct VersionSet {
     next_file_id: AtomicU64,
     levels: parking_lot::RwLock<Levels>,
     manifest: parking_lot::Mutex<Manifest>,
+    reader_cache: crate::cache::ClockProCache<PathBuf, SstReader>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -64,7 +65,18 @@ impl VersionSet {
             next_file_id: AtomicU64::new(max_file_id.saturating_add(1).max(1)),
             levels: parking_lot::RwLock::new(Levels { l0, l1 }),
             manifest: parking_lot::Mutex::new(manifest),
+            reader_cache: crate::cache::ClockProCache::new(options.sst_reader_cache_entries),
         })
+    }
+
+    fn cached_reader(&self, path: &Path) -> anyhow::Result<Arc<SstReader>> {
+        let key = path.to_path_buf();
+        if let Some(reader) = self.reader_cache.get(&key) {
+            return Ok(reader);
+        }
+        let reader = Arc::new(SstReader::open(path)?);
+        self.reader_cache.insert(key, reader.clone());
+        Ok(reader)
     }
 
     fn sst_root_dir(&self, level: u8) -> PathBuf {
@@ -138,7 +150,7 @@ impl VersionSet {
                 continue;
             }
             let path = self.resolve_sst_path(add.level, add.file_id)?;
-            let reader = SstReader::open(&path)?;
+            let reader = self.cached_reader(&path)?;
             if let Some((seqno, v)) = reader.get(key, snapshot_seqno)? {
                 match &candidate {
                     Some((best_seq, _)) if *best_seq >= seqno => {}
@@ -150,7 +162,7 @@ impl VersionSet {
         // L1: non-overlapping; binary search by key range.
         if let Some(add) = find_l1_file(&levels.l1, key) {
             let path = self.resolve_sst_path(add.level, add.file_id)?;
-            let reader = SstReader::open(&path)?;
+            let reader = self.cached_reader(&path)?;
             if let Some((seqno, v)) = reader.get(key, snapshot_seqno)? {
                 match &candidate {
                     Some((best_seq, _)) if *best_seq >= seqno => {}
@@ -197,7 +209,7 @@ impl VersionSet {
 
         for file in guard.l0.iter().chain(guard.l1.iter()) {
             let path = self.resolve_sst_path(file.level, file.file_id)?;
-            let reader = SstReader::open(&path)?;
+            let reader = self.cached_reader(&path)?;
             out.extend(reader.range_tombstones(snapshot_seqno)?);
         }
 
@@ -254,7 +266,7 @@ impl VersionSet {
         let mut entries = Vec::new();
         for file in &compact_inputs {
             let path = self.resolve_sst_path(file.level, file.file_id)?;
-            let reader = SstReader::open(&path)?;
+            let reader = self.cached_reader(&path)?;
             let mut iter = reader.iter(u64::MAX)?;
             iter.seek_to_first();
             while let Some(next) = iter.next() {

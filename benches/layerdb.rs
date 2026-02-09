@@ -14,6 +14,7 @@ fn options() -> DbOptions {
         wal_segment_bytes: 64 * 1024 * 1024,
         memtable_bytes: 64 * 1024 * 1024,
         fsync_writes: false,
+        ..Default::default()
     }
 }
 

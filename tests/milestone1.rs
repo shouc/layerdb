@@ -9,6 +9,7 @@ fn small_options() -> DbOptions {
         wal_segment_bytes: 32 * 1024,
         memtable_bytes: 4 * 1024,
         fsync_writes: true,
+        ..Default::default()
     }
 }
 

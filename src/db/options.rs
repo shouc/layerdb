@@ -4,6 +4,22 @@ pub struct DbOptions {
     pub wal_segment_bytes: u64,
     pub memtable_bytes: u64,
     pub fsync_writes: bool,
+
+    /// Enable a secondary HDD tier rooted at `<db>/sst_hdd`.
+    pub enable_hdd_tier: bool,
+
+    /// Highest (hottest) level that should stay on NVMe.
+    ///
+    /// v1 only has levels 0 and 1.
+    pub hot_levels_max: u8,
+
+    /// Maximum number of SST readers to keep open.
+    pub sst_reader_cache_entries: usize,
+
+    /// Maximum number of data blocks to cache.
+    ///
+    /// Currently unused; reserved for milestone 5.
+    pub block_cache_entries: usize,
 }
 
 impl Default for DbOptions {
@@ -13,6 +29,11 @@ impl Default for DbOptions {
             wal_segment_bytes: 64 * 1024 * 1024,
             memtable_bytes: 64 * 1024 * 1024,
             fsync_writes: true,
+
+            enable_hdd_tier: false,
+            hot_levels_max: 2,
+            sst_reader_cache_entries: 128,
+            block_cache_entries: 0,
         }
     }
 }

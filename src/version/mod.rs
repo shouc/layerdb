@@ -269,14 +269,23 @@ impl VersionSet {
             .join("sst_s3")
             .join(format!("sst_{file_id:016x}.sst"));
 
-        for candidate in [&primary, &secondary, &s3] {
+        for candidate in [&primary, &secondary] {
             if candidate.exists() {
                 return Ok(candidate.clone());
             }
         }
 
+        let cache = self.sst_cache_path(file_id);
+        if cache.exists() {
+            return Ok(cache);
+        }
+
+        if s3.exists() {
+            return self.hydrate_s3_to_cache(file_id, &s3);
+        }
+
         anyhow::bail!(
-            "manifest references missing sst file_id={file_id} level={level}: primary={primary:?} secondary={secondary:?} s3={s3:?}"
+            "manifest references missing sst file_id={file_id} level={level}: primary={primary:?} secondary={secondary:?} s3={s3:?} cache={cache:?}"
         )
     }
 
@@ -292,6 +301,42 @@ impl VersionSet {
             StorageTier::S3 => self.dir.join("sst_s3"),
         };
         dir.join(format!("sst_{file_id:016x}.sst"))
+    }
+
+    fn sst_cache_path(&self, file_id: u64) -> PathBuf {
+        self.dir
+            .join("sst_cache")
+            .join(format!("sst_{file_id:016x}.sst"))
+    }
+
+    fn hydrate_s3_to_cache(&self, file_id: u64, s3_path: &Path) -> anyhow::Result<PathBuf> {
+        let cache = self.sst_cache_path(file_id);
+        if cache.exists() {
+            return Ok(cache);
+        }
+
+        if let Some(parent) = cache.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let tmp = cache.with_extension("tmp");
+        std::fs::copy(s3_path, &tmp)?;
+        {
+            let fd = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&tmp)?;
+            fd.sync_data()?;
+        }
+        std::fs::rename(&tmp, &cache)?;
+
+        let parent = cache
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("cache file has no parent"))?;
+        let dir_fd = std::fs::File::open(parent)?;
+        dir_fd.sync_all()?;
+
+        Ok(cache)
     }
 
     pub fn snapshots(&self) -> &SnapshotTracker {
@@ -429,6 +474,79 @@ impl VersionSet {
         Ok(moved)
     }
 
+    pub fn thaw_level_from_s3(&self, level: u8, max_files: Option<usize>) -> anyhow::Result<usize> {
+        let files = {
+            let guard = self.levels.read();
+            match level {
+                0 => guard.l0.clone(),
+                1 => guard.l1.clone(),
+                _ => anyhow::bail!("unsupported level for thaw: {level}"),
+            }
+        };
+
+        let target_tier = self.tier_for_level(level);
+        if target_tier == StorageTier::S3 {
+            anyhow::bail!("cannot thaw level {level} into s3 tier");
+        }
+
+        let limit = max_files.unwrap_or(usize::MAX);
+        let mut moved = 0usize;
+        for add in files {
+            if moved >= limit {
+                break;
+            }
+            if add.tier != StorageTier::S3 {
+                continue;
+            }
+            self.move_file_between_tiers(add.file_id, add.level, StorageTier::S3, target_tier)?;
+            moved += 1;
+        }
+
+        Ok(moved)
+    }
+
+    pub fn gc_orphaned_s3_files(&self) -> anyhow::Result<usize> {
+        let referenced: std::collections::HashSet<u64> = {
+            let guard = self.levels.read();
+            guard
+                .l0
+                .iter()
+                .chain(guard.l1.iter())
+                .filter(|file| file.tier == StorageTier::S3)
+                .map(|file| file.file_id)
+                .collect()
+        };
+
+        let s3_dir = self.dir.join("sst_s3");
+        if !s3_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&s3_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("sst") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(file_id) = parse_sst_file_id(name) else {
+                continue;
+            };
+
+            if referenced.contains(&file_id) {
+                continue;
+            }
+
+            std::fs::remove_file(&path)?;
+            let _ = std::fs::remove_file(self.sst_cache_path(file_id));
+            removed += 1;
+        }
+
+        Ok(removed)
+    }
+
     fn freeze_file_to_s3(&self, add: &AddFile) -> anyhow::Result<()> {
         let src = self.resolve_sst_path(add.level, add.file_id)?;
         let dst = self.sst_path_for_tier(StorageTier::S3, add.file_id);
@@ -466,6 +584,8 @@ impl VersionSet {
         if src != dst {
             let _ = std::fs::remove_file(src);
         }
+
+        let _ = std::fs::remove_file(self.sst_cache_path(add.file_id));
 
         Ok(())
     }
@@ -610,6 +730,7 @@ impl VersionSet {
         }
 
         let _ = std::fs::remove_file(src);
+        let _ = std::fs::remove_file(self.sst_cache_path(file_id));
         Ok(())
     }
 
@@ -920,9 +1041,14 @@ impl VersionSet {
                 .dir
                 .join("sst_s3")
                 .join(format!("sst_{:016x}.sst", input.file_id));
+            let path_cache = self
+                .dir
+                .join("sst_cache")
+                .join(format!("sst_{:016x}.sst", input.file_id));
             let _ = std::fs::remove_file(path_nvme);
             let _ = std::fs::remove_file(path_hdd);
             let _ = std::fs::remove_file(path_s3);
+            let _ = std::fs::remove_file(path_cache);
         }
         Ok(())
     }
@@ -967,6 +1093,14 @@ fn find_l1_file<'a>(l1: &'a [AddFile], key: &[u8]) -> Option<&'a AddFile> {
 
 fn overlaps(a_smallest: &[u8], a_largest: &[u8], b_smallest: &[u8], b_largest: &[u8]) -> bool {
     !(a_largest < b_smallest || b_largest < a_smallest)
+}
+
+fn parse_sst_file_id(name: &str) -> Option<u64> {
+    if !name.starts_with("sst_") || !name.ends_with(".sst") {
+        return None;
+    }
+    let hex = &name[4..name.len() - 4];
+    u64::from_str_radix(hex, 16).ok()
 }
 
 fn drop_obsolete_range_tombstones_bottommost(

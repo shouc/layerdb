@@ -49,6 +49,18 @@ enum Command {
         #[arg(long)]
         max_files: Option<usize>,
     },
+    ThawLevel {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        level: u8,
+        #[arg(long)]
+        max_files: Option<usize>,
+    },
+    GcS3 {
+        #[arg(long)]
+        db: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -65,6 +77,12 @@ fn main() -> anyhow::Result<()> {
             level,
             max_files,
         } => freeze_level(&db, level, max_files),
+        Command::ThawLevel {
+            db,
+            level,
+            max_files,
+        } => thaw_level(&db, level, max_files),
+        Command::GcS3 { db } => gc_s3(&db),
     }
 }
 
@@ -298,6 +316,20 @@ fn freeze_level(db: &Path, level: u8, max_files: Option<usize>) -> anyhow::Resul
     let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
     let moved = db.freeze_level_to_s3(level, max_files)?;
     println!("freeze_level level={level} moved={moved}");
+    Ok(())
+}
+
+fn thaw_level(db: &Path, level: u8, max_files: Option<usize>) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    let moved = db.thaw_level_from_s3(level, max_files)?;
+    println!("thaw_level level={level} moved={moved}");
+    Ok(())
+}
+
+fn gc_s3(db: &Path) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    let removed = db.gc_orphaned_s3_files()?;
+    println!("gc_s3 removed={removed}");
     Ok(())
 }
 

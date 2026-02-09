@@ -15,12 +15,18 @@ Implementation details may evolve, but these invariants must remain true.
 - `create_branch(name, from_snapshot)` (optional)
 - `checkout(branch)` (optional)
 - `compact_range(optional range)` (manual trigger)
-- `ingest_sst(sst_path)` (optional; not implemented in v1)
+- `ingest_sst(sst_path)` (optional)
 
 ### v2 extension in-progress
 
 - `delete_range(start, end, WriteOptions)` stores range tombstones and applies
   them in point lookups + iterators + compaction merges.
+
+### v1+ behavior notes
+
+- `compact_range(Some(range))` compacts only overlapping L0 inputs.
+- `ingest_sst` installs an external SST with manifest durability ordering and
+  raises WAL sequence floor above ingested `max_seqno`.
 
 ## Semantics
 

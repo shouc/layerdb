@@ -77,6 +77,10 @@ enum Command {
         #[arg(long)]
         db: PathBuf,
     },
+    FrozenObjects {
+        #[arg(long)]
+        db: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -102,6 +106,7 @@ fn main() -> anyhow::Result<()> {
         Command::DropBranch { db, name } => drop_branch(&db, &name),
         Command::CreateBranch { db, name } => create_branch(&db, &name),
         Command::Branches { db } => branches(&db),
+        Command::FrozenObjects { db } => frozen_objects(&db),
     }
 }
 
@@ -372,6 +377,21 @@ fn branches(db: &Path) -> anyhow::Result<()> {
     for (name, seqno) in db.list_branches() {
         let marker = if name == current { "*" } else { " " };
         println!("{marker} {name} {seqno}");
+    }
+    Ok(())
+}
+
+fn frozen_objects(db: &Path) -> anyhow::Result<()> {
+    let db = layerdb::Db::open(db, layerdb::DbOptions::default())?;
+    for frozen in db.frozen_objects() {
+        println!(
+            "file_id={} level={} object_id={} object_version={} superblock_bytes={}",
+            frozen.file_id,
+            frozen.level,
+            frozen.object_id,
+            frozen.object_version.as_deref().unwrap_or("-"),
+            frozen.superblock_bytes,
+        );
     }
     Ok(())
 }

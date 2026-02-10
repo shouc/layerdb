@@ -5,7 +5,7 @@
 //! file APIs and bounded by a semaphore to model queue depth.
 
 use std::collections::HashMap;
-use std::io::{IoSlice, Read, Seek, Write};
+use std::io::{IoSlice, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -15,6 +15,9 @@ use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+#[cfg(not(unix))]
+use std::io::{Read, Seek};
 
 #[cfg(all(feature = "native-uring", target_os = "linux"))]
 mod native_uring;
@@ -28,7 +31,7 @@ pub enum IoBackend {
 
 impl Default for IoBackend {
     fn default() -> Self {
-        Self::Tokio
+        Self::Uring
     }
 }
 
@@ -50,7 +53,8 @@ impl Default for UringExecutor {
 
 impl UringExecutor {
     pub fn new(max_in_flight: usize) -> Self {
-        Self::with_backend(max_in_flight, IoBackend::Tokio)
+        // Prefer io_uring when available; fall back safely otherwise.
+        Self::with_backend(max_in_flight, IoBackend::Uring)
     }
 
     pub fn with_backend(max_in_flight: usize, backend: IoBackend) -> Self {
@@ -377,25 +381,54 @@ impl UringExecutor {
         offset: u64,
         data: &[u8],
     ) -> anyhow::Result<()> {
-        #[cfg(all(feature = "native-uring", target_os = "linux"))]
-        if self.backend == IoBackend::Uring {
-            if let Some(native) = &self.native {
-                return native.write_all_at(path.as_ref(), offset, data);
-            }
-        }
-
         let path = path.as_ref();
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .open(path)
             .with_context(|| format!("open for write: {}", path.display()))?;
-        file.seek(std::io::SeekFrom::Start(offset))
-            .with_context(|| format!("seek: {}", path.display()))?;
-        file.write_all(data)
-            .with_context(|| format!("write: {}", path.display()))?;
-        Ok(())
+        self.write_all_at_file_blocking(&file, offset, data)
+            .with_context(|| format!("write_all_at: {}", path.display()))
+    }
+
+    pub fn write_all_at_file_blocking(
+        &self,
+        file: &std::fs::File,
+        offset: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.write_all_at_file(file, offset, data);
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+
+            let mut written = 0usize;
+            while written < data.len() {
+                let n = file.write_at(&data[written..], offset + written as u64)?;
+                if n == 0 {
+                    anyhow::bail!("write_all_at wrote zero bytes");
+                }
+                written += n;
+            }
+            Ok(())
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut cloned = file.try_clone().context("try_clone file")?;
+            cloned
+                .seek(std::io::SeekFrom::Start(offset))
+                .context("seek")?;
+            cloned.write_all(data).context("write")?;
+            Ok(())
+        }
     }
 
     pub fn read_into_at_blocking(
@@ -404,41 +437,78 @@ impl UringExecutor {
         offset: u64,
         buf: &mut [u8],
     ) -> anyhow::Result<()> {
-        #[cfg(all(feature = "native-uring", target_os = "linux"))]
-        if self.backend == IoBackend::Uring {
-            if let Some(native) = &self.native {
-                return native.read_into_at(path.as_ref(), offset, buf);
-            }
-        }
-
         let path = path.as_ref();
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .open(path)
             .with_context(|| format!("open for read_into_at: {}", path.display()))?;
-        file.seek(std::io::SeekFrom::Start(offset))
-            .with_context(|| format!("seek: {}", path.display()))?;
-        file.read_exact(buf)
-            .with_context(|| format!("read_exact: {}", path.display()))?;
-        Ok(())
+        self.read_into_at_file_blocking(&file, offset, buf)
+            .with_context(|| format!("read_into_at: {}", path.display()))
     }
 
-    pub fn sync_file_blocking(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+    pub fn read_into_at_file_blocking(
+        &self,
+        file: &std::fs::File,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> anyhow::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
         #[cfg(all(feature = "native-uring", target_os = "linux"))]
         if self.backend == IoBackend::Uring {
             if let Some(native) = &self.native {
-                return native.sync_file(path.as_ref());
+                return native.read_into_at_file(file, offset, buf);
             }
         }
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+
+            let mut read = 0usize;
+            while read < buf.len() {
+                let n = file.read_at(&mut buf[read..], offset + read as u64)?;
+                if n == 0 {
+                    anyhow::bail!("read_into_at hit EOF");
+                }
+                read += n;
+            }
+            Ok(())
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut cloned = file.try_clone().context("try_clone file")?;
+            cloned
+                .seek(std::io::SeekFrom::Start(offset))
+                .context("seek")?;
+            cloned.read_exact(buf).context("read_exact")?;
+            Ok(())
+        }
+    }
+
+    pub fn sync_file_blocking(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         let path = path.as_ref();
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .with_context(|| format!("open for sync: {}", path.display()))?;
-        file.sync_data()
-            .with_context(|| format!("sync_data: {}", path.display()))
+        self.sync_file_file_blocking(&file)
+            .with_context(|| format!("sync_file: {}", path.display()))
+    }
+
+    pub fn sync_file_file_blocking(&self, file: &std::fs::File) -> anyhow::Result<()> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.sync_file_file(file);
+            }
+        }
+
+        file.sync_data().context("sync_data")
     }
 
     pub fn sync_parent_dir_blocking(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {

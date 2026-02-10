@@ -41,6 +41,9 @@ pub struct DbOptions {
     /// - `Tokio` uses async tokio file APIs.
     /// - `Blocking` uses std file APIs.
     /// - `Uring` attempts to use the `io-uring` crate (Linux only).
+    ///
+    /// Default prefers `Uring`; runtime will gracefully fall back when native
+    /// io_uring is unavailable.
     pub io_backend: crate::io::IoBackend,
 
     /// Use io-executor + buffer pool for SST reads instead of mmap.
@@ -65,7 +68,7 @@ impl Default for DbOptions {
             sst_reader_cache_entries: 128,
             block_cache_entries: 0,
             io_max_in_flight: 256,
-            io_backend: crate::io::IoBackend::Tokio,
+            io_backend: crate::io::IoBackend::Uring,
             sst_use_io_executor_reads: false,
             sst_use_io_executor_writes: false,
         }

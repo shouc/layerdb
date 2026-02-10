@@ -49,12 +49,12 @@ struct WalState {
     options: DbOptions,
     memtables: Arc<MemTableManager>,
     versions: Arc<VersionSet>,
-    io: crate::io::UringExecutor,
     next_seqno: Arc<AtomicU64>,
     last_ack_seqno: Arc<AtomicU64>,
     last_durable_seqno: Arc<AtomicU64>,
     segment_id: u64,
     segment_path: PathBuf,
+    segment_file: std::fs::File,
     segment_bytes: u64,
     flush_tx: mpsc::UnboundedSender<FlushSignal>,
 }
@@ -361,36 +361,73 @@ impl WalState {
         let wal_dir = dir.join("wal");
         std::fs::create_dir_all(&wal_dir)?;
         let segment_path = wal_dir.join(format!("wal_{segment_id:016x}.log"));
-        let io = crate::io::UringExecutor::with_backend(
-            options.io_max_in_flight,
-            options.io_backend,
-        );
-        {
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(true)
-                .open(&segment_path)
-                .with_context(|| format!("open wal segment {}", segment_path.display()))?;
-        }
-        let segment_bytes = std::fs::metadata(&segment_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+
+        let segment_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&segment_path)
+            .with_context(|| format!("open wal segment {}", segment_path.display()))?;
+
+        let segment_bytes = segment_file.metadata().map(|m| m.len()).unwrap_or(0);
         sync_dir(&wal_dir)?;
         Ok(Self {
             dir,
             options,
             memtables,
             versions,
-            io,
             next_seqno,
             last_ack_seqno,
             last_durable_seqno,
             segment_id,
             segment_path,
+            segment_file,
             segment_bytes,
             flush_tx,
         })
+    }
+
+    fn append_records(&mut self, records: &[Vec<u8>]) -> anyhow::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        use std::io::{IoSlice, Write};
+        let mut record_idx = 0usize;
+        let mut record_off = 0usize;
+        while record_idx < records.len() {
+            let mut slices = Vec::with_capacity(records.len() - record_idx);
+            slices.push(IoSlice::new(&records[record_idx][record_off..]));
+            for record in records.iter().skip(record_idx + 1) {
+                slices.push(IoSlice::new(record));
+            }
+
+            let written = self
+                .segment_file
+                .write_vectored(&slices)
+                .with_context(|| format!("wal write_vectored {}", self.segment_path.display()))?;
+            if written == 0 {
+                anyhow::bail!(
+                    "wal write_vectored wrote zero bytes: {}",
+                    self.segment_path.display()
+                );
+            }
+
+            let mut remaining = written;
+            while remaining > 0 && record_idx < records.len() {
+                let available = records[record_idx].len() - record_off;
+                if remaining < available {
+                    record_off += remaining;
+                    remaining = 0;
+                } else {
+                    remaining -= available;
+                    record_idx += 1;
+                    record_off = 0;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn rotate_segment_if_needed(&mut self, additional: u64) -> anyhow::Result<()> {
@@ -402,23 +439,23 @@ impl WalState {
     }
 
     fn rotate_segment(&mut self) -> anyhow::Result<()> {
-        self.io.sync_file_blocking(&self.segment_path)?;
+        self.segment_file
+            .sync_data()
+            .with_context(|| format!("sync wal segment {}", self.segment_path.display()))?;
         self.segment_id += 1;
 
         let wal_dir = self.dir.join("wal");
         let segment_path = wal_dir.join(format!("wal_{:016x}.log", self.segment_id));
-        {
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(true)
-                .open(&segment_path)
-                .with_context(|| format!("open wal segment {}", segment_path.display()))?;
-        }
+
+        let segment_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&segment_path)
+            .with_context(|| format!("open wal segment {}", segment_path.display()))?;
         self.segment_path = segment_path;
-        self.segment_bytes = std::fs::metadata(&self.segment_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        self.segment_file = segment_file;
+        self.segment_bytes = self.segment_file.metadata().map(|m| m.len()).unwrap_or(0);
         sync_dir(&wal_dir)?;
 
         self.memtables.rotate_memtable(self.segment_id);
@@ -492,10 +529,7 @@ impl WalState {
             });
         }
 
-        if let Err(err) = self
-            .io
-            .append_many_blocking(&self.segment_path, &records)
-        {
+        if let Err(err) = self.append_records(&records) {
             let msg = format!("{err:#}");
             for write in staged {
                 let _ = write.done.send(Err(anyhow::anyhow!(msg.clone())));
@@ -515,7 +549,11 @@ impl WalState {
         let do_sync = staged.iter().any(|write| write.require_sync);
 
         if do_sync {
-            if let Err(err) = self.io.sync_file_blocking(&self.segment_path) {
+            if let Err(err) = self
+                .segment_file
+                .sync_data()
+                .with_context(|| format!("sync wal segment {}", self.segment_path.display()))
+            {
                 let msg = format!("{err:#}");
                 for write in staged {
                     let _ = write.done.send(Err(anyhow::anyhow!(msg.clone())));
@@ -583,12 +621,17 @@ impl WalState {
         let record = encode_wal_record(seqno_base, &ops)?;
         self.rotate_segment_if_needed(record.len() as u64)?;
 
-        self.io.append_blocking(&self.segment_path, &record)?;
+        use std::io::Write;
+        self.segment_file
+            .write_all(&record)
+            .with_context(|| format!("wal write {}", self.segment_path.display()))?;
         self.segment_bytes += record.len() as u64;
 
         let do_sync = opts.sync || self.options.fsync_writes;
         if do_sync {
-            self.io.sync_file_blocking(&self.segment_path)?;
+            self.segment_file
+                .sync_data()
+                .with_context(|| format!("sync wal segment {}", self.segment_path.display()))?;
         }
 
         self.memtables.apply_batch(seqno_base, &ops)?;
@@ -731,10 +774,8 @@ fn recover_from_wal(
         memtables.reset_for_wal_recovery(*first_id);
     }
 
-    let io = crate::io::UringExecutor::with_backend(
-        options.io_max_in_flight.max(1),
-        options.io_backend,
-    );
+    let io =
+        crate::io::UringExecutor::with_backend(options.io_max_in_flight.max(1), options.io_backend);
 
     for (idx, (segment_id, path)) in entries.iter().enumerate() {
         let file_len = std::fs::metadata(path)

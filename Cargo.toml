@@ -44,3 +44,7 @@ harness = false
 [[bench]]
 name = "regression"
 harness = false
+
+[[bench]]
+name = "nvme"
+harness = false

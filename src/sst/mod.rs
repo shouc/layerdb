@@ -368,6 +368,7 @@ pub struct SstBuilder {
 
     io: Option<crate::io::UringExecutor>,
     io_offset: u64,
+    io_fixed_fd: Option<u32>,
 }
 
 fn max_bytes(a: Option<Bytes>, b: Bytes) -> Bytes {
@@ -409,6 +410,7 @@ impl SstBuilder {
             entry_offsets: Vec::new(),
             io: None,
             io_offset: 0,
+            io_fixed_fd: None,
         })
     }
 
@@ -432,6 +434,8 @@ impl SstBuilder {
             .read(true)
             .open(&path_tmp)?;
 
+        let io_fixed_fd = io.register_file_blocking(&io_file);
+
         Ok(Self {
             block_size,
             file: None,
@@ -453,6 +457,7 @@ impl SstBuilder {
             entry_offsets: Vec::new(),
             io: Some(io),
             io_offset: 0,
+            io_fixed_fd,
         })
     }
 
@@ -592,8 +597,13 @@ impl SstBuilder {
         if let Some(file) = &mut self.file {
             file.write_all(data)?;
         } else if let (Some(io), Some(file)) = (&self.io, self.io_file.as_ref()) {
-            io.write_all_at_file_blocking(file, self.io_offset, data)
-                .map_err(|_| SstError::Corrupt("io write"))?;
+            if let Some(fixed) = self.io_fixed_fd {
+                io.write_all_at_file_blocking_fixed(file, fixed, self.io_offset, data)
+                    .map_err(|_| SstError::Corrupt("io write"))?;
+            } else {
+                io.write_all_at_file_blocking(file, self.io_offset, data)
+                    .map_err(|_| SstError::Corrupt("io write"))?;
+            }
         } else {
             return Err(SstError::Corrupt("sst builder missing output"));
         }
@@ -612,8 +622,13 @@ impl SstBuilder {
         }
 
         if let (Some(io), Some(file)) = (&self.io, self.io_file.as_ref()) {
-            io.sync_file_file_blocking(file)
-                .map_err(|_| SstError::Corrupt("io sync"))?;
+            if let Some(fixed) = self.io_fixed_fd {
+                io.sync_file_file_blocking_fixed(file, fixed)
+                    .map_err(|_| SstError::Corrupt("io sync"))?;
+            } else {
+                io.sync_file_file_blocking(file)
+                    .map_err(|_| SstError::Corrupt("io sync"))?;
+            }
             return Ok(());
         }
 
@@ -663,6 +678,18 @@ impl SstBuilder {
     }
 }
 
+impl Drop for SstBuilder {
+    fn drop(&mut self) {
+        let Some(io) = self.io.as_ref() else {
+            return;
+        };
+        let Some(fixed) = self.io_fixed_fd.take() else {
+            return;
+        };
+        io.unregister_file_blocking(fixed);
+    }
+}
+
 pub struct SstReader {
     sst_id: u64,
     mmap: Mmap,
@@ -674,6 +701,7 @@ pub struct SstReader {
 
     io_ctx: Option<Arc<SstIoContext>>,
     io_file: Option<std::fs::File>,
+    io_fixed_fd: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -760,7 +788,14 @@ impl SstReader {
             .as_ref()
             .and_then(|raw| decode_point_filter(raw));
 
-        let io_file = if keep_file { Some(file) } else { None };
+        let (io_file, io_fixed_fd) = if keep_file {
+            let fixed = io_ctx
+                .as_ref()
+                .and_then(|ctx| ctx.io.register_file_blocking(&file));
+            (Some(file), fixed)
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             sst_id,
@@ -772,7 +807,12 @@ impl SstReader {
             point_filter,
             io_ctx,
             io_file,
+            io_fixed_fd,
         })
+    }
+
+    fn io_fixed_fd(&self) -> Option<u32> {
+        self.io_fixed_fd
     }
 
     pub fn properties(&self) -> &SstProperties {
@@ -991,10 +1031,28 @@ impl SstReader {
             .as_ref()
             .ok_or(SstError::Corrupt("io ctx missing file"))?;
 
-        io_ctx
-            .io
-            .read_into_at_file_blocking(file, handle.offset, &mut buf)
-            .map_err(|_| SstError::Corrupt("io read"))?;
+        if let Some(buf_index) = buf.fixed_buf_index() {
+            io_ctx
+                .io
+                .read_into_at_file_fixed_buf_blocking(
+                    file,
+                    self.io_fixed_fd(),
+                    handle.offset,
+                    buf_index,
+                    &mut buf,
+                )
+                .map_err(|_| SstError::Corrupt("io read"))?;
+        } else if let Some(fixed) = self.io_fixed_fd() {
+            io_ctx
+                .io
+                .read_into_at_file_blocking_fixed(file, fixed, handle.offset, &mut buf)
+                .map_err(|_| SstError::Corrupt("io read"))?;
+        } else {
+            io_ctx
+                .io
+                .read_into_at_file_blocking(file, handle.offset, &mut buf)
+                .map_err(|_| SstError::Corrupt("io read"))?;
+        }
 
         let payload = verified_block_payload(&buf)?;
 
@@ -1038,10 +1096,28 @@ impl SstReader {
                 .as_ref()
                 .ok_or(SstError::Corrupt("io ctx missing file"))?;
 
-            io_ctx
-                .io
-                .read_into_at_file_blocking(file, handle.offset, &mut buf)
-                .map_err(|_| SstError::Corrupt("io read"))?;
+            if let Some(buf_index) = buf.fixed_buf_index() {
+                io_ctx
+                    .io
+                    .read_into_at_file_fixed_buf_blocking(
+                        file,
+                        self.io_fixed_fd(),
+                        handle.offset,
+                        buf_index,
+                        &mut buf,
+                    )
+                    .map_err(|_| SstError::Corrupt("io read"))?;
+            } else if let Some(fixed) = self.io_fixed_fd() {
+                io_ctx
+                    .io
+                    .read_into_at_file_blocking_fixed(file, fixed, handle.offset, &mut buf)
+                    .map_err(|_| SstError::Corrupt("io read"))?;
+            } else {
+                io_ctx
+                    .io
+                    .read_into_at_file_blocking(file, handle.offset, &mut buf)
+                    .map_err(|_| SstError::Corrupt("io read"))?;
+            }
 
             let payload = verified_block_payload(&buf)?;
             return point_get_from_payload(
@@ -1060,6 +1136,18 @@ impl SstReader {
 
         let payload = verified_block_payload(&self.mmap[start..end])?;
         point_get_from_payload(payload, user_key, snapshot_seqno, self.props.format_version)
+    }
+}
+
+impl Drop for SstReader {
+    fn drop(&mut self) {
+        let Some(io_ctx) = self.io_ctx.as_ref() else {
+            return;
+        };
+        let Some(fixed) = self.io_fixed_fd.take() else {
+            return;
+        };
+        io_ctx.io.unregister_file_blocking(fixed);
     }
 }
 

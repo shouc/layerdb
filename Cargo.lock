@@ -571,6 +571,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-skiplist",
  "io-uring",
+ "libc",
  "lru",
  "memmap2",
  "parking_lot",

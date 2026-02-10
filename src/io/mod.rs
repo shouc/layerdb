@@ -20,7 +20,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use std::io::{Read, Seek};
 
 #[cfg(all(feature = "native-uring", target_os = "linux"))]
-mod native_uring;
+pub(crate) mod native_uring;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoBackend {
@@ -95,6 +95,11 @@ impl UringExecutor {
         self.backend
     }
 
+    #[cfg(all(feature = "native-uring", target_os = "linux"))]
+    pub(crate) fn native_uring(&self) -> Option<Arc<native_uring::NativeUring>> {
+        self.native.clone()
+    }
+
     pub fn supports_native_uring() -> bool {
         #[cfg(all(feature = "native-uring", target_os = "linux"))]
         {
@@ -105,6 +110,29 @@ impl UringExecutor {
         {
             false
         }
+    }
+
+    pub(crate) fn register_file_blocking(&self, file: &std::fs::File) -> Option<u32> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.register_file(file);
+            }
+        }
+
+        let _ = file;
+        None
+    }
+
+    pub(crate) fn unregister_file_blocking(&self, fixed_fd: u32) {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                native.unregister_file(fixed_fd);
+            }
+        }
+
+        let _ = fixed_fd;
     }
 
     async fn acquire_permit(&self) -> anyhow::Result<OwnedSemaphorePermit> {
@@ -431,6 +459,24 @@ impl UringExecutor {
         }
     }
 
+    pub(crate) fn write_all_at_file_blocking_fixed(
+        &self,
+        file: &std::fs::File,
+        fixed_fd: u32,
+        offset: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.write_all_at_file_fixed(file, fixed_fd, offset, data);
+            }
+        }
+
+        let _ = fixed_fd;
+        self.write_all_at_file_blocking(file, offset, data)
+    }
+
     pub fn read_into_at_blocking(
         &self,
         path: impl AsRef<Path>,
@@ -489,6 +535,44 @@ impl UringExecutor {
         }
     }
 
+    pub(crate) fn read_into_at_file_blocking_fixed(
+        &self,
+        file: &std::fs::File,
+        fixed_fd: u32,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> anyhow::Result<()> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.read_into_at_file_fixed(file, fixed_fd, offset, buf);
+            }
+        }
+
+        let _ = fixed_fd;
+        self.read_into_at_file_blocking(file, offset, buf)
+    }
+
+    pub(crate) fn read_into_at_file_fixed_buf_blocking(
+        &self,
+        file: &std::fs::File,
+        fixed_fd: Option<u32>,
+        offset: u64,
+        buf_index: u16,
+        buf: &mut [u8],
+    ) -> anyhow::Result<()> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.read_into_at_file_fixed_buf(file, fixed_fd, offset, buf_index, buf);
+            }
+        }
+
+        let _ = fixed_fd;
+        let _ = buf_index;
+        self.read_into_at_file_blocking(file, offset, buf)
+    }
+
     pub fn sync_file_blocking(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         let path = path.as_ref();
         let file = std::fs::OpenOptions::new()
@@ -509,6 +593,22 @@ impl UringExecutor {
         }
 
         file.sync_data().context("sync_data")
+    }
+
+    pub(crate) fn sync_file_file_blocking_fixed(
+        &self,
+        file: &std::fs::File,
+        fixed_fd: u32,
+    ) -> anyhow::Result<()> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.sync_file_file_fixed(file, fixed_fd);
+            }
+        }
+
+        let _ = fixed_fd;
+        self.sync_file_file_blocking(file)
     }
 
     pub fn sync_parent_dir_blocking(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
@@ -557,6 +657,9 @@ struct BufPoolInner {
     bucket_sizes: Vec<usize>,
     max_cached_per_bucket: usize,
     free: Mutex<HashMap<usize, Vec<Vec<u8>>>>,
+
+    #[cfg(all(feature = "native-uring", target_os = "linux"))]
+    native_uring: Option<Arc<native_uring::NativeUring>>,
 }
 
 impl Default for BufPool {
@@ -579,11 +682,37 @@ impl BufPool {
                 bucket_sizes: sizes,
                 max_cached_per_bucket,
                 free: Mutex::new(HashMap::new()),
+
+                #[cfg(all(feature = "native-uring", target_os = "linux"))]
+                native_uring: None,
             }),
         }
     }
 
+    #[cfg(all(feature = "native-uring", target_os = "linux"))]
+    pub(crate) fn with_native_uring(
+        native: Arc<native_uring::NativeUring>,
+        bucket_sizes: impl IntoIterator<Item = usize>,
+        max_cached_per_bucket: usize,
+    ) -> Self {
+        let mut pool = Self::new(bucket_sizes, max_cached_per_bucket);
+        let inner = Arc::get_mut(&mut pool.inner).expect("new BufPool has unique Arc");
+        inner.native_uring = Some(native);
+        pool
+    }
+
     pub fn acquire(&self, min_capacity: usize) -> PooledBuf {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if let Some(native) = &self.inner.native_uring {
+            if let Some(buf) = native.try_acquire_fixed_buf(min_capacity) {
+                return PooledBuf {
+                    inner: PooledBufInner::Fixed(buf),
+                    bucket_capacity: None,
+                    pool: Arc::downgrade(&self.inner),
+                };
+            }
+        }
+
         let target_cap = self
             .inner
             .bucket_sizes
@@ -597,7 +726,7 @@ impl BufPool {
                 if let Some(mut data) = list.pop() {
                     data.clear();
                     return PooledBuf {
-                        data,
+                        inner: PooledBufInner::Vec(data),
                         bucket_capacity: Some(bucket),
                         pool: Arc::downgrade(&self.inner),
                     };
@@ -605,14 +734,14 @@ impl BufPool {
             }
 
             return PooledBuf {
-                data: Vec::with_capacity(bucket),
+                inner: PooledBufInner::Vec(Vec::with_capacity(bucket)),
                 bucket_capacity: Some(bucket),
                 pool: Arc::downgrade(&self.inner),
             };
         }
 
         PooledBuf {
-            data: Vec::with_capacity(min_capacity),
+            inner: PooledBufInner::Vec(Vec::with_capacity(min_capacity)),
             bucket_capacity: None,
             pool: Arc::downgrade(&self.inner),
         }
@@ -630,57 +759,156 @@ impl BufPool {
 
 #[derive(Debug)]
 pub struct PooledBuf {
-    data: Vec<u8>,
+    inner: PooledBufInner,
     bucket_capacity: Option<usize>,
     pool: Weak<BufPoolInner>,
 }
 
+#[derive(Debug)]
+enum PooledBufInner {
+    Vec(Vec<u8>),
+
+    #[cfg(all(feature = "native-uring", target_os = "linux"))]
+    Fixed(native_uring::FixedBuf),
+}
+
+impl PooledBufInner {
+    fn len(&self) -> usize {
+        match self {
+            PooledBufInner::Vec(v) => v.len(),
+
+            #[cfg(all(feature = "native-uring", target_os = "linux"))]
+            PooledBufInner::Fixed(b) => b.len(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            PooledBufInner::Vec(v) => v.capacity(),
+
+            #[cfg(all(feature = "native-uring", target_os = "linux"))]
+            PooledBufInner::Fixed(b) => b.capacity(),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            PooledBufInner::Vec(v) => v.as_slice(),
+
+            #[cfg(all(feature = "native-uring", target_os = "linux"))]
+            PooledBufInner::Fixed(b) => b.as_slice(),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            PooledBufInner::Vec(v) => v.as_mut_slice(),
+
+            #[cfg(all(feature = "native-uring", target_os = "linux"))]
+            PooledBufInner::Fixed(b) => b.as_mut_slice(),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            PooledBufInner::Vec(v) => v.clear(),
+
+            #[cfg(all(feature = "native-uring", target_os = "linux"))]
+            PooledBufInner::Fixed(b) => b.clear(),
+        }
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        match self {
+            PooledBufInner::Vec(v) => v.extend_from_slice(bytes),
+
+            #[cfg(all(feature = "native-uring", target_os = "linux"))]
+            PooledBufInner::Fixed(b) => {
+                let old_len = b.len();
+                let new_len = old_len + bytes.len();
+                assert!(new_len <= b.capacity(), "fixed buf overflow");
+                b.resize(new_len, 0);
+                b.as_mut_slice()[old_len..new_len].copy_from_slice(bytes);
+            }
+        }
+    }
+}
+
 impl PooledBuf {
     pub fn as_slice(&self) -> &[u8] {
-        &self.data
+        self.inner.as_slice()
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data
+        self.inner.as_mut_slice()
     }
 
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.inner.len() == 0
     }
 
     pub fn capacity(&self) -> usize {
-        self.data.capacity()
+        self.inner.capacity()
     }
 
     pub fn clear(&mut self) {
-        self.data.clear();
+        self.inner.clear();
     }
 
     pub fn extend_from_slice(&mut self, bytes: &[u8]) {
-        self.data.extend_from_slice(bytes);
+        self.inner.extend_from_slice(bytes);
+    }
+
+    pub fn resize(&mut self, new_len: usize, value: u8) {
+        match &mut self.inner {
+            PooledBufInner::Vec(v) => v.resize(new_len, value),
+
+            #[cfg(all(feature = "native-uring", target_os = "linux"))]
+            PooledBufInner::Fixed(b) => b.resize(new_len, value),
+        }
+    }
+
+    pub(crate) fn fixed_buf_index(&self) -> Option<u16> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        {
+            match &self.inner {
+                PooledBufInner::Fixed(b) => Some(b.buf_index()),
+                _ => None,
+            }
+        }
+
+        #[cfg(not(all(feature = "native-uring", target_os = "linux")))]
+        {
+            None
+        }
     }
 
     pub fn into_vec(mut self) -> Vec<u8> {
         self.bucket_capacity = None;
-        std::mem::take(&mut self.data)
+        match &mut self.inner {
+            PooledBufInner::Vec(v) => std::mem::take(v),
+
+            #[cfg(all(feature = "native-uring", target_os = "linux"))]
+            PooledBufInner::Fixed(b) => b.as_slice().to_vec(),
+        }
     }
 }
 
 impl std::ops::Deref for PooledBuf {
-    type Target = Vec<u8>;
+    type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        &self.data
+        self.inner.as_slice()
     }
 }
 
 impl std::ops::DerefMut for PooledBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.data
+        self.inner.as_mut_slice()
     }
 }
 
@@ -689,18 +917,22 @@ impl Drop for PooledBuf {
         let Some(bucket) = self.bucket_capacity else {
             return;
         };
-        if self.data.capacity() != bucket {
+
+        let PooledBufInner::Vec(vec) = &mut self.inner else {
+            return;
+        };
+        if vec.capacity() != bucket {
             return;
         }
         let Some(inner) = self.pool.upgrade() else {
             return;
         };
 
-        self.data.clear();
+        vec.clear();
         let mut free = inner.free.lock();
         let list = free.entry(bucket).or_default();
         if list.len() < inner.max_cached_per_bucket {
-            list.push(std::mem::take(&mut self.data));
+            list.push(std::mem::take(vec));
         }
     }
 }

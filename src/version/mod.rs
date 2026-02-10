@@ -184,13 +184,27 @@ impl VersionSet {
         let branch_archives = state.branch_archives;
 
         let sst_io_ctx = if options.sst_use_io_executor_reads || options.sst_use_io_executor_writes {
-            Some(Arc::new(SstIoContext::new(
-                crate::io::UringExecutor::with_backend(
-                    options.io_max_in_flight.max(1),
-                    options.io_backend,
-                ),
-                crate::io::BufPool::default(),
-            )))
+            let io = crate::io::UringExecutor::with_backend(
+                options.io_max_in_flight.max(1),
+                options.io_backend,
+            );
+
+            #[cfg(all(feature = "native-uring", target_os = "linux"))]
+            let buf_pool = io
+                .native_uring()
+                .map(|native| {
+                    crate::io::BufPool::with_native_uring(
+                        native,
+                        [4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024],
+                        64,
+                    )
+                })
+                .unwrap_or_else(crate::io::BufPool::default);
+
+            #[cfg(not(all(feature = "native-uring", target_os = "linux")))]
+            let buf_pool = crate::io::BufPool::default();
+
+            Some(Arc::new(SstIoContext::new(io, buf_pool)))
         } else {
             None
         };

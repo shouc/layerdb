@@ -19,6 +19,7 @@
 //! repeated count times:
 //!   [internal_key]
 //!   [val_len u32][val bytes]
+//! [entry_offsets u32 * count] (format v3+)
 //! [trailer]
 //! ```
 //!
@@ -74,6 +75,7 @@ pub struct SstProperties {
     ///
     /// - v1: range tombstones are stored as point entries only.
     /// - v2: `range_tombstones` is populated from the write path.
+    /// - v3: data blocks include a per-entry offset index for faster point lookups.
     #[serde(default = "default_sst_format_version")]
     pub format_version: u32,
 
@@ -153,6 +155,19 @@ fn point_get_from_payload(
     payload: &[u8],
     user_key: &[u8],
     snapshot_seqno: u64,
+    format_version: u32,
+) -> Result<Option<(u64, Option<Bytes>)>, SstError> {
+    if format_version >= 3 {
+        return point_get_from_payload_with_offset_index(payload, user_key, snapshot_seqno);
+    }
+
+    point_get_from_payload_linear(payload, user_key, snapshot_seqno)
+}
+
+fn point_get_from_payload_linear(
+    payload: &[u8],
+    user_key: &[u8],
+    snapshot_seqno: u64,
 ) -> Result<Option<(u64, Option<Bytes>)>, SstError> {
     if payload.len() < 4 {
         return Err(SstError::Corrupt("block payload too small"));
@@ -212,6 +227,125 @@ fn point_get_from_payload(
     Ok(None)
 }
 
+fn point_get_from_payload_with_offset_index(
+    payload: &[u8],
+    user_key: &[u8],
+    snapshot_seqno: u64,
+) -> Result<Option<(u64, Option<Bytes>)>, SstError> {
+    fn parse_entry<'a>(
+        payload: &'a [u8],
+        entries_end: usize,
+        entry_offset: usize,
+    ) -> Result<(&'a [u8], u64, KeyKind, &'a [u8]), SstError> {
+        if entry_offset + 4 > entries_end {
+            return Err(SstError::Corrupt("truncated internal key"));
+        }
+
+        let user_key_len =
+            u32::from_le_bytes(payload[entry_offset..entry_offset + 4].try_into().unwrap())
+                as usize;
+        let mut offset = entry_offset + 4;
+        if offset + user_key_len + 8 + 1 > entries_end {
+            return Err(SstError::Corrupt("truncated internal key bytes"));
+        }
+
+        let entry_user_key = &payload[offset..offset + user_key_len];
+        offset += user_key_len;
+        let seqno = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let kind =
+            KeyKind::from_u8(payload[offset]).map_err(|_| SstError::Corrupt("unknown key kind"))?;
+        offset += 1;
+
+        if offset + 4 > entries_end {
+            return Err(SstError::Corrupt("truncated value len"));
+        }
+        let val_len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + val_len > entries_end {
+            return Err(SstError::Corrupt("truncated value bytes"));
+        }
+
+        Ok((
+            entry_user_key,
+            seqno,
+            kind,
+            &payload[offset..offset + val_len],
+        ))
+    }
+
+    if payload.len() < 4 {
+        return Err(SstError::Corrupt("block payload too small"));
+    }
+
+    let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    if count == 0 {
+        return Ok(None);
+    }
+
+    let offsets_bytes = count
+        .checked_mul(4)
+        .ok_or(SstError::Corrupt("block offset index too large"))?;
+    if payload.len() < 4 + offsets_bytes {
+        return Err(SstError::Corrupt(
+            "block payload too small for offset index",
+        ));
+    }
+    let entries_end = payload.len() - offsets_bytes;
+    if entries_end < 4 {
+        return Err(SstError::Corrupt("block offset index overlaps header"));
+    }
+
+    let offset_at = |idx: usize| -> Result<usize, SstError> {
+        if idx >= count {
+            return Err(SstError::Corrupt("block offset index out of bounds"));
+        }
+        let start = entries_end + idx * 4;
+        let raw = u32::from_le_bytes(payload[start..start + 4].try_into().unwrap()) as usize;
+        if raw < 4 || raw >= entries_end {
+            return Err(SstError::Corrupt("block offset index corrupt"));
+        }
+        Ok(raw)
+    };
+
+    let mut lo = 0usize;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let entry_offset = offset_at(mid)?;
+        let (entry_user_key, _seqno, _kind, _value) =
+            parse_entry(payload, entries_end, entry_offset)?;
+
+        match entry_user_key.cmp(user_key) {
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater | Ordering::Equal => hi = mid,
+        }
+    }
+
+    if lo >= count {
+        return Ok(None);
+    }
+
+    for idx in lo..count {
+        let entry_offset = offset_at(idx)?;
+        let (entry_user_key, seqno, kind, value) = parse_entry(payload, entries_end, entry_offset)?;
+        if entry_user_key != user_key {
+            break;
+        }
+        if seqno > snapshot_seqno {
+            continue;
+        }
+
+        return Ok(match kind {
+            KeyKind::Put => Some((seqno, Some(Bytes::copy_from_slice(value)))),
+            KeyKind::Del => Some((seqno, None)),
+            _ => None,
+        });
+    }
+
+    Ok(None)
+}
+
 pub struct SstBuilder {
     block_size: usize,
     file: Option<std::fs::File>,
@@ -230,6 +364,7 @@ pub struct SstBuilder {
     table_hasher: blake3::Hasher,
     range_tombstones: Vec<RangeTombstone>,
     point_keys: Vec<Bytes>,
+    entry_offsets: Vec<u32>,
 
     io: Option<crate::io::UringExecutor>,
     io_offset: u64,
@@ -271,6 +406,7 @@ impl SstBuilder {
             table_hasher: blake3::Hasher::new(),
             range_tombstones: Vec::new(),
             point_keys: Vec::new(),
+            entry_offsets: Vec::new(),
             io: None,
             io_offset: 0,
         })
@@ -314,6 +450,7 @@ impl SstBuilder {
             table_hasher: blake3::Hasher::new(),
             range_tombstones: Vec::new(),
             point_keys: Vec::new(),
+            entry_offsets: Vec::new(),
             io: Some(io),
             io_offset: 0,
         })
@@ -361,6 +498,13 @@ impl SstBuilder {
         if self.entries_in_block == 0 {
             self.buf.extend_from_slice(&0u32.to_le_bytes());
         }
+
+        let entry_offset: u32 = self
+            .buf
+            .len()
+            .try_into()
+            .map_err(|_| SstError::Corrupt("sst block too large"))?;
+        self.entry_offsets.push(entry_offset);
         key.encode_into(&mut self.buf);
         let val_len: u32 = value
             .len()
@@ -405,7 +549,7 @@ impl SstBuilder {
             data_bytes: self.data_bytes,
             index_bytes: index_bytes.len() as u64,
             table_root,
-            format_version: 2,
+            format_version: 3,
             range_tombstones: self.range_tombstones.clone(),
             point_filter,
         };
@@ -477,6 +621,15 @@ impl SstBuilder {
     }
 
     fn flush_block(&mut self) -> Result<(), SstError> {
+        if self.entry_offsets.len() != self.entries_in_block as usize {
+            return Err(SstError::Corrupt("sst block offset index mismatch"));
+        }
+
+        for offset in &self.entry_offsets {
+            self.buf.extend_from_slice(&offset.to_le_bytes());
+        }
+        self.entry_offsets.clear();
+
         let payload_len = self.buf.len();
         let crc = RecordHasher::crc32c(&self.buf);
         let hash = RecordHasher::blake3(&self.buf);
@@ -891,7 +1044,12 @@ impl SstReader {
                 .map_err(|_| SstError::Corrupt("io read"))?;
 
             let payload = verified_block_payload(&buf)?;
-            return point_get_from_payload(payload, user_key, snapshot_seqno);
+            return point_get_from_payload(
+                payload,
+                user_key,
+                snapshot_seqno,
+                self.props.format_version,
+            );
         }
 
         let start = handle.offset as usize;
@@ -901,7 +1059,7 @@ impl SstReader {
         }
 
         let payload = verified_block_payload(&self.mmap[start..end])?;
-        point_get_from_payload(payload, user_key, snapshot_seqno)
+        point_get_from_payload(payload, user_key, snapshot_seqno, self.props.format_version)
     }
 }
 

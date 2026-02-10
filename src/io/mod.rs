@@ -477,6 +477,32 @@ impl UringExecutor {
         self.write_all_at_file_blocking(file, offset, data)
     }
 
+    pub(crate) fn write_all_at_file_blocking_batch(
+        &self,
+        file: &std::fs::File,
+        fixed_fd: Option<u32>,
+        writes: &[(u64, &[u8])],
+    ) -> anyhow::Result<()> {
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
+        if self.backend == IoBackend::Uring {
+            if let Some(native) = &self.native {
+                return native.write_all_at_file_batch(file, fixed_fd, writes);
+            }
+        }
+
+        if let Some(fixed) = fixed_fd {
+            for (offset, data) in writes {
+                self.write_all_at_file_blocking_fixed(file, fixed, *offset, data)?;
+            }
+        } else {
+            for (offset, data) in writes {
+                self.write_all_at_file_blocking(file, *offset, data)?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn read_into_at_blocking(
         &self,
         path: impl AsRef<Path>,

@@ -185,9 +185,7 @@ impl NativeUring {
         let fd = file.as_raw_fd();
         let updated = {
             let ring = self.ring.lock();
-            ring.submitter()
-                .register_files_update(slot, &[fd])
-                .ok()
+            ring.submitter().register_files_update(slot, &[fd]).ok()
         };
 
         match updated {
@@ -205,9 +203,7 @@ impl NativeUring {
     pub fn unregister_file(&self, fixed_fd: u32) {
         let updated = {
             let ring = self.ring.lock();
-            ring.submitter()
-                .register_files_update(fixed_fd, &[-1])
-                .ok()
+            ring.submitter().register_files_update(fixed_fd, &[-1]).ok()
         };
 
         if updated != Some(1) {
@@ -275,6 +271,56 @@ impl NativeUring {
         Ok(cqe.result())
     }
 
+    fn submit_batch(&self, entries: Vec<io_uring::squeue::Entry>) -> anyhow::Result<Vec<i32>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let want = entries.len();
+        let mut ring = self.ring.lock();
+
+        unsafe {
+            let mut sq = ring.submission();
+            for entry in &entries {
+                sq.push(entry)
+                    .map_err(|_| anyhow::anyhow!("io_uring submission queue is full"))?;
+            }
+        }
+
+        ring.submit_and_wait(want)
+            .context("io_uring submit_and_wait batch")?;
+
+        let mut results = vec![i32::MIN; want];
+        let mut seen = 0usize;
+
+        while seen < want {
+            {
+                let mut cq = ring.completion();
+                while seen < want {
+                    let Some(cqe) = cq.next() else {
+                        break;
+                    };
+                    let idx: usize = cqe
+                        .user_data()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("io_uring completion user_data overflow"))?;
+                    if idx >= want {
+                        anyhow::bail!("io_uring completion user_data out of range: {idx}");
+                    }
+                    results[idx] = cqe.result();
+                    seen += 1;
+                }
+            }
+
+            if seen < want {
+                ring.submit_and_wait(want - seen)
+                    .context("io_uring submit_and_wait batch (drain)")?;
+            }
+        }
+
+        Ok(results)
+    }
+
     fn result_to_io(res: i32) -> std::io::Result<usize> {
         if res >= 0 {
             Ok(res as usize)
@@ -290,6 +336,89 @@ impl NativeUring {
         data: &[u8],
     ) -> anyhow::Result<()> {
         self.write_all_at_file_impl(file, None, offset, data)
+    }
+
+    pub fn write_all_at_file_batch(
+        &self,
+        file: &std::fs::File,
+        fixed_fd: Option<u32>,
+        writes: &[(u64, &[u8])],
+    ) -> anyhow::Result<()> {
+        #[derive(Debug, Clone, Copy)]
+        struct PendingSlice {
+            offset: u64,
+            ptr: *const u8,
+            len: usize,
+        }
+
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        let fd = file.as_raw_fd();
+        let max_batch = self._max_in_flight.clamp(1, 128);
+
+        let mut pending = Vec::new();
+        for (offset, data) in writes {
+            if data.is_empty() {
+                continue;
+            }
+            if data.len() > u32::MAX as usize {
+                self.write_all_at_file_impl(file, fixed_fd, *offset, data)?;
+                continue;
+            }
+            pending.push(PendingSlice {
+                offset: *offset,
+                ptr: data.as_ptr(),
+                len: data.len(),
+            });
+        }
+
+        while !pending.is_empty() {
+            let chunk_len = pending.len().min(max_batch);
+            let mut chunk: Vec<PendingSlice> = pending.drain(..chunk_len).collect();
+            let mut entries = Vec::with_capacity(chunk_len);
+
+            for (idx, slice) in chunk.iter().enumerate() {
+                let len: u32 = slice
+                    .len
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("batch write len exceeds u32"))?;
+                let entry = if let Some(fixed) = fixed_fd {
+                    opcode::Write::new(types::Fixed(fixed), slice.ptr, len)
+                        .offset(slice.offset)
+                        .build()
+                } else {
+                    opcode::Write::new(types::Fd(fd), slice.ptr, len)
+                        .offset(slice.offset)
+                        .build()
+                };
+                entries.push(entry.user_data(idx as u64));
+            }
+
+            let results = self.submit_batch(entries).context("io_uring write batch")?;
+            debug_assert_eq!(results.len(), chunk_len);
+
+            for (idx, slice) in chunk.iter_mut().enumerate() {
+                let n = Self::result_to_io(results[idx]).with_context(|| {
+                    format!("io_uring write batch result offset {}", slice.offset)
+                })?;
+                if n == 0 {
+                    anyhow::bail!("io_uring write batch returned zero bytes");
+                }
+                if n < slice.len {
+                    slice.offset = slice
+                        .offset
+                        .checked_add(n as u64)
+                        .context("io_uring write batch offset overflow")?;
+                    slice.ptr = unsafe { slice.ptr.add(n) };
+                    slice.len -= n;
+                    pending.push(*slice);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn write_all_at_file_fixed(
@@ -438,7 +567,10 @@ impl NativeUring {
             anyhow::bail!("io_uring read_fixed hit EOF");
         }
         if n != buf.len() {
-            anyhow::bail!("io_uring read_fixed returned short read: {n} != {}", buf.len());
+            anyhow::bail!(
+                "io_uring read_fixed returned short read: {n} != {}",
+                buf.len()
+            );
         }
         Ok(())
     }
@@ -627,9 +759,7 @@ mod tests {
         uring
             .write_all_at_file_fixed(&file, fixed_fd, 0, payload)
             .expect("write");
-        uring
-            .sync_file_file_fixed(&file, fixed_fd)
-            .expect("sync");
+        uring.sync_file_file_fixed(&file, fixed_fd).expect("sync");
 
         fixed_buf.resize(payload.len(), 0);
         uring
@@ -645,5 +775,40 @@ mod tests {
 
         drop(fixed_buf);
         uring.unregister_file(fixed_fd);
+    }
+
+    #[test]
+    fn native_uring_batch_write_roundtrip() {
+        let uring = match NativeUring::new(8) {
+            Ok(uring) => uring,
+            Err(_) => return,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("batch.bin");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open");
+
+        // Write 2 slices at different offsets in one batch.
+        let part_a = b"hello";
+        let part_b = b"world";
+        uring
+            .write_all_at_file_batch(
+                &file,
+                None,
+                &[(0, part_a.as_slice()), (10, part_b.as_slice())],
+            )
+            .expect("write_batch");
+        uring.sync_file_file(&file).expect("sync");
+
+        let mut out = vec![0u8; 15];
+        uring.read_into_at_file(&file, 0, &mut out).expect("read");
+        assert_eq!(&out[0..5], part_a);
+        assert_eq!(&out[10..15], part_b);
     }
 }

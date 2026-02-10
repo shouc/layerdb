@@ -369,6 +369,15 @@ pub struct SstBuilder {
     io: Option<crate::io::UringExecutor>,
     io_offset: u64,
     io_fixed_fd: Option<u32>,
+
+    io_pending_writes: Vec<IoPendingWrite>,
+    io_write_buf_pool: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct IoPendingWrite {
+    offset: u64,
+    data: Vec<u8>,
 }
 
 fn max_bytes(a: Option<Bytes>, b: Bytes) -> Bytes {
@@ -411,6 +420,8 @@ impl SstBuilder {
             io: None,
             io_offset: 0,
             io_fixed_fd: None,
+            io_pending_writes: Vec::new(),
+            io_write_buf_pool: Vec::new(),
         })
     }
 
@@ -458,6 +469,8 @@ impl SstBuilder {
             io: Some(io),
             io_offset: 0,
             io_fixed_fd,
+            io_pending_writes: Vec::new(),
+            io_write_buf_pool: Vec::new(),
         })
     }
 
@@ -593,16 +606,56 @@ impl SstBuilder {
         }
     }
 
-    fn write_all(&mut self, data: &[u8]) -> Result<(), SstError> {
+    fn take_io_write_buf(&mut self) -> Vec<u8> {
+        self.io_write_buf_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(self.block_size + 256))
+    }
+
+    fn flush_pending_writes(&mut self) -> Result<(), SstError> {
+        if self.io_pending_writes.is_empty() {
+            return Ok(());
+        }
+
+        let (Some(io), Some(file)) = (&self.io, self.io_file.as_ref()) else {
+            return Err(SstError::Corrupt("sst builder missing output"));
+        };
+
+        let fixed_fd = self.io_fixed_fd;
+
+        let refs: Vec<(u64, &[u8])> = self
+            .io_pending_writes
+            .iter()
+            .map(|write| (write.offset, write.data.as_slice()))
+            .collect();
+
+        io.write_all_at_file_blocking_batch(file, fixed_fd, &refs)
+            .map_err(|_| SstError::Corrupt("io write"))?;
+
+        for mut pending in self.io_pending_writes.drain(..) {
+            pending.data.clear();
+            if self.io_write_buf_pool.len() < 256 {
+                self.io_write_buf_pool.push(pending.data);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_vec(&mut self, data: Vec<u8>) -> Result<(), SstError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let len = data.len();
+
         if let Some(file) = &mut self.file {
-            file.write_all(data)?;
-        } else if let (Some(io), Some(file)) = (&self.io, self.io_file.as_ref()) {
-            if let Some(fixed) = self.io_fixed_fd {
-                io.write_all_at_file_blocking_fixed(file, fixed, self.io_offset, data)
-                    .map_err(|_| SstError::Corrupt("io write"))?;
-            } else {
-                io.write_all_at_file_blocking(file, self.io_offset, data)
-                    .map_err(|_| SstError::Corrupt("io write"))?;
+            file.write_all(&data)?;
+        } else if self.io.is_some() {
+            let offset = self.io_offset;
+            self.io_pending_writes.push(IoPendingWrite { offset, data });
+            if self.io_pending_writes.len() >= 64 {
+                self.flush_pending_writes()?;
             }
         } else {
             return Err(SstError::Corrupt("sst builder missing output"));
@@ -610,15 +663,36 @@ impl SstBuilder {
 
         self.io_offset = self
             .io_offset
-            .checked_add(data.len() as u64)
+            .checked_add(len as u64)
             .ok_or(SstError::Corrupt("sst size overflow"))?;
         Ok(())
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> Result<(), SstError> {
+        if let Some(file) = &mut self.file {
+            file.write_all(data)?;
+            self.io_offset = self
+                .io_offset
+                .checked_add(data.len() as u64)
+                .ok_or(SstError::Corrupt("sst size overflow"))?;
+            return Ok(());
+        }
+
+        if self.io.is_some() {
+            return self.write_vec(data.to_vec());
+        }
+
+        Err(SstError::Corrupt("sst builder missing output"))
     }
 
     fn sync_data(&mut self) -> Result<(), SstError> {
         if let Some(file) = &self.file {
             file.sync_data()?;
             return Ok(());
+        }
+
+        if self.io.is_some() {
+            self.flush_pending_writes()?;
         }
 
         if let (Some(io), Some(file)) = (&self.io, self.io_file.as_ref()) {
@@ -653,13 +727,27 @@ impl SstBuilder {
         self.buf.extend_from_slice(&hash.0);
 
         let offset = self.stream_position()?;
-        let mut block = Vec::new();
-        std::mem::swap(&mut block, &mut self.buf);
-        self.write_all(&block)?;
-        let len: u32 = block
-            .len()
-            .try_into()
-            .map_err(|_| SstError::Corrupt("block too large"))?;
+        let len: u32;
+        if self.io.is_some() {
+            let block = std::mem::take(&mut self.buf);
+            len = block
+                .len()
+                .try_into()
+                .map_err(|_| SstError::Corrupt("block too large"))?;
+            self.buf = self.take_io_write_buf();
+            self.buf.clear();
+            self.write_vec(block)?;
+        } else {
+            let mut block = Vec::new();
+            std::mem::swap(&mut block, &mut self.buf);
+            len = block
+                .len()
+                .try_into()
+                .map_err(|_| SstError::Corrupt("block too large"))?;
+            self.write_all(&block)?;
+            block.clear();
+            std::mem::swap(&mut block, &mut self.buf);
+        }
 
         let last_key = self
             .last_key
@@ -671,8 +759,6 @@ impl SstBuilder {
         });
 
         self.data_bytes += payload_len as u64;
-        block.clear();
-        std::mem::swap(&mut block, &mut self.buf);
         self.entries_in_block = 0;
         Ok(())
     }

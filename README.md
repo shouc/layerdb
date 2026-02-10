@@ -19,6 +19,12 @@ cargo run --bin layerdb -- --help
 - Default build enables `native-uring`.
 - Runtime default backend is `io_uring` (Linux), with automatic fallback to blocking IO when unavailable.
 
+Native `io_uring` tries to enable SQPOLL mode by default (best effort). Disable with:
+
+```bash
+LAYERDB_URING_SQPOLL=0
+```
+
 On Linux, SST reads/writes are routed through the IO executor by default.
 To force the legacy mmap-based reader, set:
 

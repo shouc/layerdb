@@ -83,12 +83,15 @@ pub struct NativeUring {
 
     registered_files: Mutex<Option<RegisteredFiles>>,
     fixed_bufs: Option<FixedBufPool>,
+
+    sqpoll: bool,
 }
 
 impl std::fmt::Debug for NativeUring {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeUring")
             .field("max_in_flight", &self._max_in_flight)
+            .field("sqpoll", &self.sqpoll)
             .finish_non_exhaustive()
     }
 }
@@ -96,7 +99,19 @@ impl std::fmt::Debug for NativeUring {
 impl NativeUring {
     pub fn new(max_in_flight: usize) -> anyhow::Result<Self> {
         let entries = max_in_flight.max(1).next_power_of_two().min(1024) as u32;
-        let ring = IoUring::new(entries).context("create io_uring")?;
+        let ring = Self::create_ring(entries).context("create io_uring")?;
+        // When SQPOLL is enabled on older kernels it may require fixed files. We don't guarantee
+        // that all call-sites will always use `types::Fixed`, so only keep SQPOLL when the kernel
+        // explicitly supports non-fixed file descriptors.
+        let ring = if ring.params().is_setup_sqpoll() && !ring.params().is_feature_sqpoll_nonfixed()
+        {
+            IoUring::new(entries).context("create io_uring (disable sqpoll)")?
+        } else {
+            ring
+        };
+
+        let sqpoll = ring.params().is_setup_sqpoll();
+
         let registered_files = Mutex::new(Self::try_register_files(&ring));
         let fixed_bufs = Self::try_register_fixed_bufs(&ring, max_in_flight);
 
@@ -105,7 +120,34 @@ impl NativeUring {
             ring: Mutex::new(ring),
             registered_files,
             fixed_bufs,
+            sqpoll,
         })
+    }
+
+    fn create_ring(entries: u32) -> anyhow::Result<IoUring> {
+        const SQPOLL_IDLE_MS: u32 = 2_000;
+        let sqpoll_enabled = match std::env::var("LAYERDB_URING_SQPOLL") {
+            Ok(value) => value != "0" && value.to_ascii_lowercase() != "false",
+            Err(std::env::VarError::NotPresent) => true,
+            Err(_) => true,
+        };
+
+        if !sqpoll_enabled {
+            return IoUring::new(entries).context("create io_uring");
+        }
+
+        let sqpoll_cpu = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1) as u32)
+            .unwrap_or(0);
+
+        let mut builder = IoUring::builder();
+        builder.setup_sqpoll(SQPOLL_IDLE_MS);
+        builder.setup_sqpoll_cpu(sqpoll_cpu);
+
+        builder
+            .build(entries)
+            .or_else(|_| IoUring::new(entries))
+            .context("create io_uring")
     }
 
     fn try_register_files(ring: &IoUring) -> Option<RegisteredFiles> {
@@ -702,6 +744,9 @@ impl NativeUring {
 #[cfg(test)]
 mod tests {
     use super::NativeUring;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn native_uring_smoke_roundtrip() {
@@ -810,5 +855,37 @@ mod tests {
         uring.read_into_at_file(&file, 0, &mut out).expect("read");
         assert_eq!(&out[0..5], part_a);
         assert_eq!(&out[10..15], part_b);
+    }
+
+    #[test]
+    fn native_uring_sqpoll_env_var_can_disable() {
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<std::ffi::OsString>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard {
+            key: "LAYERDB_URING_SQPOLL",
+            prev: std::env::var_os("LAYERDB_URING_SQPOLL"),
+        };
+        std::env::set_var("LAYERDB_URING_SQPOLL", "0");
+
+        let uring = match NativeUring::new(8) {
+            Ok(uring) => uring,
+            Err(_) => return,
+        };
+
+        assert!(!uring.sqpoll);
+        drop(guard);
     }
 }

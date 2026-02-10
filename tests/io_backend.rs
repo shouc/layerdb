@@ -30,6 +30,18 @@ fn io_backend_defaults_to_uring() {
     assert_eq!(IoBackend::default(), IoBackend::Uring);
     assert_eq!(DbOptions::default().io_backend, IoBackend::Uring);
 
+    #[cfg(target_os = "linux")]
+    {
+        assert!(DbOptions::default().sst_use_io_executor_reads);
+        assert!(DbOptions::default().sst_use_io_executor_writes);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert!(!DbOptions::default().sst_use_io_executor_reads);
+        assert!(!DbOptions::default().sst_use_io_executor_writes);
+    }
+
     let io = UringExecutor::default();
 
     #[cfg(all(feature = "native-uring", target_os = "linux"))]

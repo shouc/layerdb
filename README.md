@@ -19,10 +19,11 @@ cargo run --bin layerdb -- --help
 - Default build enables `native-uring`.
 - Runtime default backend is `io_uring` (Linux), with automatic fallback to blocking IO when unavailable.
 
-To route SST reads/writes through the IO executor (and therefore `io_uring` on Linux), set:
+On Linux, SST reads/writes are routed through the IO executor by default.
+To force the legacy mmap-based reader, set:
 
-- `DbOptions::sst_use_io_executor_reads = true`
-- `DbOptions::sst_use_io_executor_writes = true`
+- `DbOptions::sst_use_io_executor_reads = false`
+- `DbOptions::sst_use_io_executor_writes = false`
 
 This speeds up local NVMe-heavy workloads by reducing syscall overhead and enabling the
 `io_uring` backend for SST reads/writes.

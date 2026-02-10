@@ -69,8 +69,8 @@ impl Default for DbOptions {
             block_cache_entries: 0,
             io_max_in_flight: 256,
             io_backend: crate::io::IoBackend::Uring,
-            sst_use_io_executor_reads: false,
-            sst_use_io_executor_writes: false,
+            sst_use_io_executor_reads: cfg!(target_os = "linux"),
+            sst_use_io_executor_writes: cfg!(target_os = "linux"),
         }
     }
 }

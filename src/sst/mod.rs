@@ -128,9 +128,94 @@ const MAGIC: &[u8; 8] = b"LAYERDB1";
 const FOOTER_SIZE: usize = 8 + 4 + 8 + 4 + 32;
 const BLOCK_TRAILER_SIZE: usize = 4 + 32;
 
+fn verified_block_payload<'a>(block: &'a [u8]) -> Result<&'a [u8], SstError> {
+    if block.len() <= BLOCK_TRAILER_SIZE {
+        return Err(SstError::Corrupt("block too small"));
+    }
+
+    let payload_end = block.len() - BLOCK_TRAILER_SIZE;
+    let payload = &block[..payload_end];
+    let crc_expected =
+        u32::from_le_bytes(block[payload_end..(payload_end + 4)].try_into().unwrap());
+    let hash_expected: [u8; 32] = block[(payload_end + 4)..].try_into().unwrap();
+
+    if !RecordHasher::verify_crc32c(payload, BlockCrc32c(crc_expected)) {
+        return Err(SstError::Corrupt("block crc mismatch"));
+    }
+    if !RecordHasher::verify_blake3(payload, BlockHash(hash_expected)) {
+        return Err(SstError::Corrupt("block hash mismatch"));
+    }
+
+    Ok(payload)
+}
+
+fn point_get_from_payload(
+    payload: &[u8],
+    user_key: &[u8],
+    snapshot_seqno: u64,
+) -> Result<Option<(u64, Option<Bytes>)>, SstError> {
+    if payload.len() < 4 {
+        return Err(SstError::Corrupt("block payload too small"));
+    }
+
+    let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let mut offset = 4usize;
+
+    for _ in 0..count {
+        if offset + 4 > payload.len() {
+            return Err(SstError::Corrupt("truncated internal key"));
+        }
+        let user_key_len =
+            u32::from_le_bytes(payload[offset..(offset + 4)].try_into().unwrap()) as usize;
+        offset += 4;
+
+        if offset + user_key_len + 8 + 1 > payload.len() {
+            return Err(SstError::Corrupt("truncated internal key bytes"));
+        }
+        let entry_user_key = &payload[offset..(offset + user_key_len)];
+        offset += user_key_len;
+        let seqno = u64::from_le_bytes(payload[offset..(offset + 8)].try_into().unwrap());
+        offset += 8;
+        let kind =
+            KeyKind::from_u8(payload[offset]).map_err(|_| SstError::Corrupt("unknown key kind"))?;
+        offset += 1;
+
+        if offset + 4 > payload.len() {
+            return Err(SstError::Corrupt("truncated value len"));
+        }
+        let val_len =
+            u32::from_le_bytes(payload[offset..(offset + 4)].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + val_len > payload.len() {
+            return Err(SstError::Corrupt("truncated value bytes"));
+        }
+        let value = &payload[offset..(offset + val_len)];
+        offset += val_len;
+
+        match entry_user_key.cmp(user_key) {
+            Ordering::Less => continue,
+            Ordering::Greater => break,
+            Ordering::Equal => {
+                if seqno > snapshot_seqno {
+                    continue;
+                }
+
+                return Ok(match kind {
+                    KeyKind::Put => Some((seqno, Some(Bytes::copy_from_slice(value)))),
+                    KeyKind::Del => Some((seqno, None)),
+                    _ => None,
+                });
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 pub struct SstBuilder {
     block_size: usize,
     file: Option<std::fs::File>,
+    io_file: Option<std::fs::File>,
     path_tmp: PathBuf,
     path_final: PathBuf,
     buf: Vec<u8>,
@@ -171,6 +256,7 @@ impl SstBuilder {
         Ok(Self {
             block_size,
             file: Some(file),
+            io_file: None,
             path_tmp,
             path_final,
             buf: Vec::with_capacity(block_size + 256),
@@ -203,9 +289,17 @@ impl SstBuilder {
             let _ = std::fs::remove_file(&path_tmp);
         }
 
+        let io_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path_tmp)?;
+
         Ok(Self {
             block_size,
             file: None,
+            io_file: Some(io_file),
             path_tmp,
             path_final,
             buf: Vec::with_capacity(block_size + 256),
@@ -335,6 +429,7 @@ impl SstBuilder {
         self.write_all(MAGIC)?;
         self.sync_data()?;
         drop(self.file.take());
+        drop(self.io_file.take());
 
         std::fs::rename(&self.path_tmp, &self.path_final)?;
         fsync_parent_dir(&self.path_final)?;
@@ -352,8 +447,8 @@ impl SstBuilder {
     fn write_all(&mut self, data: &[u8]) -> Result<(), SstError> {
         if let Some(file) = &mut self.file {
             file.write_all(data)?;
-        } else if let Some(io) = &self.io {
-            io.write_all_at_blocking(&self.path_tmp, self.io_offset, data)
+        } else if let (Some(io), Some(file)) = (&self.io, self.io_file.as_ref()) {
+            io.write_all_at_file_blocking(file, self.io_offset, data)
                 .map_err(|_| SstError::Corrupt("io write"))?;
         } else {
             return Err(SstError::Corrupt("sst builder missing output"));
@@ -372,8 +467,8 @@ impl SstBuilder {
             return Ok(());
         }
 
-        if let Some(io) = &self.io {
-            io.sync_file_blocking(&self.path_tmp)
+        if let (Some(io), Some(file)) = (&self.io, self.io_file.as_ref()) {
+            io.sync_file_file_blocking(file)
                 .map_err(|_| SstError::Corrupt("io sync"))?;
             return Ok(());
         }
@@ -416,7 +511,6 @@ impl SstBuilder {
 }
 
 pub struct SstReader {
-    path: PathBuf,
     sst_id: u64,
     mmap: Mmap,
     index: Vec<IndexEntry>,
@@ -426,6 +520,7 @@ pub struct SstReader {
     point_filter: Option<bloomfilter::Bloom<Bytes>>,
 
     io_ctx: Option<Arc<SstIoContext>>,
+    io_file: Option<std::fs::File>,
 }
 
 #[derive(Debug, Clone)]
@@ -470,6 +565,7 @@ impl SstReader {
         data_block_cache: Option<Arc<ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
     ) -> Result<Self, SstError> {
         let path = path.to_path_buf();
+        let keep_file = io_ctx.is_some();
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         if mmap.len() < MAGIC.len() + FOOTER_SIZE {
@@ -511,8 +607,9 @@ impl SstReader {
             .as_ref()
             .and_then(|raw| decode_point_filter(raw));
 
+        let io_file = if keep_file { Some(file) } else { None };
+
         Ok(Self {
-            path,
             sst_id,
             mmap,
             index,
@@ -521,6 +618,7 @@ impl SstReader {
             data_block_cache,
             point_filter,
             io_ctx,
+            io_file,
         })
     }
 
@@ -547,18 +645,22 @@ impl SstReader {
             KeyKind::Meta,
         );
         let candidate = if let Some((block_no, block)) = self.find_block(&target) {
-            let entries = self.read_block(block_no, block)?;
+            if self.data_block_cache.is_some() {
+                let entries = self.read_block(block_no, block)?;
 
-            let pos = match entries.binary_search_by(|(k, _)| k.cmp(&target)) {
-                Ok(i) | Err(i) => i,
-            };
-            match entries.get(pos).cloned() {
-                Some((k, v)) if k.user_key.as_ref() == user_key => match k.kind {
-                    KeyKind::Put => Some((k.seqno, Some(v))),
-                    KeyKind::Del => Some((k.seqno, None)),
+                let pos = match entries.binary_search_by(|(k, _)| k.cmp(&target)) {
+                    Ok(i) | Err(i) => i,
+                };
+                match entries.get(pos) {
+                    Some((k, v)) if k.user_key.as_ref() == user_key => match k.kind {
+                        KeyKind::Put => Some((k.seqno, Some(v.clone()))),
+                        KeyKind::Del => Some((k.seqno, None)),
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
+                }
+            } else {
+                self.get_from_block_handle_fast(block, user_key, snapshot_seqno)?
             }
         } else {
             None
@@ -641,7 +743,7 @@ impl SstReader {
             snapshot_seqno,
             index_pos: 0,
             seek_target: None,
-            entries: Vec::new(),
+            entries: Arc::new(Vec::new()),
             entry_pos: 0,
         })
     }
@@ -669,19 +771,20 @@ impl SstReader {
         &self,
         block_no: u32,
         handle: BlockHandle,
-    ) -> Result<Vec<(InternalKey, Bytes)>, SstError> {
+    ) -> Result<Arc<Vec<(InternalKey, Bytes)>>, SstError> {
         if let Some(cache) = &self.data_block_cache {
             let cache_key = BlockCacheKey::new(self.sst_id, BlockKind::Data, block_no);
             if let Some(cached) = cache.get(&cache_key) {
-                return Ok((*cached).clone());
+                return Ok(cached);
             }
 
             let decoded = self.decode_block(handle)?;
-            cache.insert(cache_key, Arc::new(decoded.clone()));
+            let decoded = Arc::new(decoded);
+            cache.insert(cache_key, decoded.clone());
             return Ok(decoded);
         }
 
-        self.decode_block(handle)
+        Ok(Arc::new(self.decode_block(handle)?))
     }
 
     fn decode_block(&self, handle: BlockHandle) -> Result<Vec<(InternalKey, Bytes)>, SstError> {
@@ -694,25 +797,8 @@ impl SstReader {
         if end > self.mmap.len() {
             return Err(SstError::Corrupt("block handle out of bounds"));
         }
-        if handle.len as usize <= BLOCK_TRAILER_SIZE {
-            return Err(SstError::Corrupt("block too small"));
-        }
 
-        let payload_end = end - BLOCK_TRAILER_SIZE;
-        let payload = &self.mmap[start..payload_end];
-        let crc_expected = u32::from_le_bytes(
-            self.mmap[payload_end..(payload_end + 4)]
-                .try_into()
-                .unwrap(),
-        );
-        let hash_expected: [u8; 32] = self.mmap[(payload_end + 4)..end].try_into().unwrap();
-
-        if !RecordHasher::verify_crc32c(payload, BlockCrc32c(crc_expected)) {
-            return Err(SstError::Corrupt("block crc mismatch"));
-        }
-        if !RecordHasher::verify_blake3(payload, BlockHash(hash_expected)) {
-            return Err(SstError::Corrupt("block hash mismatch"));
-        }
+        let payload = verified_block_payload(&self.mmap[start..end])?;
 
         if payload.len() < 4 {
             return Err(SstError::Corrupt("block payload too small"));
@@ -747,27 +833,17 @@ impl SstReader {
         let mut buf = io_ctx.buf_pool.acquire(handle.len as usize);
         buf.resize(handle.len as usize, 0u8);
 
+        let file = self
+            .io_file
+            .as_ref()
+            .ok_or(SstError::Corrupt("io ctx missing file"))?;
+
         io_ctx
             .io
-            .read_into_at_blocking(&self.path, handle.offset, &mut buf)
+            .read_into_at_file_blocking(file, handle.offset, &mut buf)
             .map_err(|_| SstError::Corrupt("io read"))?;
 
-        if buf.len() <= BLOCK_TRAILER_SIZE {
-            return Err(SstError::Corrupt("block too small"));
-        }
-
-        let payload_end = buf.len() - BLOCK_TRAILER_SIZE;
-        let payload = &buf[..payload_end];
-        let crc_expected =
-            u32::from_le_bytes(buf[payload_end..(payload_end + 4)].try_into().unwrap());
-        let hash_expected: [u8; 32] = buf[(payload_end + 4)..].try_into().unwrap();
-
-        if !RecordHasher::verify_crc32c(payload, BlockCrc32c(crc_expected)) {
-            return Err(SstError::Corrupt("block crc mismatch"));
-        }
-        if !RecordHasher::verify_blake3(payload, BlockHash(hash_expected)) {
-            return Err(SstError::Corrupt("block hash mismatch"));
-        }
+        let payload = verified_block_payload(&buf)?;
 
         if payload.len() < 4 {
             return Err(SstError::Corrupt("block payload too small"));
@@ -793,6 +869,40 @@ impl SstReader {
         }
         Ok(out)
     }
+
+    fn get_from_block_handle_fast(
+        &self,
+        handle: BlockHandle,
+        user_key: &[u8],
+        snapshot_seqno: u64,
+    ) -> Result<Option<(u64, Option<Bytes>)>, SstError> {
+        if let Some(io_ctx) = self.io_ctx.as_ref() {
+            let mut buf = io_ctx.buf_pool.acquire(handle.len as usize);
+            buf.resize(handle.len as usize, 0u8);
+
+            let file = self
+                .io_file
+                .as_ref()
+                .ok_or(SstError::Corrupt("io ctx missing file"))?;
+
+            io_ctx
+                .io
+                .read_into_at_file_blocking(file, handle.offset, &mut buf)
+                .map_err(|_| SstError::Corrupt("io read"))?;
+
+            let payload = verified_block_payload(&buf)?;
+            return point_get_from_payload(payload, user_key, snapshot_seqno);
+        }
+
+        let start = handle.offset as usize;
+        let end = start + handle.len as usize;
+        if end > self.mmap.len() {
+            return Err(SstError::Corrupt("block handle out of bounds"));
+        }
+
+        let payload = verified_block_payload(&self.mmap[start..end])?;
+        point_get_from_payload(payload, user_key, snapshot_seqno)
+    }
 }
 
 pub struct SstIter<'a> {
@@ -800,7 +910,7 @@ pub struct SstIter<'a> {
     snapshot_seqno: u64,
     index_pos: usize,
     seek_target: Option<InternalKey>,
-    entries: Vec<(InternalKey, Bytes)>,
+    entries: Arc<Vec<(InternalKey, Bytes)>>,
     entry_pos: usize,
 }
 
@@ -808,7 +918,7 @@ impl<'a> SstIter<'a> {
     pub fn seek_to_first(&mut self) {
         self.index_pos = 0;
         self.seek_target = None;
-        self.entries.clear();
+        self.entries = Arc::new(Vec::new());
         self.entry_pos = 0;
     }
 
@@ -828,7 +938,7 @@ impl<'a> SstIter<'a> {
             lo
         };
         self.seek_target = Some(target);
-        self.entries.clear();
+        self.entries = Arc::new(Vec::new());
         self.entry_pos = 0;
     }
 
@@ -857,7 +967,7 @@ impl<'a> SstIter<'a> {
                 continue;
             }
 
-            let (ikey, value) = self.entries[self.entry_pos].clone();
+            let (ikey, value) = &self.entries[self.entry_pos];
             self.entry_pos += 1;
             if ikey.seqno > self.snapshot_seqno {
                 continue;
@@ -868,7 +978,7 @@ impl<'a> SstIter<'a> {
                 KeyKind::RangeDel => crate::db::OpKind::RangeDel,
                 _ => continue,
             };
-            return Some(Ok((ikey.user_key, ikey.seqno, kind, value)));
+            return Some(Ok((ikey.user_key.clone(), ikey.seqno, kind, value.clone())));
         }
     }
 }

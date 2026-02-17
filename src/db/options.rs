@@ -140,7 +140,7 @@ impl Default for DbOptions {
             io_backend: crate::io::IoBackend::Uring,
             sst_use_io_executor_reads: cfg!(target_os = "linux"),
             sst_use_io_executor_writes: cfg!(target_os = "linux"),
-            s3: None,
+            s3: S3Options::from_env(),
         }
     }
 }

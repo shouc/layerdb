@@ -112,9 +112,14 @@ fn gc_s3_cli_removes_orphan() -> anyhow::Result<()> {
         assert!(moved >= 1);
     }
 
-    let orphan_path = dir.path().join("sst_s3").join("sst_deadbeef00000001.sst");
-    std::fs::create_dir_all(orphan_path.parent().expect("parent"))?;
-    std::fs::write(&orphan_path, b"orphan")?;
+    let orphan_path = dir
+        .path()
+        .join("sst_s3")
+        .join("L1")
+        .join("L1-deadbeef00000001");
+    std::fs::create_dir_all(&orphan_path)?;
+    std::fs::write(orphan_path.join("meta.bin"), b"orphan-meta")?;
+    std::fs::write(orphan_path.join("sb_00000000.bin"), b"orphan-sb")?;
     assert!(orphan_path.exists());
 
     let gc = Command::new(layerdb_bin()?)

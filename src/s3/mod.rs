@@ -145,6 +145,20 @@ impl ObjectStore for LocalObjectStore {
         let path = self.key_path(key);
         if path.exists() {
             std::fs::remove_file(path)?;
+            let mut parent = self.key_path(key).parent().map(PathBuf::from);
+            while let Some(dir) = parent {
+                if dir == self.root {
+                    break;
+                }
+                match std::fs::remove_dir(&dir) {
+                    Ok(_) => {
+                        parent = dir.parent().map(PathBuf::from);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(err) => return Err(err.into()),
+                }
+            }
         }
         Ok(())
     }

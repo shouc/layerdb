@@ -33,6 +33,15 @@ python3 scripts/bench_milvus.py \
   --dataset /tmp/vectordb_dataset.json --k 10 --nprobe 8 --nlist 64 --update-batch 1
 ```
 
+## Production Notes (LayerDB-backed SPFresh)
+- `SpFreshLayerDbConfig::default()` is durability-first:
+  - `db_options.fsync_writes=true`
+  - `write_sync=true`
+- prefer fallible APIs in services:
+  - `try_upsert`, `try_delete`, `try_bulk_load`
+  - `close` for graceful worker shutdown + final rebuild
+  - `health_check` and `stats` for operational monitoring
+
 SAQ paper-style validation (vs uniform ablation):
 ```bash
 cargo run -p vectordb --bin vectordb-cli -- saq-validate \

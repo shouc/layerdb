@@ -18,6 +18,7 @@ Implementation details:
 - persisted vector key format: `spfresh/v/{id}`
 - payload: serialized `VectorRecord`
 - updates and deletes are gated by a shared mutex so persistence and in-memory mutation stay ordered
+- default durability uses synchronous writes (`write_sync=true`) and LayerDB WAL fsync (`db_options.fsync_writes=true`)
 
 ### 2) Background Rebuilder (`spawn_rebuilder` + `rebuild_once`)
 Responsibilities:
@@ -29,6 +30,7 @@ Trigger modes:
 - signal-based (`pending_ops` reaches threshold)
 - optional interval checks
 - explicit synchronous trigger (`force_rebuild`) for benchmark checkpoints
+- explicit shutdown path (`close`) performs final rebuild after worker join
 
 ### 3) LayerDB Block/Storage Controller
 LayerDB is used as the persistent block controller equivalent:
@@ -54,6 +56,15 @@ This provides crash recovery without replaying external logs in `vectordb`.
 4. Updater increments pending counter.
 5. Rebuilder receives signal and rebuilds index from LayerDB snapshot.
 6. Search serves from latest in-memory index.
+
+## Production Ops Hooks
+- `stats()` returns operation and rebuild counters:
+  - `total_upserts`, `total_deletes`, `persist_errors`
+  - `rebuild_successes`, `rebuild_failures`, `last_rebuild_rows`, `pending_ops`
+- `health_check()` validates:
+  - WAL directory and at least one WAL segment exist
+  - persisted SPFresh metadata matches runtime config
+  - returns current stats snapshot on success
 
 ## Relationship to SPFresh Paper Architecture (arXiv:2410.14452v1)
 This implementation follows the same system split:

@@ -52,7 +52,7 @@ impl Default for SpFreshLayerDbConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpFreshLayerDbStats {
     pub total_upserts: u64,
     pub total_deletes: u64,

@@ -33,6 +33,13 @@ python3 scripts/bench_milvus.py \
   --dataset /tmp/vectordb_dataset.json --k 10 --nprobe 8 --nlist 64 --update-batch 1
 ```
 
+Check SPFresh LayerDB index health:
+```bash
+cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
+  --db /path/to/spfresh-index --dim 64 --initial-postings 64 --split-limit 512 \
+  --merge-limit 64 --reassign-range 64 --nprobe 8 --kmeans-iters 8
+```
+
 ## Production Notes (LayerDB-backed SPFresh)
 - `SpFreshLayerDbConfig::default()` is durability-first:
   - `db_options.fsync_writes=true`

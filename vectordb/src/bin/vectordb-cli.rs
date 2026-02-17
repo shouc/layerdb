@@ -27,6 +27,7 @@ enum Command {
     Bench(BenchArgs),
     SaqValidate(SaqValidateArgs),
     DumpDataset(DumpDatasetArgs),
+    SpfreshHealth(SpfreshHealthArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -99,6 +100,26 @@ struct DumpDatasetArgs {
     seed: u64,
 }
 
+#[derive(Debug, Parser)]
+struct SpfreshHealthArgs {
+    #[arg(long)]
+    db: String,
+    #[arg(long, default_value_t = 64)]
+    dim: usize,
+    #[arg(long, default_value_t = 64)]
+    initial_postings: usize,
+    #[arg(long, default_value_t = 512)]
+    split_limit: usize,
+    #[arg(long, default_value_t = 64)]
+    merge_limit: usize,
+    #[arg(long, default_value_t = 64)]
+    reassign_range: usize,
+    #[arg(long, default_value_t = 8)]
+    nprobe: usize,
+    #[arg(long, default_value_t = 8)]
+    kmeans_iters: usize,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -108,6 +129,7 @@ fn main() -> Result<()> {
         Command::Bench(args) => run_bench(&args)?,
         Command::SaqValidate(args) => run_saq_validate(&args)?,
         Command::DumpDataset(args) => run_dump_dataset(&args)?,
+        Command::SpfreshHealth(args) => run_spfresh_health(&args)?,
     }
     Ok(())
 }
@@ -272,6 +294,27 @@ fn run_dump_dataset(args: &DumpDatasetArgs) -> Result<()> {
         "wrote dataset to {} (dim={} base={} updates={} queries={} seed={})",
         args.out, args.dim, args.base, args.updates, args.queries, args.seed
     );
+    Ok(())
+}
+
+fn run_spfresh_health(args: &SpfreshHealthArgs) -> Result<()> {
+    let cfg = SpFreshLayerDbConfig {
+        spfresh: SpFreshConfig {
+            dim: args.dim,
+            initial_postings: args.initial_postings,
+            split_limit: args.split_limit,
+            merge_limit: args.merge_limit,
+            reassign_range: args.reassign_range,
+            nprobe: args.nprobe,
+            kmeans_iters: args.kmeans_iters,
+        },
+        ..Default::default()
+    };
+
+    let idx = SpFreshLayerDbIndex::open(&args.db, cfg)?;
+    let health = idx.health_check()?;
+    println!("{}", serde_json::to_string_pretty(&health)?);
+    idx.close()?;
     Ok(())
 }
 

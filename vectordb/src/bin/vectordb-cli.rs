@@ -97,6 +97,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
     stats.push(bench_spfresh(args, &data, &exact_answers));
     stats.push(bench_append_only(args, &data, &exact_answers));
     stats.push(bench_saq(args, &data, &exact_answers));
+    stats.push(bench_saq_uniform(args, &data, &exact_answers));
 
     println!(
         "vectordb bench dim={} base={} updates={} queries={} k={}",
@@ -256,6 +257,51 @@ fn bench_saq(
 
     EngineStats {
         name: "saq",
+        build_ms,
+        update_qps,
+        search_qps,
+        avg_recall: recall_sum / data.queries.len() as f64,
+    }
+}
+
+fn bench_saq_uniform(
+    args: &BenchArgs,
+    data: &vectordb::dataset::SyntheticDataset,
+    exact_answers: &[Vec<vectordb::Neighbor>],
+) -> EngineStats {
+    let cfg = SaqConfig {
+        dim: args.dim,
+        total_bits: args.saq_total_bits,
+        ivf_clusters: args.saq_ivf_clusters,
+        nprobe: args.nprobe,
+        use_joint_dp: false,
+        use_variance_permutation: false,
+        caq_rounds: 0,
+        ..Default::default()
+    };
+
+    let build_start = Instant::now();
+    let mut index = SaqIndex::build(cfg, &data.base);
+    let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
+
+    let update_start = Instant::now();
+    for (id, v) in &data.updates {
+        index.upsert(*id, v.clone());
+    }
+    let update_s = update_start.elapsed().as_secs_f64().max(1e-9);
+    let update_qps = data.updates.len() as f64 / update_s;
+
+    let search_start = Instant::now();
+    let mut recall_sum = 0.0f64;
+    for (i, q) in data.queries.iter().enumerate() {
+        let got = index.search(q, exact_answers[i].len());
+        recall_sum += recall_at_k(&got, &exact_answers[i], got.len()) as f64;
+    }
+    let search_s = search_start.elapsed().as_secs_f64().max(1e-9);
+    let search_qps = data.queries.len() as f64 / search_s;
+
+    EngineStats {
+        name: "saq-uniform",
         build_ms,
         update_qps,
         search_qps,

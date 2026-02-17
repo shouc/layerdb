@@ -15,6 +15,8 @@ pub struct SaqConfig {
     pub nprobe: usize,
     pub caq_rounds: usize,
     pub train_sample: usize,
+    pub use_joint_dp: bool,
+    pub use_variance_permutation: bool,
 }
 
 impl Default for SaqConfig {
@@ -30,6 +32,8 @@ impl Default for SaqConfig {
             nprobe: 8,
             caq_rounds: 1,
             train_sample: 50_000,
+            use_joint_dp: true,
+            use_variance_permutation: true,
         }
     }
 }
@@ -249,10 +253,16 @@ fn train_plan(cfg: &SaqConfig, sample: &[Vec<f32>]) -> SaqPlan {
     let dim = cfg.dim;
     let variances = dimension_variances(sample, dim);
     let mut ordered: Vec<usize> = (0..dim).collect();
-    ordered.sort_by(|a, b| variances[*b].total_cmp(&variances[*a]));
+    if cfg.use_variance_permutation {
+        ordered.sort_by(|a, b| variances[*b].total_cmp(&variances[*a]));
+    }
 
     let reordered_vars: Vec<f32> = ordered.iter().map(|i| variances[*i]).collect();
-    let segments = allocate_joint_segments(cfg, &reordered_vars);
+    let segments = if cfg.use_joint_dp {
+        allocate_joint_segments(cfg, &reordered_vars)
+    } else {
+        uniform_segments(cfg, dim)
+    };
     let mut inv = vec![0usize; dim];
     for (new_idx, old_idx) in ordered.iter().enumerate() {
         inv[*old_idx] = new_idx;
@@ -263,6 +273,32 @@ fn train_plan(cfg: &SaqConfig, sample: &[Vec<f32>]) -> SaqPlan {
         inv_dim_order: inv,
         segments,
     }
+}
+
+fn uniform_segments(cfg: &SaqConfig, dim: usize) -> Vec<SaqSegment> {
+    let mut bits = cfg.total_bits / dim.max(1);
+    bits = bits.max(cfg.min_bits_per_dim);
+    bits = bits.min(cfg.max_bits_per_dim);
+    let mut out = Vec::new();
+    let seg_size = cfg.max_dims_per_segment.max(cfg.min_dims_per_segment).min(dim.max(1));
+    let mut start = 0usize;
+    while start < dim {
+        let len = (dim - start).min(seg_size);
+        out.push(SaqSegment {
+            start_dim: start,
+            dim_count: len,
+            bits,
+        });
+        start += len;
+    }
+    if out.is_empty() {
+        out.push(SaqSegment {
+            start_dim: 0,
+            dim_count: dim,
+            bits,
+        });
+    }
+    out
 }
 
 fn dimension_variances(sample: &[Vec<f32>], dim: usize) -> Vec<f32> {

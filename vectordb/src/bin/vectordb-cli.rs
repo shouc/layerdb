@@ -22,6 +22,7 @@ struct Cli {
 enum Command {
     Version,
     Bench(BenchArgs),
+    SaqValidate(SaqValidateArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -54,6 +55,26 @@ struct BenchArgs {
     saq_ivf_clusters: usize,
 }
 
+#[derive(Debug, Parser)]
+struct SaqValidateArgs {
+    #[arg(long, default_value_t = 96)]
+    dim: usize,
+    #[arg(long, default_value_t = 25_000)]
+    base: usize,
+    #[arg(long, default_value_t = 500)]
+    queries: usize,
+    #[arg(long, default_value_t = 10)]
+    k: usize,
+    #[arg(long, default_value_t = 42_u64)]
+    seed: u64,
+    #[arg(long, default_value_t = 256)]
+    total_bits: usize,
+    #[arg(long, default_value_t = 128)]
+    ivf_clusters: usize,
+    #[arg(long, default_value_t = 12)]
+    nprobe: usize,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -61,6 +82,7 @@ fn main() -> Result<()> {
             println!("{}", vectordb::VERSION);
         }
         Command::Bench(args) => run_bench(&args)?,
+        Command::SaqValidate(args) => run_saq_validate(&args)?,
     }
     Ok(())
 }
@@ -126,6 +148,92 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
 using append-only partition baseline as pinecore-like reference."
     );
 
+    Ok(())
+}
+
+fn run_saq_validate(args: &SaqValidateArgs) -> Result<()> {
+    if args.k == 0 {
+        anyhow::bail!("--k must be > 0");
+    }
+
+    let (base, queries) = generate_anisotropic(args.seed, args.base, args.queries, args.dim);
+    let exact_answers: Vec<Vec<vectordb::Neighbor>> = queries
+        .iter()
+        .map(|q| exact_knn(&base, q, args.k))
+        .collect();
+
+    let saq_cfg = SaqConfig {
+        dim: args.dim,
+        total_bits: args.total_bits,
+        ivf_clusters: args.ivf_clusters,
+        nprobe: args.nprobe,
+        use_joint_dp: true,
+        use_variance_permutation: true,
+        caq_rounds: 1,
+        ..Default::default()
+    };
+    let uniform_cfg = SaqConfig {
+        dim: args.dim,
+        total_bits: args.total_bits,
+        ivf_clusters: args.ivf_clusters,
+        nprobe: args.nprobe,
+        use_joint_dp: false,
+        use_variance_permutation: false,
+        caq_rounds: 0,
+        ..Default::default()
+    };
+
+    let saq_build_start = Instant::now();
+    let saq_index = SaqIndex::build(saq_cfg, &base);
+    let saq_build_ms = saq_build_start.elapsed().as_secs_f64() * 1000.0;
+
+    let uniform_build_start = Instant::now();
+    let uniform_index = SaqIndex::build(uniform_cfg, &base);
+    let uniform_build_ms = uniform_build_start.elapsed().as_secs_f64() * 1000.0;
+
+    let base_vectors: Vec<Vec<f32>> = base.iter().map(|r| r.values.clone()).collect();
+    let saq_mse = saq_index.quantization_mse(&base_vectors).unwrap_or(f64::NAN);
+    let uniform_mse = uniform_index.quantization_mse(&base_vectors).unwrap_or(f64::NAN);
+
+    let saq_search_start = Instant::now();
+    let mut saq_recall = 0.0f64;
+    for (i, q) in queries.iter().enumerate() {
+        let got = saq_index.search(q, args.k);
+        saq_recall += recall_at_k(&got, &exact_answers[i], args.k) as f64;
+    }
+    let saq_search_qps = queries.len() as f64 / saq_search_start.elapsed().as_secs_f64().max(1e-9);
+
+    let uniform_search_start = Instant::now();
+    let mut uniform_recall = 0.0f64;
+    for (i, q) in queries.iter().enumerate() {
+        let got = uniform_index.search(q, args.k);
+        uniform_recall += recall_at_k(&got, &exact_answers[i], args.k) as f64;
+    }
+    let uniform_search_qps =
+        queries.len() as f64 / uniform_search_start.elapsed().as_secs_f64().max(1e-9);
+
+    println!(
+        "saq-validate dim={} base={} queries={} k={} total_bits={}",
+        args.dim, args.base, args.queries, args.k, args.total_bits
+    );
+    println!(
+        "{:<14} {:>10} {:>10} {:>12} {:>12}",
+        "variant", "build ms", "mse", "search qps", "recall@k"
+    );
+    println!(
+        "{:<14} {:>10.1} {:>10.6} {:>12.0} {:>12.4}",
+        "saq", saq_build_ms, saq_mse, saq_search_qps, saq_recall / queries.len() as f64
+    );
+    println!(
+        "{:<14} {:>10.1} {:>10.6} {:>12.0} {:>12.4}",
+        "uniform", uniform_build_ms, uniform_mse, uniform_search_qps, uniform_recall / queries.len() as f64
+    );
+    println!();
+    println!("validation design:");
+    println!("- anisotropic dataset: larger variance in leading dimensions");
+    println!("- same IVF cluster count, nprobe, and bit budget for both variants");
+    println!("- SAQ variant enables joint DP + variance-aware ordering + CAQ");
+    println!("- uniform variant disables those paper-specific components");
     Ok(())
 }
 
@@ -307,4 +415,48 @@ fn bench_saq_uniform(
         search_qps,
         avg_recall: recall_sum / data.queries.len() as f64,
     }
+}
+
+fn generate_anisotropic(
+    seed: u64,
+    base_count: usize,
+    query_count: usize,
+    dim: usize,
+) -> (Vec<VectorRecord>, Vec<Vec<f32>>) {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut base = Vec::with_capacity(base_count);
+    for id in 0..base_count as u64 {
+        let mut values = Vec::with_capacity(dim);
+        for d in 0..dim {
+            let scale = if d < dim / 4 {
+                3.0
+            } else if d < dim / 2 {
+                1.5
+            } else {
+                0.5
+            };
+            values.push(rng.gen_range(-1.0..1.0) * scale);
+        }
+        base.push(VectorRecord::new(id, values));
+    }
+
+    let mut queries = Vec::with_capacity(query_count);
+    for _ in 0..query_count {
+        let mut q = Vec::with_capacity(dim);
+        for d in 0..dim {
+            let scale = if d < dim / 4 {
+                3.0
+            } else if d < dim / 2 {
+                1.5
+            } else {
+                0.5
+            };
+            q.push(rng.gen_range(-1.0..1.0) * scale);
+        }
+        queries.push(q);
+    }
+    (base, queries)
 }

@@ -88,6 +88,24 @@ impl SaqIndex {
         self.plan.as_ref()
     }
 
+    pub fn quantization_mse(&self, vectors: &[Vec<f32>]) -> Option<f64> {
+        let plan = self.plan.as_ref()?;
+        if vectors.is_empty() {
+            return Some(0.0);
+        }
+        let mut total = 0.0f64;
+        for v in vectors {
+            if v.len() != self.cfg.dim {
+                continue;
+            }
+            let enc = encode_vector(plan, v, self.cfg.caq_rounds);
+            let decoded_reordered = decode_reordered(plan, &enc.codes, enc.v_max);
+            let decoded = restore_order(&decoded_reordered, &plan.inv_dim_order);
+            total += squared_l2(v, &decoded) as f64 / self.cfg.dim as f64;
+        }
+        Some(total / vectors.len() as f64)
+    }
+
     pub fn build(cfg: SaqConfig, base: &[VectorRecord]) -> Self {
         let mut out = Self::new(cfg);
         if base.is_empty() {
@@ -372,7 +390,8 @@ fn allocate_joint_segments(cfg: &SaqConfig, dim_variances: &[f32]) -> Vec<SaqSeg
                 let distortion = if bits == 0 {
                     var_sum
                 } else {
-                    var_sum / ((1usize << bits) as f32 * std::f32::consts::PI)
+                    // MSE-oriented scalar quantization surrogate: error scales with 2^(-2b).
+                    var_sum / ((1usize << (2 * bits)) as f32)
                 };
                 for q_prev in 0..=(q - bit_cost) {
                     if !dp[d_start][q_prev].is_finite() {
@@ -544,6 +563,14 @@ fn reorder(values: &[f32], order: &[usize]) -> Vec<f32> {
     out
 }
 
+fn restore_order(values_reordered: &[f32], inv_order: &[usize]) -> Vec<f32> {
+    let mut out = vec![0.0; values_reordered.len()];
+    for (old_idx, new_idx) in inv_order.iter().enumerate() {
+        out[old_idx] = values_reordered[*new_idx];
+    }
+    out
+}
+
 fn kmeans(vectors: &[Vec<f32>], k: usize, iters: usize) -> Vec<Vec<f32>> {
     if vectors.is_empty() {
         return Vec::new();
@@ -636,5 +663,9 @@ mod tests {
         let got = idx.search(&[0.8, 0.0, 0.0, 0.0], 2);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].id, 2);
+        let mse = idx
+            .quantization_mse(&base.iter().map(|r| r.values.clone()).collect::<Vec<_>>())
+            .unwrap();
+        assert!(mse.is_finite());
     }
 }

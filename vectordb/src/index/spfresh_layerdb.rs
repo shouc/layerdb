@@ -27,10 +27,10 @@ impl Default for SpFreshLayerDbConfig {
         Self {
             spfresh: SpFreshConfig::default(),
             db_options: DbOptions {
-                fsync_writes: false,
+                fsync_writes: true,
                 ..Default::default()
             },
-            write_sync: false,
+            write_sync: true,
             rebuild_pending_ops: 2_000,
             rebuild_interval: Duration::from_millis(500),
         }
@@ -50,7 +50,9 @@ pub struct SpFreshLayerDbIndex {
 
 impl SpFreshLayerDbIndex {
     pub fn open(path: impl AsRef<Path>, cfg: SpFreshLayerDbConfig) -> anyhow::Result<Self> {
-        let db = Db::open(path, cfg.db_options.clone()).context("open layerdb for spfresh")?;
+        let db_path = path.as_ref();
+        let db = Db::open(db_path, cfg.db_options.clone()).context("open layerdb for spfresh")?;
+        ensure_wal_exists(db_path)?;
         refresh_read_snapshot(&db)?;
         let rows = load_rows(&db)?;
         let index = SpFreshIndex::build(cfg.spfresh.clone(), &rows);
@@ -299,6 +301,32 @@ fn refresh_read_snapshot(db: &Db) -> anyhow::Result<()> {
     .context("refresh layerdb read snapshot for recovery")
 }
 
+fn ensure_wal_exists(path: &Path) -> anyhow::Result<()> {
+    let wal_dir = path.join("wal");
+    if !wal_dir.is_dir() {
+        anyhow::bail!("layerdb wal directory missing at {}", wal_dir.display());
+    }
+
+    let mut has_segment = false;
+    for entry in std::fs::read_dir(&wal_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("wal_") && name.ends_with(".log") {
+            has_segment = true;
+            break;
+        }
+    }
+
+    if !has_segment {
+        anyhow::bail!("layerdb wal contains no segment files in {}", wal_dir.display());
+    }
+    Ok(())
+}
+
 fn vector_key(id: u64) -> String {
     format!("{VECTOR_PREFIX}{id:020}")
 }
@@ -326,6 +354,8 @@ fn lock_write<T>(m: &Arc<RwLock<T>>) -> RwLockWriteGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::TempDir;
 
     use crate::types::VectorIndex;
@@ -349,6 +379,32 @@ mod tests {
         assert_eq!(idx.len(), 1);
         let got = idx.search(&vec![1.0; 64], 1);
         assert_eq!(got[0].id, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn wal_persists_indexed_vectors_across_restart() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let cfg = SpFreshLayerDbConfig::default();
+
+        {
+            let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+            idx.upsert(11, vec![0.25; cfg.spfresh.dim]);
+            idx.upsert(12, vec![0.5; cfg.spfresh.dim]);
+        }
+
+        let wal_dir = dir.path().join("wal");
+        assert!(wal_dir.is_dir());
+        let has_segment = fs::read_dir(&wal_dir)?
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .any(|name| name.starts_with("wal_") && name.ends_with(".log"));
+        assert!(has_segment, "expected wal segment in {}", wal_dir.display());
+
+        let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
+        assert_eq!(idx.len(), 2);
+        let got = idx.search(&vec![0.5; 64], 1);
+        assert_eq!(got[0].id, 12);
         Ok(())
     }
 }

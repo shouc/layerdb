@@ -3,9 +3,7 @@ use layerdb::{Db, DbOptions, ReadOptions, WriteOptions};
 
 fn minio_enabled() -> bool {
     matches!(
-        std::env::var("LAYERDB_MINIO_INTEGRATION")
-            .ok()
-            .as_deref(),
+        std::env::var("LAYERDB_MINIO_INTEGRATION").ok().as_deref(),
         Some("1") | Some("true") | Some("yes")
     )
 }

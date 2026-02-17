@@ -9,8 +9,8 @@
 //! an actual CLOCK-Pro implementation later without touching call-sites.
 
 use std::hash::Hash;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use lru::LruCache;
 use parking_lot::Mutex;

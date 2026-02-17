@@ -301,7 +301,11 @@ impl SpFreshIndex {
                 if !cond2 {
                     continue;
                 }
-                let (best, best_dist) = if d_a <= d_b { (new_a, d_a) } else { (new_b, d_b) };
+                let (best, best_dist) = if d_a <= d_b {
+                    (new_a, d_a)
+                } else {
+                    (new_b, d_b)
+                };
                 let current_dist = squared_l2(&v.values, &current_centroid);
                 if best_dist < current_dist {
                     reassign.push((*vid, *pid, best));
@@ -378,7 +382,8 @@ impl VectorIndex for SpFreshIndex {
         if self.vectors.contains_key(&id) {
             let _ = self.delete(id);
         }
-        self.vectors.insert(id, VectorRecord::new(id, vector.clone()));
+        self.vectors
+            .insert(id, VectorRecord::new(id, vector.clone()));
 
         let posting = self
             .nearest_postings(&vector, 1)
@@ -426,7 +431,11 @@ impl VectorIndex for SpFreshIndex {
             }
         }
 
-        out.sort_by(|a, b| a.distance.total_cmp(&b.distance).then_with(|| a.id.cmp(&b.id)));
+        out.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         out.truncate(k);
         out
     }

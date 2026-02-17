@@ -118,7 +118,7 @@ fn collect_iter(db: &Db, snap: Option<layerdb::SnapshotId>) -> anyhow::Result<Ve
     let mut iter = db.iter(Range::all(), ReadOptions { snapshot: snap })?;
     iter.seek_to_first();
     let mut out = Vec::new();
-    while let Some(next) = iter.next() {
+    for next in iter {
         let (k, v) = next?;
         if let Some(v) = v {
             out.push((k, v));

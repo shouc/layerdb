@@ -43,7 +43,7 @@ fn preload(db: &Db, n: u32) {
 fn bench_fill(c: &mut Criterion) {
     c.bench_function("fill/100k", |b| {
         b.iter_batched(
-            || open_temp_db(),
+            open_temp_db,
             |(_dir, db)| {
                 preload(&db, 100_000);
             },
@@ -94,7 +94,7 @@ fn bench_readseq(c: &mut Criterion) {
                     )
                     .expect("iter");
                 iter.seek_to_first();
-                while let Some(next) = iter.next() {
+                for next in iter {
                     let _ = next.expect("next");
                 }
             },
@@ -165,7 +165,7 @@ fn bench_scan_heavy(c: &mut Criterion) {
                         )
                         .expect("iter");
                     iter.seek_to_first();
-                    while let Some(next) = iter.next() {
+                    for next in iter {
                         let _ = next.expect("next");
                     }
                 }

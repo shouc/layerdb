@@ -114,7 +114,7 @@ fn iter_returns_latest_visible_per_key() -> anyhow::Result<()> {
     iter.seek_to_first();
 
     let mut out = Vec::new();
-    while let Some(next) = iter.next() {
+    for next in iter {
         let (k, v) = next?;
         out.push((k, v));
     }
@@ -161,7 +161,7 @@ fn range_tombstones_hide_keys_across_snapshots() -> anyhow::Result<()> {
     let mut iter = db.iter(Range::all(), ReadOptions::default())?;
     iter.seek_to_first();
     let mut keys = Vec::new();
-    while let Some(next) = iter.next() {
+    for next in iter {
         let (k, v) = next?;
         if v.is_some() {
             keys.push(k);
@@ -199,10 +199,16 @@ fn compaction_drops_obsolete_range_tombstones_without_snapshots() -> anyhow::Res
     db.put(&b"z"[..], &b"9"[..], WriteOptions { sync: true })?;
     db.compact_range(None)?;
 
-    assert_eq!(db.get(b"a", ReadOptions::default())?, Some(bytes::Bytes::from("1")));
+    assert_eq!(
+        db.get(b"a", ReadOptions::default())?,
+        Some(bytes::Bytes::from("1"))
+    );
     assert_eq!(db.get(b"b", ReadOptions::default())?, None);
     assert_eq!(db.get(b"c", ReadOptions::default())?, None);
-    assert_eq!(db.get(b"z", ReadOptions::default())?, Some(bytes::Bytes::from("9")));
+    assert_eq!(
+        db.get(b"z", ReadOptions::default())?,
+        Some(bytes::Bytes::from("9"))
+    );
 
     assert_eq!(total_range_tombstones_in_sst_dir(dir.path())?, 0);
 

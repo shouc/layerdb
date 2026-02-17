@@ -1,5 +1,5 @@
-pub mod manifest;
 mod iter;
+pub mod manifest;
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
@@ -184,7 +184,8 @@ impl VersionSet {
 
         let branch_archives = state.branch_archives;
 
-        let sst_io_ctx = if options.sst_use_io_executor_reads || options.sst_use_io_executor_writes {
+        let sst_io_ctx = if options.sst_use_io_executor_reads || options.sst_use_io_executor_writes
+        {
             let io = crate::io::UringExecutor::with_backend(
                 options.io_max_in_flight.max(1),
                 options.io_backend,
@@ -210,8 +211,9 @@ impl VersionSet {
             None
         };
 
-        let s3_store = crate::s3::S3ObjectStore::for_options(options.s3.clone(), dir.join("sst_s3"))
-            .context("initialize s3 object store")?;
+        let s3_store =
+            crate::s3::S3ObjectStore::for_options(options.s3.clone(), dir.join("sst_s3"))
+                .context("initialize s3 object store")?;
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -332,11 +334,7 @@ impl VersionSet {
     }
 
     pub fn list_branch_archives(&self) -> Vec<BranchArchive> {
-        self.branch_archives
-            .read()
-            .values()
-            .cloned()
-            .collect()
+        self.branch_archives.read().values().cloned().collect()
     }
 
     pub fn add_branch_archive(&self, archive: BranchArchive) -> anyhow::Result<()> {
@@ -1236,7 +1234,11 @@ impl VersionSet {
                 }
                 let hash = blake3::hash(&data);
                 if hash.as_bytes() != sb.hash.as_slice() {
-                    anyhow::bail!("superblock hash mismatch for {} sb={}", meta.object_id, sb.id);
+                    anyhow::bail!(
+                        "superblock hash mismatch for {} sb={}",
+                        meta.object_id,
+                        sb.id
+                    );
                 }
                 out.write_all(&data)
                     .with_context(|| format!("write dst tmp {}", dst_tmp.display()))?;
@@ -1411,7 +1413,6 @@ impl VersionSet {
         l1: Vec<AddFile>,
         _range: Option<&Range>,
     ) -> anyhow::Result<()> {
-
         if l0_in_range.is_empty() {
             return Ok(());
         }

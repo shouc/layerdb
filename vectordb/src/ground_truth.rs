@@ -16,7 +16,11 @@ pub fn exact_knn(records: &[VectorRecord], query: &[f32], k: usize) -> Vec<Neigh
             distance: squared_l2(&r.values, query),
         })
         .collect();
-    out.sort_by(|a, b| a.distance.total_cmp(&b.distance).then_with(|| a.id.cmp(&b.id)));
+    out.sort_by(|a, b| {
+        a.distance
+            .total_cmp(&b.distance)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     out.truncate(k);
     out
 }

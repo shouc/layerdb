@@ -138,7 +138,10 @@ fn create_branch_cli_rejects_future_seqno() -> anyhow::Result<()> {
         ])
         .output()?;
 
-    assert!(!create.status.success(), "future seqno unexpectedly succeeded");
+    assert!(
+        !create.status.success(),
+        "future seqno unexpectedly succeeded"
+    );
     let stderr = String::from_utf8_lossy(&create.stderr);
     assert!(
         stderr.contains("ahead of latest"),
@@ -147,7 +150,6 @@ fn create_branch_cli_rejects_future_seqno() -> anyhow::Result<()> {
 
     Ok(())
 }
-
 
 #[test]
 fn create_branch_cli_rejects_conflicting_source_flags() -> anyhow::Result<()> {
@@ -181,7 +183,10 @@ fn create_branch_cli_rejects_conflicting_source_flags() -> anyhow::Result<()> {
         ])
         .output()?;
 
-    assert!(!create.status.success(), "conflicting flags unexpectedly succeeded");
+    assert!(
+        !create.status.success(),
+        "conflicting flags unexpectedly succeeded"
+    );
     let stderr = String::from_utf8_lossy(&create.stderr);
     assert!(
         stderr.contains("cannot be used with") || stderr.contains("mutually exclusive"),

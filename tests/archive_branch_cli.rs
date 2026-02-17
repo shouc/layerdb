@@ -103,7 +103,7 @@ fn archive_branch_cli_exports_branch_snapshot_sst() -> anyhow::Result<()> {
     iter.seek_to_first();
 
     let mut items = Vec::new();
-    while let Some(next) = iter.next() {
+    for next in iter {
         let (key, _seq, _kind, value) = next?;
         items.push((key, value));
     }

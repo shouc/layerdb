@@ -79,7 +79,10 @@ fn checkout_cli_rejects_unknown_branch() -> anyhow::Result<()> {
         ])
         .output()?;
 
-    assert!(!checkout.status.success(), "checkout unexpectedly succeeded");
+    assert!(
+        !checkout.status.success(),
+        "checkout unexpectedly succeeded"
+    );
     let stderr = String::from_utf8_lossy(&checkout.stderr);
     assert!(
         stderr.contains("unknown branch"),

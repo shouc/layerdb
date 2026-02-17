@@ -32,7 +32,7 @@ fn reader_populates_data_block_cache() {
     assert_eq!(cache.len(), 0);
     let got = reader.get(b"k0000", u64::MAX).expect("get");
     assert_eq!(got.and_then(|(_, v)| v), Some(Bytes::from_static(b"v0000")));
-    assert!(cache.len() > 0);
+    assert!(!cache.is_empty());
 
     // A second read should still succeed while reusing cached blocks.
     let got2 = reader.get(b"k0001", u64::MAX).expect("get2");
@@ -40,5 +40,5 @@ fn reader_populates_data_block_cache() {
         got2.and_then(|(_, v)| v),
         Some(Bytes::from_static(b"v0001"))
     );
-    assert!(cache.len() > 0);
+    assert!(!cache.is_empty());
 }

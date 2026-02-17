@@ -146,7 +146,8 @@ impl VectorIndex for AppendOnlyIndex {
             return;
         }
         let _ = self.delete(id);
-        self.vectors.insert(id, VectorRecord::new(id, vector.clone()));
+        self.vectors
+            .insert(id, VectorRecord::new(id, vector.clone()));
         let posting = self
             .nearest_postings(&vector, 1)
             .first()
@@ -187,7 +188,11 @@ impl VectorIndex for AppendOnlyIndex {
                 });
             }
         }
-        out.sort_by(|a, b| a.distance.total_cmp(&b.distance).then_with(|| a.id.cmp(&b.id)));
+        out.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         out.truncate(k);
         out
     }

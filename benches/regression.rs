@@ -44,7 +44,7 @@ fn preload(db: &Db, n: u32) {
 fn bench_fill(c: &mut Criterion) {
     c.bench_function("fill/5k", |b| {
         b.iter_batched(
-            || open_temp_db(),
+            open_temp_db,
             |(_dir, db)| preload(&db, N),
             BatchSize::LargeInput,
         );
@@ -93,7 +93,7 @@ fn bench_readseq(c: &mut Criterion) {
                     )
                     .expect("iter");
                 iter.seek_to_first();
-                while let Some(next) = iter.next() {
+                for next in iter {
                     let _ = next.expect("next");
                 }
             },
@@ -133,7 +133,8 @@ fn bench_delete_heavy(c: &mut Criterion) {
                 let mut rng = StdRng::seed_from_u64(0xdead_beef);
                 for _ in 0..N {
                     let i: u32 = rng.gen_range(0..N);
-                    db.delete(key(i), WriteOptions { sync: false }).expect("del");
+                    db.delete(key(i), WriteOptions { sync: false })
+                        .expect("del");
                 }
             },
             BatchSize::LargeInput,
@@ -163,7 +164,7 @@ fn bench_scan_heavy(c: &mut Criterion) {
                         )
                         .expect("iter");
                     iter.seek_to_first();
-                    while let Some(next) = iter.next() {
+                    for next in iter {
                         let _ = next.expect("next");
                     }
                 }

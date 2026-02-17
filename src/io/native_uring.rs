@@ -706,7 +706,6 @@ impl NativeUring {
 
         Ok(offset)
     }
-
 }
 
 #[cfg(test)]

@@ -45,7 +45,10 @@ fn scan_cli_rejects_invalid_bounds() -> anyhow::Result<()> {
         ])
         .output()?;
 
-    assert!(!out.status.success(), "invalid scan bounds unexpectedly succeeded");
+    assert!(
+        !out.status.success(),
+        "invalid scan bounds unexpectedly succeeded"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("scan requires start < end"),

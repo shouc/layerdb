@@ -268,7 +268,11 @@ impl VectorIndex for SaqIndex {
                 });
             }
         }
-        out.sort_by(|a, b| a.distance.total_cmp(&b.distance).then_with(|| a.id.cmp(&b.id)));
+        out.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         out.truncate(k);
         out
     }

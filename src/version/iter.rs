@@ -20,7 +20,11 @@ pub struct SstIter {
 }
 
 impl SstIter {
-    pub(crate) fn new(paths: Vec<PathBuf>, snapshot_seqno: u64, range: Range) -> anyhow::Result<Self> {
+    pub(crate) fn new(
+        paths: Vec<PathBuf>,
+        snapshot_seqno: u64,
+        range: Range,
+    ) -> anyhow::Result<Self> {
         let bounds = crate::memtable::bounds_from_range(&range);
         let mut entries = Vec::new();
 

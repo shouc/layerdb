@@ -15,7 +15,7 @@ use crate::range_tombstone::RangeTombstone;
 
 mod iter;
 
-pub use iter::{MemTableIter, MergedMemAndSstIter, bounds_from_range};
+pub use iter::{bounds_from_range, MemTableIter, MergedMemAndSstIter};
 
 #[derive(Debug)]
 pub(crate) struct MemTableManager {

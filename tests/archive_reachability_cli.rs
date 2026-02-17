@@ -78,7 +78,11 @@ fn archive_list_drop_and_gc_cli_work() -> anyhow::Result<()> {
         .to_string();
 
     let list = Command::new(layerdb_bin()?)
-        .args(["list-archives", "--db", db_dir.path().to_str().expect("utf8 path")])
+        .args([
+            "list-archives",
+            "--db",
+            db_dir.path().to_str().expect("utf8 path"),
+        ])
         .output()?;
     assert!(
         list.status.success(),
@@ -87,7 +91,10 @@ fn archive_list_drop_and_gc_cli_work() -> anyhow::Result<()> {
         String::from_utf8_lossy(&list.stderr)
     );
     let list_stdout = String::from_utf8_lossy(&list.stdout);
-    assert!(list_stdout.contains(&format!("id={archive_id}")), "stdout={list_stdout}");
+    assert!(
+        list_stdout.contains(&format!("id={archive_id}")),
+        "stdout={list_stdout}"
+    );
 
     let drop = Command::new(layerdb_bin()?)
         .args([
@@ -106,7 +113,11 @@ fn archive_list_drop_and_gc_cli_work() -> anyhow::Result<()> {
     );
 
     let list_after_drop = Command::new(layerdb_bin()?)
-        .args(["list-archives", "--db", db_dir.path().to_str().expect("utf8 path")])
+        .args([
+            "list-archives",
+            "--db",
+            db_dir.path().to_str().expect("utf8 path"),
+        ])
         .output()?;
     assert!(list_after_drop.status.success());
     let list_after_drop_stdout = String::from_utf8_lossy(&list_after_drop.stdout);
@@ -142,7 +153,11 @@ fn archive_list_drop_and_gc_cli_work() -> anyhow::Result<()> {
     std::fs::remove_file(archived_path)?;
 
     let gc = Command::new(layerdb_bin()?)
-        .args(["gc-archives", "--db", db_dir.path().to_str().expect("utf8 path")])
+        .args([
+            "gc-archives",
+            "--db",
+            db_dir.path().to_str().expect("utf8 path"),
+        ])
         .output()?;
     assert!(
         gc.status.success(),
@@ -151,10 +166,17 @@ fn archive_list_drop_and_gc_cli_work() -> anyhow::Result<()> {
         String::from_utf8_lossy(&gc.stderr)
     );
     let gc_stdout = String::from_utf8_lossy(&gc.stdout);
-    assert!(gc_stdout.contains("gc_archives removed=1"), "stdout={gc_stdout}");
+    assert!(
+        gc_stdout.contains("gc_archives removed=1"),
+        "stdout={gc_stdout}"
+    );
 
     let list_after_gc = Command::new(layerdb_bin()?)
-        .args(["list-archives", "--db", db_dir.path().to_str().expect("utf8 path")])
+        .args([
+            "list-archives",
+            "--db",
+            db_dir.path().to_str().expect("utf8 path"),
+        ])
         .output()?;
     assert!(list_after_gc.status.success());
     let list_after_gc_stdout = String::from_utf8_lossy(&list_after_gc.stdout);

@@ -46,7 +46,10 @@ fn delete_range_cli_rejects_invalid_bounds() -> anyhow::Result<()> {
         ])
         .output()?;
 
-    assert!(!output.status.success(), "invalid bounds unexpectedly succeeded");
+    assert!(
+        !output.status.success(),
+        "invalid bounds unexpectedly succeeded"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("delete-range requires start < end"),
@@ -96,25 +99,49 @@ fn delete_range_cli_tombstones_half_open_span() -> anyhow::Result<()> {
     );
 
     let get_a = Command::new(layerdb_bin()?)
-        .args(["get", "--db", dir.path().to_str().expect("utf8 path"), "--key", "a"])
+        .args([
+            "get",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--key",
+            "a",
+        ])
         .output()?;
     assert!(get_a.status.success());
     assert!(String::from_utf8_lossy(&get_a.stdout).contains("value=1"));
 
     let get_b = Command::new(layerdb_bin()?)
-        .args(["get", "--db", dir.path().to_str().expect("utf8 path"), "--key", "b"])
+        .args([
+            "get",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--key",
+            "b",
+        ])
         .output()?;
     assert!(get_b.status.success());
     assert!(String::from_utf8_lossy(&get_b.stdout).contains("not_found"));
 
     let get_c = Command::new(layerdb_bin()?)
-        .args(["get", "--db", dir.path().to_str().expect("utf8 path"), "--key", "c"])
+        .args([
+            "get",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--key",
+            "c",
+        ])
         .output()?;
     assert!(get_c.status.success());
     assert!(String::from_utf8_lossy(&get_c.stdout).contains("not_found"));
 
     let get_d = Command::new(layerdb_bin()?)
-        .args(["get", "--db", dir.path().to_str().expect("utf8 path"), "--key", "d"])
+        .args([
+            "get",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--key",
+            "d",
+        ])
         .output()?;
     assert!(get_d.status.success());
     assert!(String::from_utf8_lossy(&get_d.stdout).contains("value=4"));
@@ -131,7 +158,6 @@ fn delete_range_cli_tombstones_half_open_span() -> anyhow::Result<()> {
 
     Ok(())
 }
-
 
 #[test]
 fn delete_range_cli_honors_branch_target() -> anyhow::Result<()> {
@@ -186,7 +212,13 @@ fn delete_range_cli_honors_branch_target() -> anyhow::Result<()> {
     );
 
     let get_main_a = Command::new(layerdb_bin()?)
-        .args(["get", "--db", dir.path().to_str().expect("utf8 path"), "--key", "a"])
+        .args([
+            "get",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--key",
+            "a",
+        ])
         .output()?;
     assert!(get_main_a.status.success());
     assert!(String::from_utf8_lossy(&get_main_a.stdout).contains("value=1"));
@@ -206,7 +238,13 @@ fn delete_range_cli_honors_branch_target() -> anyhow::Result<()> {
     assert!(String::from_utf8_lossy(&get_feature_a.stdout).contains("not_found"));
 
     let get_main_b = Command::new(layerdb_bin()?)
-        .args(["get", "--db", dir.path().to_str().expect("utf8 path"), "--key", "b"])
+        .args([
+            "get",
+            "--db",
+            dir.path().to_str().expect("utf8 path"),
+            "--key",
+            "b",
+        ])
         .output()?;
     assert!(get_main_b.status.success());
     assert!(String::from_utf8_lossy(&get_main_b.stdout).contains("value=2"));

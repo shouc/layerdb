@@ -312,10 +312,7 @@ fn list_archives_cmd(db: &Path) -> anyhow::Result<()> {
     for archive in db.list_archives() {
         println!(
             "archive id={} branch={} seqno={} path={}",
-            archive.archive_id,
-            archive.branch,
-            archive.seqno,
-            archive.archive_path
+            archive.archive_id, archive.branch, archive.seqno, archive.archive_path
         );
     }
     Ok(())
@@ -364,7 +361,7 @@ fn sst_dump(sst: &Path) -> anyhow::Result<()> {
     let mut count = 0u64;
     let mut first = None;
     let mut last = None;
-    while let Some(next) = iter.next() {
+    for next in iter {
         let (k, seq, kind, v) = next?;
         if first.is_none() {
             first = Some(k.clone());
@@ -444,7 +441,7 @@ fn db_check(db: &Path) -> anyhow::Result<()> {
             let mut iter = reader.iter(u64::MAX)?;
             iter.seek_to_first();
             let mut entries = 0u64;
-            while let Some(next) = iter.next() {
+            for next in iter {
                 let _ = next?;
                 entries += 1;
             }
@@ -599,7 +596,7 @@ fn bench(db: &Path, keys: usize, workload: BenchWorkload) -> anyhow::Result<()> 
                 layerdb::ReadOptions::default(),
             )?;
             iter.seek_to_first();
-            while let Some(next) = iter.next() {
+            for next in iter {
                 let _ = next?;
             }
             start.elapsed()
@@ -642,7 +639,7 @@ fn bench(db: &Path, keys: usize, workload: BenchWorkload) -> anyhow::Result<()> 
                     layerdb::ReadOptions::default(),
                 )?;
                 iter.seek_to_first();
-                while let Some(next) = iter.next() {
+                for next in iter {
                     let _ = next?;
                 }
             }
@@ -848,7 +845,7 @@ fn archive_branch_cmd(db: &Path, name: &str, out: &Path) -> anyhow::Result<()> {
     )?;
     iter.seek_to_first();
     let mut entries = 0u64;
-    while let Some(next) = iter.next() {
+    for next in iter {
         let (key, value) = next?;
         if let Some(value) = value {
             builder.add(
@@ -931,7 +928,7 @@ fn scan_cmd(
 
     let mut iter = db.iter(range, layerdb::ReadOptions::default())?;
     iter.seek_to_first();
-    while let Some(next) = iter.next() {
+    for next in iter {
         let (key, value) = next?;
         if let Some(value) = value {
             println!(
@@ -1265,9 +1262,7 @@ fn resolve_sst_for_check(
         return Ok(legacy_path);
     }
 
-    let object_id = freeze
-        .map(|f| f.object_id.as_str())
-        .unwrap_or_else(|| "");
+    let object_id = freeze.map(|f| f.object_id.as_str()).unwrap_or_else(|| "");
     let object_id = if object_id.is_empty() {
         format!("L{}-{:016x}", add.level, add.file_id)
     } else {
@@ -1284,8 +1279,7 @@ fn resolve_sst_for_check(
     }
     let meta_bytes = std::fs::read(&meta_path)
         .with_context(|| format!("read s3 meta {}", meta_path.display()))?;
-    let meta: S3ObjectMetaFile =
-        bincode::deserialize(&meta_bytes).context("decode s3 meta")?;
+    let meta: S3ObjectMetaFile = bincode::deserialize(&meta_bytes).context("decode s3 meta")?;
     if meta.file_id != add.file_id || meta.level != add.level {
         anyhow::bail!(
             "s3 meta mismatch for file_id={} expected_level={} got_file_id={} got_level={}",

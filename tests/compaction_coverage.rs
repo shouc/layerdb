@@ -39,7 +39,10 @@ fn compaction_retains_tombstone_when_lower_levels_not_covered() -> anyhow::Resul
 
     // We should still have at least one SST holding visibility state.
     let total = sst_count(dir.path(), "sst")? + sst_count(dir.path(), "sst_hdd")?;
-    assert!(total >= 1, "expected retained sst files for tombstone safety");
+    assert!(
+        total >= 1,
+        "expected retained sst files for tombstone safety"
+    );
 
     Ok(())
 }
@@ -60,9 +63,15 @@ fn compact_range_subset_does_not_drop_out_of_range_visibility() -> anyhow::Resul
         end: std::ops::Bound::Excluded(bytes::Bytes::from_static(b"n")),
     }))?;
 
-    assert_eq!(db.get("a", ReadOptions::default())?, Some(bytes::Bytes::from("1")));
+    assert_eq!(
+        db.get("a", ReadOptions::default())?,
+        Some(bytes::Bytes::from("1"))
+    );
     assert_eq!(db.get("m", ReadOptions::default())?, None);
-    assert_eq!(db.get("z", ReadOptions::default())?, Some(bytes::Bytes::from("1")));
+    assert_eq!(
+        db.get("z", ReadOptions::default())?,
+        Some(bytes::Bytes::from("1"))
+    );
 
     Ok(())
 }
@@ -73,10 +82,7 @@ fn compaction_preserves_snapshot_for_non_overwritten_key() -> anyhow::Result<()>
     let db = Db::open(dir.path(), options())?;
 
     db.write_batch(
-        vec![
-            layerdb::Op::put("e", "0"),
-            layerdb::Op::put("a", "0"),
-        ],
+        vec![layerdb::Op::put("e", "0"), layerdb::Op::put("a", "0")],
         WriteOptions { sync: true },
     )?;
 

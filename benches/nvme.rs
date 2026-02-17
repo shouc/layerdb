@@ -67,7 +67,7 @@ fn preload(db: &Db) {
 fn bench_fill(c: &mut Criterion) {
     c.bench_function("nvme/fill/20k_256b", |b| {
         b.iter_batched(
-            || open_temp_db(),
+            open_temp_db,
             |(_dir, db)| {
                 for i in 0..KEYS {
                     db.put(key(i), value(i), WriteOptions { sync: false })
@@ -144,7 +144,7 @@ fn bench_readseq(c: &mut Criterion) {
                     )
                     .expect("iter");
                 iter.seek_to_first();
-                while let Some(next) = iter.next() {
+                for next in iter {
                     let _ = next.expect("next");
                 }
             },

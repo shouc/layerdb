@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -187,7 +187,10 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
 
     println!();
     println!("fairness:");
-    println!("- same synthetic dataset seed={} for all engines", args.seed);
+    println!(
+        "- same synthetic dataset seed={} for all engines",
+        args.seed
+    );
     println!("- same update stream and same query set for all engines");
     println!("- recall measured against exact KNN after all updates");
     println!("- same nprobe={} and top-k={}", args.nprobe, args.k);
@@ -236,8 +239,12 @@ fn run_saq_validate(args: &SaqValidateArgs) -> Result<()> {
     let uniform_build_ms = uniform_build_start.elapsed().as_secs_f64() * 1000.0;
 
     let base_vectors: Vec<Vec<f32>> = base.iter().map(|r| r.values.clone()).collect();
-    let saq_mse = saq_index.quantization_mse(&base_vectors).unwrap_or(f64::NAN);
-    let uniform_mse = uniform_index.quantization_mse(&base_vectors).unwrap_or(f64::NAN);
+    let saq_mse = saq_index
+        .quantization_mse(&base_vectors)
+        .unwrap_or(f64::NAN);
+    let uniform_mse = uniform_index
+        .quantization_mse(&base_vectors)
+        .unwrap_or(f64::NAN);
 
     let saq_search_start = Instant::now();
     let mut saq_recall = 0.0f64;
@@ -266,11 +273,19 @@ fn run_saq_validate(args: &SaqValidateArgs) -> Result<()> {
     );
     println!(
         "{:<14} {:>10.1} {:>10.6} {:>12.0} {:>12.4}",
-        "saq", saq_build_ms, saq_mse, saq_search_qps, saq_recall / queries.len() as f64
+        "saq",
+        saq_build_ms,
+        saq_mse,
+        saq_search_qps,
+        saq_recall / queries.len() as f64
     );
     println!(
         "{:<14} {:>10.1} {:>10.6} {:>12.0} {:>12.4}",
-        "uniform", uniform_build_ms, uniform_mse, uniform_search_qps, uniform_recall / queries.len() as f64
+        "uniform",
+        uniform_build_ms,
+        uniform_mse,
+        uniform_search_qps,
+        uniform_recall / queries.len() as f64
     );
     println!();
     println!("validation design:");
@@ -319,7 +334,10 @@ fn run_spfresh_health(args: &SpfreshHealthArgs) -> Result<()> {
     Ok(())
 }
 
-fn final_rows_after_updates(base: &[VectorRecord], updates: &[(u64, Vec<f32>)]) -> Vec<VectorRecord> {
+fn final_rows_after_updates(
+    base: &[VectorRecord],
+    updates: &[(u64, Vec<f32>)],
+) -> Vec<VectorRecord> {
     let mut map: HashMap<u64, VectorRecord> = base.iter().cloned().map(|r| (r.id, r)).collect();
     for (id, v) in updates {
         map.insert(*id, VectorRecord::new(*id, v.clone()));

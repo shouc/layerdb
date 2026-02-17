@@ -231,10 +231,7 @@ impl MinioObjectStore {
             client,
             bucket: options.bucket,
             region: options.region,
-            prefix: options
-                .prefix
-                .trim_matches('/')
-                .to_string(),
+            prefix: options.prefix.trim_matches('/').to_string(),
             retry: RetryOptions {
                 max_attempts: options.retry_max_attempts,
                 base_delay: Duration::from_millis(options.retry_base_delay_ms),
@@ -259,7 +256,10 @@ impl MinioObjectStore {
             return Ok(());
         }
         if !auto_create {
-            anyhow::bail!("s3 bucket does not exist and auto-create is disabled: {}", self.bucket);
+            anyhow::bail!(
+                "s3 bucket does not exist and auto-create is disabled: {}",
+                self.bucket
+            );
         }
 
         let client = self.client.clone();
@@ -302,9 +302,8 @@ impl MinioObjectStore {
             match run_minio_future(op()) {
                 Ok(value) => return Ok(value),
                 Err(err) => {
-                    last_err = Some(err.context(format!(
-                        "{op_name} attempt {attempt}/{attempts} failed"
-                    )));
+                    last_err =
+                        Some(err.context(format!("{op_name} attempt {attempt}/{attempts} failed")));
                     if attempt < attempts {
                         std::thread::sleep(self.retry.backoff_for_attempt(attempt));
                     }

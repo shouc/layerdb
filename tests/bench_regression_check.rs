@@ -27,7 +27,8 @@ struct EstimateMean {
 
 #[test]
 fn benchmark_baselines_allow_current_results() -> anyhow::Result<()> {
-    let baseline: BaselineFile = serde_json::from_slice(&std::fs::read("benchmarks/baseline.json")?)?;
+    let baseline: BaselineFile =
+        serde_json::from_slice(&std::fs::read("benchmarks/baseline.json")?)?;
 
     for (display, entry) in baseline.benchmarks {
         let est_path = Path::new("target")

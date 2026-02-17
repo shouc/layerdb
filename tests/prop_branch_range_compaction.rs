@@ -47,7 +47,11 @@ fn value_bytes(value: u8) -> Vec<u8> {
 fn apply_db(db: &Db, op: &MiniOp) {
     match op {
         MiniOp::Put { key, value } => db
-            .put(key_bytes(*key), value_bytes(*value), WriteOptions { sync: true })
+            .put(
+                key_bytes(*key),
+                value_bytes(*value),
+                WriteOptions { sync: true },
+            )
             .expect("put"),
         MiniOp::Del { key } => db
             .delete(key_bytes(*key), WriteOptions { sync: true })
@@ -62,7 +66,11 @@ fn apply_db(db: &Db, op: &MiniOp) {
     }
 }
 
-fn ref_latest_point(log: &ModelLog, key: u8, snapshot_seqno: u64) -> Option<(u64, Option<Vec<u8>>)> {
+fn ref_latest_point(
+    log: &ModelLog,
+    key: u8,
+    snapshot_seqno: u64,
+) -> Option<(u64, Option<Vec<u8>>)> {
     for (seqno, op) in log.iter().rev() {
         if *seqno > snapshot_seqno {
             continue;
@@ -117,7 +125,11 @@ fn event_strategy() -> impl Strategy<Value = Event> {
         (0u8..KEY_SPACE, 0u8..KEY_SPACE).prop_map(|(a, b)| {
             let start = a.min(b);
             let end = a.max(b).saturating_add(1).min(KEY_SPACE);
-            let end = if end <= start { start.saturating_add(1) } else { end };
+            let end = if end <= start {
+                start.saturating_add(1)
+            } else {
+                end
+            };
             MiniOp::RangeDel { start, end }
         }),
     ];

@@ -34,7 +34,6 @@ impl DbIterator {
     pub fn seek(&mut self, key: impl AsRef<[u8]>) {
         self.merged.seek(key.as_ref());
     }
-
 }
 
 impl Iterator for DbIterator {

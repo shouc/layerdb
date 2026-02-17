@@ -331,7 +331,7 @@ fn bench_readseq_layerdb(inputs: &Inputs) -> anyhow::Result<Duration> {
     iter.seek_to_first();
 
     let mut seen = 0usize;
-    while let Some(next) = iter.next() {
+    for next in iter {
         let _ = next?;
         seen += 1;
     }
@@ -389,7 +389,10 @@ fn bench_delete_heavy_layerdb(inputs: &Inputs) -> anyhow::Result<Duration> {
 
     let start = Instant::now();
     for &idx in &inputs.random_order {
-        db.delete(Bytes::copy_from_slice(&inputs.keys[idx]), WriteOptions { sync: false })?;
+        db.delete(
+            Bytes::copy_from_slice(&inputs.keys[idx]),
+            WriteOptions { sync: false },
+        )?;
     }
     Ok(start.elapsed())
 }

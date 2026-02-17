@@ -159,7 +159,9 @@ fn ingest_rejects_empty_sst() -> anyhow::Result<()> {
     build_empty_external_sst(ext_dir.path())?;
 
     let db = Db::open(dir.path(), options())?;
-    let err = db.ingest_sst(&source_path).expect_err("empty ingest should fail");
+    let err = db
+        .ingest_sst(&source_path)
+        .expect_err("empty ingest should fail");
     let msg = format!("{err:#}");
     assert!(msg.contains("empty sst"), "unexpected error: {msg}");
 

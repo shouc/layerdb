@@ -31,7 +31,10 @@ fn uniform_segments(cfg: &SaqConfig, dim: usize) -> Vec<SaqSegment> {
     bits = bits.max(cfg.min_bits_per_dim);
     bits = bits.min(cfg.max_bits_per_dim);
     let mut out = Vec::new();
-    let seg_size = cfg.max_dims_per_segment.max(cfg.min_dims_per_segment).min(dim.max(1));
+    let seg_size = cfg
+        .max_dims_per_segment
+        .max(cfg.min_dims_per_segment)
+        .min(dim.max(1));
     let mut start = 0usize;
     while start < dim {
         let len = (dim - start).min(seg_size);
@@ -103,7 +106,10 @@ pub(crate) fn allocate_joint_segments(cfg: &SaqConfig, dim_variances: &[f32]) ->
     let mut bt = vec![vec![Choice::default(); q + 1]; d + 1];
     dp[0][0] = 0.0;
 
-    let max_seg = cfg.max_dims_per_segment.max(cfg.min_dims_per_segment).min(d);
+    let max_seg = cfg
+        .max_dims_per_segment
+        .max(cfg.min_dims_per_segment)
+        .min(d);
     let min_seg = cfg.min_dims_per_segment.max(1);
 
     for d_end in 1..=d {

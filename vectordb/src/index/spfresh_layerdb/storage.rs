@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use anyhow::Context;
-use layerdb::{Db, ReadOptions, Range, WriteOptions};
+use layerdb::{Db, Range, ReadOptions, WriteOptions};
 
 use crate::types::VectorRecord;
 
 use super::config::{
-    META_CONFIG_KEY, META_SCHEMA_VERSION, SpFreshLayerDbConfig, SpFreshPersistedMeta, VECTOR_PREFIX,
+    SpFreshLayerDbConfig, SpFreshPersistedMeta, META_CONFIG_KEY, META_SCHEMA_VERSION, VECTOR_PREFIX,
 };
 
 pub(crate) fn validate_config(cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> {
@@ -51,7 +51,7 @@ pub(crate) fn load_rows(db: &Db) -> anyhow::Result<Vec<VectorRecord>> {
     let mut out = Vec::new();
     let mut iter = db.iter(Range::all(), ReadOptions::default())?;
     iter.seek_to_first();
-    while let Some(next) = iter.next() {
+    for next in iter {
         let (key, value) = next?;
         if !key.starts_with(VECTOR_PREFIX.as_bytes()) {
             continue;
@@ -100,7 +100,10 @@ pub(crate) fn ensure_wal_exists(path: &Path) -> anyhow::Result<()> {
     }
 
     if !has_segment {
-        anyhow::bail!("layerdb wal contains no segment files in {}", wal_dir.display());
+        anyhow::bail!(
+            "layerdb wal contains no segment files in {}",
+            wal_dir.display()
+        );
     }
     Ok(())
 }
@@ -138,7 +141,11 @@ pub(crate) fn ensure_metadata(db: &Db, cfg: &SpFreshLayerDbConfig) -> anyhow::Re
             );
         }
         if actual.dim != expected.dim {
-            anyhow::bail!("spfresh dim mismatch: stored={} expected={}", actual.dim, expected.dim);
+            anyhow::bail!(
+                "spfresh dim mismatch: stored={} expected={}",
+                actual.dim,
+                expected.dim
+            );
         }
         if actual.initial_postings != expected.initial_postings
             || actual.split_limit != expected.split_limit

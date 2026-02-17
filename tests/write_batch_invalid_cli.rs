@@ -44,7 +44,10 @@ fn write_batch_cli_rejects_invalid_spec() -> anyhow::Result<()> {
         ])
         .output()?;
 
-    assert!(!output.status.success(), "invalid spec unexpectedly succeeded");
+    assert!(
+        !output.status.success(),
+        "invalid spec unexpectedly succeeded"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("invalid --op spec"),

@@ -60,6 +60,18 @@ struct WalState {
 }
 
 #[derive(Debug)]
+struct WalOpenContext {
+    dir: PathBuf,
+    options: DbOptions,
+    memtables: Arc<MemTableManager>,
+    versions: Arc<VersionSet>,
+    next_seqno: Arc<AtomicU64>,
+    last_ack_seqno: Arc<AtomicU64>,
+    last_durable_seqno: Arc<AtomicU64>,
+    flush_tx: mpsc::UnboundedSender<FlushSignal>,
+}
+
+#[derive(Debug)]
 struct StagedWrite {
     done: oneshot::Sender<anyhow::Result<()>>,
     seqno_base: u64,
@@ -119,14 +131,16 @@ impl Wal {
         let (tx, rx) = mpsc::unbounded_channel();
 
         let mut state = WalState::open_new_segment(
-            dir.to_path_buf(),
-            options.clone(),
-            memtables,
-            versions,
-            next_seqno.clone(),
-            last_ack_seqno.clone(),
-            last_durable_seqno.clone(),
-            flush_tx_for_wal,
+            WalOpenContext {
+                dir: dir.to_path_buf(),
+                options: options.clone(),
+                memtables,
+                versions,
+                next_seqno: next_seqno.clone(),
+                last_ack_seqno: last_ack_seqno.clone(),
+                last_durable_seqno: last_durable_seqno.clone(),
+                flush_tx: flush_tx_for_wal,
+            },
             recovered.last_segment_id + 1,
         )?;
 
@@ -347,17 +361,17 @@ fn maybe_delete_wal_segment(dir: &Path, segment_id: u64) {
 }
 
 impl WalState {
-    fn open_new_segment(
-        dir: PathBuf,
-        options: DbOptions,
-        memtables: Arc<MemTableManager>,
-        versions: Arc<VersionSet>,
-        next_seqno: Arc<AtomicU64>,
-        last_ack_seqno: Arc<AtomicU64>,
-        last_durable_seqno: Arc<AtomicU64>,
-        flush_tx: mpsc::UnboundedSender<FlushSignal>,
-        segment_id: u64,
-    ) -> anyhow::Result<Self> {
+    fn open_new_segment(ctx: WalOpenContext, segment_id: u64) -> anyhow::Result<Self> {
+        let WalOpenContext {
+            dir,
+            options,
+            memtables,
+            versions,
+            next_seqno,
+            last_ack_seqno,
+            last_durable_seqno,
+            flush_tx,
+        } = ctx;
         let wal_dir = dir.join("wal");
         std::fs::create_dir_all(&wal_dir)?;
         let segment_path = wal_dir.join(format!("wal_{segment_id:016x}.log"));

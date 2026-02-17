@@ -47,6 +47,10 @@ mod iter;
 
 pub use iter::SstIter;
 
+pub type DataBlockEntries = Vec<(InternalKey, Bytes)>;
+pub type DataBlockCache = ClockProCache<BlockCacheKey, DataBlockEntries>;
+pub type DataBlockCacheHandle = Arc<DataBlockCache>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SstError {
     #[error("io error: {0}")]
@@ -134,7 +138,7 @@ const MAGIC: &[u8; 8] = b"LAYERDB1";
 const FOOTER_SIZE: usize = 8 + 4 + 8 + 4 + 32;
 const BLOCK_TRAILER_SIZE: usize = 4 + 32;
 
-fn verified_block_payload<'a>(block: &'a [u8]) -> Result<&'a [u8], SstError> {
+fn verified_block_payload(block: &[u8]) -> Result<&[u8], SstError> {
     if block.len() <= BLOCK_TRAILER_SIZE {
         return Err(SstError::Corrupt("block too small"));
     }
@@ -236,11 +240,13 @@ fn point_get_from_payload_with_offset_index(
     user_key: &[u8],
     snapshot_seqno: u64,
 ) -> Result<Option<(u64, Option<Bytes>)>, SstError> {
-    fn parse_entry<'a>(
-        payload: &'a [u8],
+    type ParsedEntry<'a> = (&'a [u8], u64, KeyKind, &'a [u8]);
+
+    fn parse_entry(
+        payload: &[u8],
         entries_end: usize,
         entry_offset: usize,
-    ) -> Result<(&'a [u8], u64, KeyKind, &'a [u8]), SstError> {
+    ) -> Result<ParsedEntry<'_>, SstError> {
         if entry_offset + 4 > entries_end {
             return Err(SstError::Corrupt("truncated internal key"));
         }
@@ -500,7 +506,7 @@ impl SstBuilder {
                     seqno: key.seqno,
                 });
                 self.smallest_user_key = Some(std::cmp::min(
-                    self.smallest_user_key.clone().unwrap_or_else(Bytes::new),
+                    self.smallest_user_key.clone().unwrap_or_default(),
                     key.user_key.clone(),
                 ));
                 self.largest_user_key = Some(max_bytes(self.largest_user_key.take(), end_key));
@@ -564,8 +570,8 @@ impl SstBuilder {
         let table_root = TableRoot(*self.table_hasher.finalize().as_bytes());
         let point_filter = build_point_filter(&self.point_keys)?;
         let props = SstProperties {
-            smallest_user_key: self.smallest_user_key.clone().unwrap_or_else(Bytes::new),
-            largest_user_key: self.largest_user_key.clone().unwrap_or_else(Bytes::new),
+            smallest_user_key: self.smallest_user_key.clone().unwrap_or_default(),
+            largest_user_key: self.largest_user_key.clone().unwrap_or_default(),
             max_seqno: self.max_seqno,
             entries: self.entries,
             data_bytes: self.data_bytes,
@@ -786,7 +792,7 @@ pub struct SstReader {
     index: Vec<IndexEntry>,
     props: SstProperties,
     range_tombstones_cache: parking_lot::Mutex<Option<Vec<RangeTombstone>>>,
-    data_block_cache: Option<Arc<ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
+    data_block_cache: Option<DataBlockCacheHandle>,
     point_filter: Option<bloomfilter::Bloom<Bytes>>,
 
     io_ctx: Option<Arc<SstIoContext>>,
@@ -818,14 +824,14 @@ impl SstReader {
     pub fn open_with_io(
         path: impl AsRef<Path>,
         io_ctx: Arc<SstIoContext>,
-        data_block_cache: Option<Arc<ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
+        data_block_cache: Option<DataBlockCacheHandle>,
     ) -> Result<Self, SstError> {
         Self::open_inner(path.as_ref(), Some(io_ctx), data_block_cache)
     }
 
     pub fn open_with_cache(
         path: impl AsRef<Path>,
-        data_block_cache: Option<Arc<ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
+        data_block_cache: Option<DataBlockCacheHandle>,
     ) -> Result<Self, SstError> {
         Self::open_inner(path.as_ref(), None, data_block_cache)
     }
@@ -833,7 +839,7 @@ impl SstReader {
     fn open_inner(
         path: &Path,
         io_ctx: Option<Arc<SstIoContext>>,
-        data_block_cache: Option<Arc<ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
+        data_block_cache: Option<DataBlockCacheHandle>,
     ) -> Result<Self, SstError> {
         let path = path.to_path_buf();
         let keep_file = io_ctx.is_some();

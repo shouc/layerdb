@@ -12,7 +12,6 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::cache::BlockCacheKey;
 use crate::db::iterator::range_contains;
 use crate::db::snapshot::SnapshotTracker;
 use crate::db::{DbOptions, LookupResult, OpKind, Range, Value};
@@ -110,8 +109,7 @@ pub struct VersionSet {
     levels: parking_lot::RwLock<Levels>,
     manifest: parking_lot::Mutex<Manifest>,
     reader_cache: crate::cache::ClockProCache<PathBuf, SstReader>,
-    data_block_cache:
-        Option<Arc<crate::cache::ClockProCache<BlockCacheKey, Vec<(InternalKey, Bytes)>>>>,
+    data_block_cache: Option<crate::sst::DataBlockCacheHandle>,
     sst_io_ctx: Option<Arc<SstIoContext>>,
     branches: RwLock<std::collections::BTreeMap<String, u64>>,
     current_branch: RwLock<String>,

@@ -23,6 +23,7 @@ pub mod internal_key;
 pub mod io;
 pub mod memtable;
 pub mod range_tombstone;
+pub mod s3;
 pub mod sst;
 pub mod tier;
 pub mod version;

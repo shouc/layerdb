@@ -16,7 +16,7 @@ use crate::memtable::MemTableManager;
 use crate::version::VersionSet;
 use crate::wal::Wal;
 
-pub use options::{DbOptions, ReadOptions, WriteOptions};
+pub use options::{DbOptions, ReadOptions, S3Options, WriteOptions};
 pub use snapshot::SnapshotId;
 
 pub type Value = bytes::Bytes;

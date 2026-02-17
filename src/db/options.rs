@@ -1,3 +1,67 @@
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Options {
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub secure: bool,
+    pub retry_max_attempts: u32,
+    pub retry_base_delay_ms: u64,
+    pub auto_create_bucket: bool,
+}
+
+impl S3Options {
+    pub fn from_env() -> Option<Self> {
+        let endpoint = std::env::var("LAYERDB_S3_ENDPOINT").ok()?;
+        let bucket = std::env::var("LAYERDB_S3_BUCKET").ok()?;
+        let access_key = std::env::var("LAYERDB_S3_ACCESS_KEY").ok()?;
+        let secret_key = std::env::var("LAYERDB_S3_SECRET_KEY").ok()?;
+
+        let region = std::env::var("LAYERDB_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let prefix = std::env::var("LAYERDB_S3_PREFIX").unwrap_or_else(|_| "layerdb".to_string());
+        let secure = std::env::var("LAYERDB_S3_SECURE")
+            .ok()
+            .map(|v| parse_bool_env(&v))
+            .unwrap_or(false);
+        let retry_max_attempts = std::env::var("LAYERDB_S3_RETRY_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(5);
+        let retry_base_delay_ms = std::env::var("LAYERDB_S3_RETRY_BASE_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(100);
+        let auto_create_bucket = std::env::var("LAYERDB_S3_AUTO_CREATE_BUCKET")
+            .ok()
+            .map(|v| parse_bool_env(&v))
+            .unwrap_or(true);
+
+        Some(Self {
+            endpoint,
+            region,
+            bucket,
+            prefix,
+            access_key,
+            secret_key,
+            secure,
+            retry_max_attempts,
+            retry_base_delay_ms,
+            auto_create_bucket,
+        })
+    }
+}
+
+fn parse_bool_env(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct DbOptions {
     pub memtable_shards: usize,
@@ -51,6 +115,11 @@ pub struct DbOptions {
 
     /// Use io-executor for SST writes (flush/compaction builders).
     pub sst_use_io_executor_writes: bool,
+
+    /// Object storage settings used by frozen-level S3 operations.
+    ///
+    /// If unset, tier-freeze/thaw uses local filesystem emulation under `sst_s3/`.
+    pub s3: Option<S3Options>,
 }
 
 impl Default for DbOptions {
@@ -71,6 +140,7 @@ impl Default for DbOptions {
             io_backend: crate::io::IoBackend::Uring,
             sst_use_io_executor_reads: cfg!(target_os = "linux"),
             sst_use_io_executor_writes: cfg!(target_os = "linux"),
+            s3: None,
         }
     }
 }

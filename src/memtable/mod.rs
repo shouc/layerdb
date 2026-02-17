@@ -84,18 +84,6 @@ impl MemTableManager {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn approximate_bytes(&self) -> u64 {
-        let mutable = self.mutable.read();
-        let immutable_bytes: u64 = self
-            .immutables
-            .lock()
-            .iter()
-            .map(|m| m.approximate_bytes())
-            .sum();
-        mutable.approximate_bytes() + immutable_bytes
-    }
-
     pub(crate) fn mutable_approximate_bytes(&self) -> u64 {
         self.mutable.read().approximate_bytes()
     }

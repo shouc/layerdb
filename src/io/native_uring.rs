@@ -707,38 +707,6 @@ impl NativeUring {
         Ok(offset)
     }
 
-    #[allow(dead_code)]
-    pub fn write_all_at(&self, path: &Path, offset: u64, data: &[u8]) -> anyhow::Result<()> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("open for write: {}", path.display()))?;
-        self.write_all_at_file(&file, offset, data)
-            .with_context(|| format!("write_all_at: {}", path.display()))
-    }
-
-    #[allow(dead_code)]
-    pub fn read_into_at(&self, path: &Path, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(path)
-            .with_context(|| format!("open for read_into_at: {}", path.display()))?;
-        self.read_into_at_file(&file, offset, buf)
-            .with_context(|| format!("read_into_at: {}", path.display()))
-    }
-
-    #[allow(dead_code)]
-    pub fn sync_file(&self, path: &Path) -> anyhow::Result<()> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("open for sync: {}", path.display()))?;
-        self.sync_file_file(&file)
-            .with_context(|| format!("sync_data: {}", path.display()))
-    }
 }
 
 #[cfg(test)]

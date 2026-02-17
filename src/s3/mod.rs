@@ -448,7 +448,8 @@ where
 {
     if tokio::runtime::Handle::try_current().is_ok() {
         let join = std::thread::spawn(move || -> anyhow::Result<T> {
-            let runtime = tokio::runtime::Builder::new_current_thread()
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .context("build tokio runtime for minio operation")?;
@@ -460,7 +461,8 @@ where
             Err(_) => Err(anyhow::anyhow!("minio runtime thread panicked")),
         }
     } else {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .context("build tokio runtime for minio operation")?;

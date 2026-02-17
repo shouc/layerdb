@@ -34,9 +34,19 @@ To force the legacy mmap-based reader, set:
 This speeds up local NVMe-heavy workloads by reducing syscall overhead and enabling the
 `io_uring` backend for SST reads/writes.
 
-S3 support is *file-based* (see `freeze_level_to_s3` / `thaw_level_from_s3`): the database stores
-objects under `<db>/sst_s3` and uses a local read-through cache (`<db>/sst_cache`).
+S3 frozen-level support uses an object-store abstraction:
+
+- Default mode (no S3 config): local object emulation under `<db>/sst_s3`.
+- Remote mode (`DbOptions::s3` or `LAYERDB_S3_*` env): direct S3/MinIO uploads and reads with retry.
+
+Read-through cache still uses `<db>/sst_cache`.
 `io_uring` is only used for local filesystem IO (NVMe/HDD/cache), not for network transfers.
+
+Run MinIO integration verification:
+
+```bash
+./scripts/minio_integration.sh
+```
 
 ## Example
 

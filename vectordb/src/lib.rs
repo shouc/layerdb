@@ -2,6 +2,7 @@
 
 pub mod dataset;
 pub mod ground_truth;
+pub mod index;
 pub mod linalg;
 pub mod types;
 

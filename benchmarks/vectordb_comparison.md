@@ -4,98 +4,108 @@ Date: 2026-02-17
 
 ## Scope
 This report covers:
-- `vectordb` crate with `SPFreshIndex`
-- append-only partition baseline (`AppendOnlyIndex`, used as pinecore-like fallback)
+- `SPFreshIndex` (in-memory incremental partition updates)
+- `SpFreshLayerDbIndex` (full SPFresh system architecture on LayerDB)
+- `AppendOnlyIndex` baseline
 - `SaqIndex` and `SaqIndex` uniform ablation for arXiv:2509.12086 validation
+- Milvus (`milvus-io/milvus`) IVF_FLAT comparison
 
-## Pinecore Baseline Availability
-A public cloneable ANN repo named `pinecore` could not be located.
-Attempts included:
-- `git ls-remote https://github.com/pinecore/pinecore.git` -> not found
-- `gh search repos pinecore` -> no relevant vector DB engine source
+## SPFresh System Architecture on LayerDB
+`SpFreshLayerDbIndex` adds the paper-style system split between a foreground updater and asynchronous background maintenance:
+- foreground updater persists each vector in LayerDB (`spfresh/v/{id}`) and applies low-latency in-memory assignment updates
+- background rebuilder runs out-of-band and periodically rebuilds postings from persisted vectors
+- recovery-on-open reconstructs the in-memory index from LayerDB state
 
-For fairness testing in this repo, we used `AppendOnlyIndex` as the pinecore-like baseline because it keeps the same partitioned IVF design but omits SPFresh split/reassign.
+This uses existing LayerDB WAL/LSM durability while preserving SPFresh search/update behavior.
 
 ## Fairness Controls
 All engines in each run used:
-- the same dataset seed
-- the same base vectors, update stream, and query set
-- the same `k`, `nprobe`, and dimensionality
-- recall measured against exact KNN over final post-update vectors
+- identical dataset seed and dimensions
+- identical base vectors, update stream, and query set
+- identical `k` and `nprobe`
+- identical L2 distance metric
+- recall measured against exact KNN after all updates
 
-## Main Comparison (Moderate Update Pressure)
-Command (seeded runs):
+Milvus fairness setup:
+- source cloned from `https://github.com/milvus-io/milvus.git` (`/tmp/milvus-layerdb-20260217b`)
+- Milvus standalone launched via Docker Compose from repo deployment config
+- index type `IVF_FLAT` with `nlist=64`
+- updates applied one-by-one (`update_batch=1`) to match vectordb benchmark write mode
+
+## Main Comparison (10k / 2k / 200)
+
+Dataset exported once and reused:
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- bench \
-  --seed <101|202> --dim 64 --base 20000 --updates 2000 --queries 400 --k 10 \
-  --initial-postings 128 --nprobe 12 --split-limit 256 --merge-limit 32 \
-  --reassign-range 16 --saq-total-bits 256 --saq-ivf-clusters 128
+cargo run -p vectordb --bin vectordb-cli -- dump-dataset \
+  --out /tmp/vectordb_dataset_10000_2000_200_seed404.json \
+  --seed 404 --dim 64 --base 10000 --updates 2000 --queries 200
 ```
 
-Average of seeds 101 and 202:
+vectordb run:
+```bash
+cargo run -p vectordb --bin vectordb-cli -- bench \
+  --seed 404 --dim 64 --base 10000 --updates 2000 --queries 200 --k 10 \
+  --initial-postings 64 --nprobe 8 --split-limit 64 --merge-limit 16 --reassign-range 32 \
+  --saq-total-bits 256 --saq-ivf-clusters 64
+```
+
+milvus run:
+```bash
+python3 scripts/bench_milvus.py \
+  --dataset /tmp/vectordb_dataset_10000_2000_200_seed404.json \
+  --k 10 --nprobe 8 --nlist 64 --update-batch 1
+```
 
 | engine | build ms | update qps | search qps | recall@10 |
 |---|---:|---:|---:|---:|
-| spfresh | 23514.2 | 2445 | 308.5 | 0.4265 |
-| append-only | 23774.9 | 2455.5 | 318.5 | 0.4265 |
-| saq | 23581.1 | 5025 | 214.5 | 0.4228 |
-| saq-uniform | 23315.0 | 5378 | 218.5 | 0.4244 |
+| spfresh | 5838.4 | 527 | 1204 | 0.2595 |
+| spfresh-layerdb | 6061.6 | 491 | 475 | 0.4380 |
+| append-only | 5863.5 | 3172 | 513 | 0.4165 |
+| saq | 5987.7 | 8553 | 341 | 0.4035 |
+| saq-uniform | 5834.0 | 9109 | 338 | 0.4045 |
+| milvus-ivf-flat | 3311.2 | 139 | 205 | 0.5430 |
 
-Observations:
-- `SPFreshIndex` and append-only are close under moderate pressure.
-- `SaqIndex` has much faster update throughput than partition scans, but lower search QPS due decode math in query path.
+## Stress Comparison (20k / 5k / 400)
 
-## Stress Comparison (High Split/Reassign Pressure)
-Command:
+vectordb run:
 ```bash
 cargo run -p vectordb --bin vectordb-cli -- bench \
   --seed 404 --dim 64 --base 20000 --updates 5000 --queries 400 --k 10 \
-  --initial-postings 64 --nprobe 8 --split-limit 64 --merge-limit 16 \
-  --reassign-range 32 --saq-total-bits 256 --saq-ivf-clusters 64
+  --initial-postings 64 --nprobe 8 --split-limit 64 --merge-limit 16 --reassign-range 32 \
+  --saq-total-bits 256 --saq-ivf-clusters 64
+```
+
+milvus run:
+```bash
+python3 scripts/bench_milvus.py \
+  --dataset /tmp/vectordb_dataset_20000_5000_400_seed404.json \
+  --k 10 --nprobe 8 --nlist 64 --update-batch 1
 ```
 
 | engine | build ms | update qps | search qps | recall@10 |
 |---|---:|---:|---:|---:|
-| spfresh | 11794.8 | 77 | 858 | 0.2103 |
-| append-only | 11975.1 | 1754 | 243 | 0.4320 |
-| saq | 12086.9 | 6422 | 165 | 0.4250 |
-| saq-uniform | 11846.6 | 6840 | 168 | 0.4273 |
+| spfresh | 11618.5 | 373 | 893 | 0.1990 |
+| spfresh-layerdb | 11985.2 | 371 | 229 | 0.4803 |
+| append-only | 11594.3 | 1765 | 247 | 0.4320 |
+| saq | 11954.6 | 6474 | 168 | 0.4250 |
+| saq-uniform | 11669.7 | 6883 | 172 | 0.4273 |
+| milvus-ivf-flat | 3749.1 | 141 | 155 | 0.5512 |
 
-Root-cause analysis for SPFresh slowdown / accuracy drop:
-- split/reassign runs synchronously in update path; no background rebuilder queue
-- frequent centroid recomputation scans full posting vectors
-- reassignment candidate rule is broad (`cond1 || cond2`) and can over-migrate vectors
-- repeated split/merge churn causes assignment instability and poorer nearest-partition quality
+## Key Findings
+- LayerDB-backed SPFresh substantially improves recall under heavy updates versus in-memory SPFresh by using background rebuild.
+- `spfresh-layerdb` remains below Milvus recall in these settings but outperforms Milvus on one-by-one update throughput and search QPS.
+- SAQ variants remain strong on update throughput but lower on recall than `spfresh-layerdb` and Milvus in these L2 IVF settings.
 
-## arXiv 2509.12086 Validation (SAQ)
-Implemented components in `SaqIndex`:
-- dimension-variance ordering
-- joint segmentation + bit allocation DP
-- scalar quantization
-- CAQ refinement
-- uniform ablation variant (`use_joint_dp=false`, `use_variance_permutation=false`, `caq_rounds=0`)
+## SAQ Paper Validation (arXiv:2509.12086)
+Implemented in `SaqIndex`:
+- variance-aware dimension ordering
+- joint segmentation + bit allocation dynamic programming
+- scalar quantization + CAQ refinement
+- uniform ablation (`use_joint_dp=false`, `use_variance_permutation=false`, `caq_rounds=0`)
 
 Validation command:
 ```bash
 cargo run -p vectordb --bin vectordb-cli -- saq-validate \
-  --dim 96 --base 25000 --queries 500 --k 10 --seed <42|77> \
+  --dim 96 --base 25000 --queries 500 --k 10 --seed 42 \
   --total-bits 256 --ivf-clusters 128 --nprobe 12
 ```
-
-Results:
-
-| seed | variant | build ms | mse | search qps | recall@10 |
-|---|---|---:|---:|---:|---:|
-| 42 | saq | 41538.3 | 0.279788 | 125 | 0.5026 |
-| 42 | uniform | 41235.6 | 0.213888 | 128 | 0.4338 |
-| 77 | saq | 42052.8 | 0.279927 | 127 | 0.5068 |
-| 77 | uniform | 41735.6 | 0.213953 | 129 | 0.4372 |
-
-Interpretation:
-- SAQ improved recall over uniform by ~15.9% (avg).
-- SAQ increased MSE and was slightly slower in search.
-- This is consistent with optimizing ranking quality (through segmentation + CAQ) rather than pure reconstruction error.
-
-## Reproduction Shortcuts
-- Main benchmark: `cargo run -p vectordb --bin vectordb-cli -- bench ...`
-- SAQ validation: `cargo run -p vectordb --bin vectordb-cli -- saq-validate ...`

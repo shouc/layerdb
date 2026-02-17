@@ -2,6 +2,7 @@
 
 Experimental vector index crate with:
 - `SPFreshIndex`: partitioned incremental update with split/reassign
+- `SpFreshLayerDbIndex`: SPFresh system architecture with LayerDB durability + background rebuild
 - `AppendOnlyIndex`: partitioned append-only baseline
 - `SaqIndex`: scalar additive quantization index inspired by arXiv:2509.12086
 
@@ -18,6 +19,18 @@ cargo run -p vectordb --bin vectordb-cli -- bench \
   --dim 64 --base 20000 --updates 2000 --queries 400 --k 10 \
   --initial-postings 128 --nprobe 12 --split-limit 256 --reassign-range 16 \
   --saq-total-bits 256 --saq-ivf-clusters 128
+```
+
+Export a reproducible benchmark dataset:
+```bash
+cargo run -p vectordb --bin vectordb-cli -- dump-dataset \
+  --out /tmp/vectordb_dataset.json --seed 404 --dim 64 --base 10000 --updates 2000 --queries 200
+```
+
+Compare the same dataset with Milvus:
+```bash
+python3 scripts/bench_milvus.py \
+  --dataset /tmp/vectordb_dataset.json --k 10 --nprobe 8 --nlist 64 --update-batch 1
 ```
 
 SAQ paper-style validation (vs uniform ablation):

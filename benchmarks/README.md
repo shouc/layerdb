@@ -8,6 +8,7 @@ This directory stores CI-facing benchmark regression thresholds.
   results against `baseline.json`.
 - Use `cargo run --bin engine_bench` for direct LayerDB vs RocksDB comparisons.
 - See `benchmarks/rocksdb_comparison.md` for the latest fair-run analysis.
+- See `benchmarks/vectordb_comparison.md` for vectordb and Milvus vector-search comparisons.
 
 ## Typical workflow
 

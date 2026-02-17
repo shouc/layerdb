@@ -4,81 +4,50 @@ Date: 2026-02-17
 
 ## Method
 
-Runner: `cargo run --bin engine_bench -- --keys 5000 --value-bytes 128 --repeats 3`
+Runner:
+```bash
+cargo run --bin engine_bench -- --keys 5000 --value-bytes 128 --repeats 3
+```
 
 Fairness controls:
-
-- Same key count (`5000`) and value size (`128` bytes).
-- Same workload definitions for both engines: `fill`, `fill-batch32`, `readrandom`, `readseq`, `overwrite`, `delete-heavy`, `compact`.
-- Single-thread client for both engines.
-- RocksDB compression disabled.
-- WAL enabled and unsynced for both (LayerDB `fsync_writes=false`; RocksDB `sync=false`, WAL on).
-- Fresh DB directory per workload for both engines.
+- same key count (`5000`) and value size (`128` bytes)
+- same workload definitions for both engines (`fill`, `fill-batch32`, `readrandom`, `readseq`, `overwrite`, `delete-heavy`, `compact`)
+- single-thread client for both
+- RocksDB compression disabled
+- WAL enabled and unsynced for both (LayerDB `fsync_writes=false`; RocksDB `sync=false`, WAL enabled)
+- fresh DB directory per workload for both
 
 Implementation details:
-
-- LayerDB: current workspace code.
-- RocksDB: Rust crate `rocksdb = 0.24.0` (binds to `librocksdb-sys 10.4.2`).
-- `facebook/rocksdb` source was cloned to `/tmp/rocksdb-layerdb-20260217` for source parity checks.
+- LayerDB: current workspace code
+- RocksDB: Rust crate `rocksdb = 0.24.0` (`librocksdb-sys 10.4.2`)
+- RocksDB source checked from clone at `/tmp/rocksdb-layerdb-20260217`
 
 ## Results (Median of 3)
 
 | workload      | layerdb qps | rocksdb qps | slower factor |
 |---------------|-------------|-------------|---------------|
-| fill          | 1770        | 6109        | 3.45x         |
-| fill-batch32  | 24913       | 39101       | 1.57x         |
-| readrandom    | 138757      | 150308      | 1.08x         |
-| readseq       | 413747      | 453400      | 1.10x         |
-| overwrite     | 1800        | 4733        | 2.63x         |
-| delete-heavy  | 1758        | 5014        | 2.85x         |
-| compact       | 16731       | 129782      | 7.76x         |
+| fill          | 49,930      | 130,501     | 2.61x         |
+| fill-batch32  | 393,559     | 779,418     | 1.98x         |
+| readrandom    | 421,891     | 405,184     | 0.96x         |
+| readseq       | 1,026,492   | 1,546,930   | 1.51x         |
+| overwrite     | 47,380      | 106,895     | 2.26x         |
+| delete-heavy  | 59,151      | 108,589     | 1.84x         |
+| compact       | 49,515      | 655,290     | 13.23x        |
 
-## Why We Were Slow (and Fixes Applied)
+## Why We Are Still Slower
 
-### 1) Per-write manifest fsync on hot path (major)
+1. `compact` remains the dominant gap.
+- LayerDB compaction is currently simpler and less optimized than RocksDB's mature compaction pipeline and scheduling heuristics.
 
-Issue:
+2. Single-op write workloads still show a consistent per-request overhead.
+- `fill`, `overwrite`, and `delete-heavy` are all slower than RocksDB.
+- batching closes part of the gap (`fill-batch32` improves materially), indicating fixed per-operation costs remain a key bottleneck.
 
-- Every write advanced branch head by appending `BranchHead` to MANIFEST with `sync=true`.
-- This forced directory/file sync behavior on each write.
+3. Read path is much closer.
+- `readrandom` is now competitive and slightly faster in this run.
+- `readseq` still trails, but by a smaller margin than write/compact paths.
 
-Fix:
-
-- Skip manifest persistence in `advance_current_branch()` for `main` branch (recoverable from WAL seqno).
-
-Impact:
-
-- Large write-path improvement (`fill`/`overwrite`/`delete-heavy` moved from ~50 ops/s class to thousands).
-
-### 2) Full range-tombstone scan on every point lookup (major)
-
-Issue:
-
-- `MemTableManager::get()` computed `range_tombstones()` every point read, scanning memtable contents even when there were no range tombstones.
-
-Fix:
-
-- Added range-tombstone presence tracking in memtables and skip tombstone scan when count is zero.
-
-Impact:
-
-- `readrandom` improved drastically and is now close to RocksDB.
-
-### 3) Small-batch write overhead in memtable insert path (moderate)
-
-Issue:
-
-- `MemTable::apply_batch()` used Rayon parallel insertion across shards even for tiny batches.
-
-Fix:
-
-- Added sequential fast path for small batches (`<=64` ops), keeping parallel path for larger batches.
-
-Impact:
-
-- Better foreground write latency and stronger `fill`/`overwrite` performance.
-
-## Remaining Gaps
-
-- `compact` is still the largest gap (~7.8x): LayerDB compaction is simpler and less optimized than RocksDB’s mature compaction pipeline.
-- Single-op write workloads are still slower than RocksDB; batching helps significantly (`fill-batch32` improves to 1.57x gap), indicating per-request overhead remains important.
+## Practical Next Optimizations
+- prioritize compaction pipeline improvements (selection, IO strategy, write amplification controls)
+- reduce foreground per-write overhead for non-batched operations
+- add compaction-stage profiling counters to isolate CPU vs IO bottlenecks

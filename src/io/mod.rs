@@ -944,12 +944,13 @@ impl Drop for PooledBuf {
             return;
         };
 
+        #[cfg(all(feature = "native-uring", target_os = "linux"))]
         let vec = match &mut self.inner {
             PooledBufInner::Vec(vec) => vec,
-
-            #[cfg(all(feature = "native-uring", target_os = "linux"))]
             PooledBufInner::Fixed(_) => return,
         };
+        #[cfg(not(all(feature = "native-uring", target_os = "linux")))]
+        let PooledBufInner::Vec(vec) = &mut self.inner;
         if vec.capacity() != bucket {
             return;
         }

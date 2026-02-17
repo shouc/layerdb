@@ -30,4 +30,8 @@ pub trait VectorIndex {
     fn delete(&mut self, id: u64) -> bool;
     fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor>;
     fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }

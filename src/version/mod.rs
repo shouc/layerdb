@@ -1,4 +1,5 @@
 pub mod manifest;
+mod iter;
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
@@ -23,6 +24,7 @@ use crate::version::manifest::{
     AddFile, BranchArchive, DeleteFile, DropBranch, DropBranchArchive, FreezeFile, Manifest,
     ManifestRecord, MoveFile, VersionEdit,
 };
+pub use iter::SstIter;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LevelMetricsSnapshot {
@@ -1913,83 +1915,4 @@ fn drop_obsolete_range_tombstones_bottommost(
             _ => true,
         })
         .collect()
-}
-
-pub struct SstIter {
-    entries: Vec<SstEntry>,
-    index: usize,
-    snapshot_seqno: u64,
-}
-
-#[derive(Debug, Clone)]
-struct SstEntry {
-    key: InternalKey,
-    value: Bytes,
-}
-
-impl SstIter {
-    fn new(paths: Vec<PathBuf>, snapshot_seqno: u64, range: Range) -> anyhow::Result<Self> {
-        let bounds = crate::memtable::bounds_from_range(&range);
-        let mut entries = Vec::new();
-
-        for path in paths {
-            let reader = SstReader::open(&path)?;
-            let mut iter = reader.iter(snapshot_seqno)?;
-            iter.seek_to_first();
-            while let Some(next) = iter.next() {
-                let (user_key, seqno, kind, value) = next?;
-                if !range_contains(&bounds, user_key.as_ref()) {
-                    continue;
-                }
-                let key_kind = match kind {
-                    OpKind::Put => KeyKind::Put,
-                    OpKind::Del => KeyKind::Del,
-                    OpKind::RangeDel => KeyKind::RangeDel,
-                };
-                entries.push(SstEntry {
-                    key: InternalKey::new(user_key, seqno, key_kind),
-                    value,
-                });
-            }
-        }
-
-        entries.sort_by(|a, b| a.key.cmp(&b.key));
-        Ok(Self {
-            entries,
-            index: 0,
-            snapshot_seqno,
-        })
-    }
-}
-
-impl SstIter {
-    pub fn seek_to_first(&mut self) {
-        self.index = 0;
-    }
-
-    pub fn seek(&mut self, user_key: &[u8]) {
-        let target = InternalKey::new(
-            Bytes::copy_from_slice(user_key),
-            self.snapshot_seqno,
-            KeyKind::Meta,
-        );
-        self.index = match self
-            .entries
-            .binary_search_by(|entry| entry.key.cmp(&target))
-        {
-            Ok(i) | Err(i) => i,
-        };
-    }
-
-    pub fn next(&mut self) -> Option<anyhow::Result<(Bytes, u64, OpKind, Bytes)>> {
-        let entry = self.entries.get(self.index)?.clone();
-        self.index += 1;
-        let kind = match entry.key.kind {
-            KeyKind::Put => OpKind::Put,
-            KeyKind::Del => OpKind::Del,
-            KeyKind::RangeDel => OpKind::RangeDel,
-            other => return Some(Err(anyhow::anyhow!("unexpected key kind: {other:?}"))),
-        };
-        Some(Ok((entry.key.user_key, entry.key.seqno, kind, entry.value)))
-    }
 }

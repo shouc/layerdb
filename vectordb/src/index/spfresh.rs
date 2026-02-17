@@ -21,7 +21,7 @@ impl Default for SpFreshConfig {
             initial_postings: 64,
             split_limit: 512,
             merge_limit: 64,
-            reassign_range: 16,
+            reassign_range: 64,
             nprobe: 8,
             kmeans_iters: 8,
         }
@@ -121,15 +121,19 @@ impl SpFreshIndex {
     }
 
     fn assign(&mut self, id: u64, posting_id: usize) {
-        if let Some(prev) = self.vector_posting.insert(id, posting_id) {
-            if prev != posting_id {
-                if let Some(prev_posting) = self.postings.get_mut(&prev) {
-                    prev_posting.members.retain(|x| *x != id);
-                }
+        if let Some(prev) = self.vector_posting.get(&id).copied() {
+            if prev == posting_id {
+                return;
+            }
+            if let Some(prev_posting) = self.postings.get_mut(&prev) {
+                prev_posting.members.retain(|x| *x != id);
             }
         }
+        self.vector_posting.insert(id, posting_id);
         if let Some(posting) = self.postings.get_mut(&posting_id) {
-            posting.members.push(id);
+            if !posting.members.contains(&id) {
+                posting.members.push(id);
+            }
         }
     }
 
@@ -178,12 +182,9 @@ impl SpFreshIndex {
         let points: Vec<Vec<f32>> = vectors.iter().map(|(_, v)| v.clone()).collect();
         let seeds = pick_two_far_apart(&points);
         let mut centroids = vec![points[seeds.0].clone(), points[seeds.1].clone()];
-
-        let mut assign = vec![0usize; points.len()];
+        let mut assign = balanced_partition(&points, &centroids);
         for _ in 0..self.cfg.kmeans_iters.max(2) {
-            for (i, p) in points.iter().enumerate() {
-                assign[i] = argmin_l2(p, &centroids).unwrap_or(0);
-            }
+            assign = balanced_partition(&points, &centroids);
             for cid in 0..2 {
                 let bucket: Vec<Vec<f32>> = points
                     .iter()
@@ -235,24 +236,22 @@ impl SpFreshIndex {
             .collect();
         scope.sort_by(|x, y| x.1.total_cmp(&y.1));
 
-        let mut scoped_ids: HashSet<usize> = HashSet::new();
-        scoped_ids.insert(new_a);
-        scoped_ids.insert(new_b);
-        for (pid, _) in scope.into_iter().take(self.cfg.reassign_range) {
-            scoped_ids.insert(pid);
-        }
-
-        let scope_centroids: Vec<(usize, Vec<f32>)> = scoped_ids
-            .iter()
-            .filter_map(|pid| self.postings.get(pid).map(|p| (*pid, p.centroid.clone())))
+        let scoped_neighbors: Vec<usize> = scope
+            .into_iter()
+            .take(self.cfg.reassign_range)
+            .map(|(pid, _)| pid)
             .collect();
 
         let mut reassign = Vec::new();
-        for pid in &scoped_ids {
-            let Some(posting) = self.postings.get(pid) else {
+
+        // Equation (1): only vectors in split postings need this check.
+        for pid in [new_a, new_b] {
+            let Some(posting) = self.postings.get(&pid) else {
                 continue;
             };
-            for vid in &posting.members {
+            let members = posting.members.clone();
+            let current_centroid = posting.centroid.clone();
+            for vid in &members {
                 let Some(v) = self.vectors.get(vid) else {
                     continue;
                 };
@@ -260,20 +259,49 @@ impl SpFreshIndex {
                 let d_a = squared_l2(&v.values, &a_centroid);
                 let d_b = squared_l2(&v.values, &b_centroid);
                 let cond1 = d_old <= d_a && d_old <= d_b;
-                let cond2 = d_a <= d_old || d_b <= d_old;
-                if !(cond1 || cond2) {
+                if !cond1 {
                     continue;
                 }
-                let mut best = *pid;
-                let mut best_dist = squared_l2(&v.values, &posting.centroid);
-                for (candidate, centroid) in &scope_centroids {
-                    let d = squared_l2(&v.values, centroid);
+
+                let mut best = pid;
+                let mut best_dist = squared_l2(&v.values, &current_centroid);
+                for neighbor_pid in &scoped_neighbors {
+                    let Some(candidate) = self.postings.get(neighbor_pid) else {
+                        continue;
+                    };
+                    let d = squared_l2(&v.values, &candidate.centroid);
                     if d < best_dist {
-                        best = *candidate;
+                        best = *neighbor_pid;
                         best_dist = d;
                     }
                 }
-                if best != *pid {
+                if best != pid {
+                    reassign.push((*vid, pid, best));
+                }
+            }
+        }
+
+        // Equation (2): only nearby neighbor postings need this check.
+        for pid in &scoped_neighbors {
+            let Some(posting) = self.postings.get(pid) else {
+                continue;
+            };
+            let members = posting.members.clone();
+            let current_centroid = posting.centroid.clone();
+            for vid in &members {
+                let Some(v) = self.vectors.get(vid) else {
+                    continue;
+                };
+                let d_old = squared_l2(&v.values, old_centroid);
+                let d_a = squared_l2(&v.values, &a_centroid);
+                let d_b = squared_l2(&v.values, &b_centroid);
+                let cond2 = d_a <= d_old || d_b <= d_old;
+                if !cond2 {
+                    continue;
+                }
+                let (best, best_dist) = if d_a <= d_b { (new_a, d_a) } else { (new_b, d_b) };
+                let current_dist = squared_l2(&v.values, &current_centroid);
+                if best_dist < current_dist {
                     reassign.push((*vid, *pid, best));
                 }
             }
@@ -285,11 +313,16 @@ impl SpFreshIndex {
 
         let mut touched = HashSet::new();
         for (vid, from, to) in reassign {
+            if self.vector_posting.get(&vid).copied() != Some(from) {
+                continue;
+            }
             if let Some(p) = self.postings.get_mut(&from) {
                 p.members.retain(|x| *x != vid);
             }
             if let Some(p) = self.postings.get_mut(&to) {
-                p.members.push(vid);
+                if !p.members.contains(&vid) {
+                    p.members.push(vid);
+                }
             }
             self.vector_posting.insert(vid, to);
             touched.insert(from);
@@ -399,6 +432,29 @@ impl VectorIndex for SpFreshIndex {
     fn len(&self) -> usize {
         self.vectors.len()
     }
+}
+
+fn balanced_partition(points: &[Vec<f32>], centroids: &[Vec<f32>]) -> Vec<usize> {
+    if points.len() <= 1 {
+        return vec![0; points.len()];
+    }
+    let mut scored: Vec<(usize, f32)> = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let d0 = squared_l2(p, &centroids[0]);
+            let d1 = squared_l2(p, &centroids[1]);
+            (i, d0 - d1)
+        })
+        .collect();
+    scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+    let split = points.len().div_ceil(2);
+    let mut assign = vec![0usize; points.len()];
+    for (rank, (idx, _)) in scored.into_iter().enumerate() {
+        assign[idx] = if rank < split { 0 } else { 1 };
+    }
+    assign
 }
 
 fn kmeans(vectors: &[Vec<f32>], k: usize, iters: usize) -> Vec<Vec<f32>> {

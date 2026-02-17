@@ -103,15 +103,19 @@ impl AppendOnlyIndex {
     }
 
     fn assign(&mut self, id: u64, pid: usize) {
-        if let Some(prev) = self.vector_posting.insert(id, pid) {
-            if prev != pid {
-                if let Some(prev_posting) = self.postings.get_mut(&prev) {
-                    prev_posting.members.retain(|x| *x != id);
-                }
+        if let Some(prev) = self.vector_posting.get(&id).copied() {
+            if prev == pid {
+                return;
+            }
+            if let Some(prev_posting) = self.postings.get_mut(&prev) {
+                prev_posting.members.retain(|x| *x != id);
             }
         }
+        self.vector_posting.insert(id, pid);
         if let Some(posting) = self.postings.get_mut(&pid) {
-            posting.members.push(id);
+            if !posting.members.contains(&id) {
+                posting.members.push(id);
+            }
         }
     }
 

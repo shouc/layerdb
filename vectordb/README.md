@@ -46,6 +46,7 @@ cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
   - `write_sync=true`
 - prefer fallible APIs in services:
   - `try_upsert`, `try_delete`, `try_bulk_load`
+  - `open_existing` to recover config from persisted metadata
   - `close` for graceful worker shutdown + final rebuild
   - `health_check` and `stats` for operational monitoring
 

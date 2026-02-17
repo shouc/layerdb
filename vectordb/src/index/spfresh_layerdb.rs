@@ -108,6 +108,43 @@ impl SpFreshLayerDbIndex {
         ensure_wal_exists(db_path)?;
         refresh_read_snapshot(&db)?;
         ensure_metadata(&db, &cfg)?;
+        Self::open_with_db(db_path, db, cfg)
+    }
+
+    pub fn open_existing(
+        path: impl AsRef<Path>,
+        db_options: DbOptions,
+    ) -> anyhow::Result<Self> {
+        let db_path = path.as_ref();
+        let db = Db::open(db_path, db_options.clone()).context("open layerdb for spfresh")?;
+        ensure_wal_exists(db_path)?;
+        refresh_read_snapshot(&db)?;
+        let meta = load_metadata(&db)?.ok_or_else(|| {
+            anyhow::anyhow!("missing spfresh metadata in {}; initialize with open()", db_path.display())
+        })?;
+        let cfg = SpFreshLayerDbConfig {
+            spfresh: SpFreshConfig {
+                dim: meta.dim,
+                initial_postings: meta.initial_postings,
+                split_limit: meta.split_limit,
+                merge_limit: meta.merge_limit,
+                reassign_range: meta.reassign_range,
+                nprobe: meta.nprobe,
+                kmeans_iters: meta.kmeans_iters,
+            },
+            db_options,
+            ..Default::default()
+        };
+        validate_config(&cfg)?;
+        ensure_metadata(&db, &cfg)?;
+        Self::open_with_db(db_path, db, cfg)
+    }
+
+    fn open_with_db(
+        db_path: &Path,
+        db: Db,
+        cfg: SpFreshLayerDbConfig,
+    ) -> anyhow::Result<Self> {
         let rows = load_rows(&db)?;
         let index = SpFreshIndex::build(cfg.spfresh.clone(), &rows);
         let index = Arc::new(RwLock::new(index));
@@ -494,12 +531,7 @@ fn ensure_metadata(db: &Db, cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> {
         kmeans_iters: cfg.spfresh.kmeans_iters,
     };
 
-    let current = db
-        .get(META_CONFIG_KEY, ReadOptions::default())
-        .context("read spfresh metadata")?;
-    if let Some(value) = current {
-        let actual: SpFreshPersistedMeta =
-            serde_json::from_slice(value.as_ref()).context("decode spfresh metadata")?;
+    if let Some(actual) = load_metadata(db)? {
         if actual.schema_version != expected.schema_version {
             anyhow::bail!(
                 "spfresh schema version mismatch: stored={} expected={}",
@@ -528,6 +560,18 @@ fn ensure_metadata(db: &Db, cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> {
     db.put(META_CONFIG_KEY, bytes, WriteOptions { sync: true })
         .context("persist spfresh metadata")?;
     Ok(())
+}
+
+fn load_metadata(db: &Db) -> anyhow::Result<Option<SpFreshPersistedMeta>> {
+    let current = db
+        .get(META_CONFIG_KEY, ReadOptions::default())
+        .context("read spfresh metadata")?;
+    let Some(value) = current else {
+        return Ok(None);
+    };
+    let meta: SpFreshPersistedMeta =
+        serde_json::from_slice(value.as_ref()).context("decode spfresh metadata")?;
+    Ok(Some(meta))
 }
 
 fn ensure_wal_exists(path: &Path) -> anyhow::Result<()> {
@@ -600,6 +644,7 @@ fn lock_write<T>(m: &Arc<RwLock<T>>) -> RwLockWriteGuard<'_, T> {
 mod tests {
     use std::fs;
 
+    use layerdb::DbOptions;
     use tempfile::TempDir;
 
     use crate::types::{VectorIndex, VectorRecord};
@@ -732,6 +777,23 @@ mod tests {
         let health = idx.health_check()?;
         assert_eq!(health.total_upserts, 1);
         assert_eq!(health.persist_errors, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn open_existing_uses_persisted_metadata() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let cfg = SpFreshLayerDbConfig::default();
+        {
+            let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+            idx.try_upsert(9, vec![0.9; cfg.spfresh.dim])?;
+            idx.close()?;
+        }
+
+        let idx = SpFreshLayerDbIndex::open_existing(dir.path(), DbOptions::default())?;
+        assert_eq!(idx.len(), 1);
+        let got = idx.search(&vec![0.9; 64], 1);
+        assert_eq!(got[0].id, 9);
         Ok(())
     }
 }

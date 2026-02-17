@@ -65,6 +65,7 @@ This provides crash recovery without replaying external logs in `vectordb`.
   - WAL directory and at least one WAL segment exist
   - persisted SPFresh metadata matches runtime config
   - returns current stats snapshot on success
+- `open_existing(path, db_options)` restores runtime SPFresh config directly from persisted metadata for safer restart automation
 
 ## Relationship to SPFresh Paper Architecture (arXiv:2410.14452v1)
 This implementation follows the same system split:

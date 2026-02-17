@@ -120,6 +120,10 @@ where
         self.inner.lock().len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn stats(&self) -> CacheStats {
         CacheStats {
             hits: self.hits.load(Ordering::Relaxed),
@@ -154,6 +158,10 @@ where
 
     pub fn len(&self) -> usize {
         self.inner.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

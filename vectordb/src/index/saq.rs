@@ -589,14 +589,14 @@ fn kmeans(vectors: &[Vec<f32>], k: usize, iters: usize) -> Vec<Vec<f32>> {
         for (i, v) in vectors.iter().enumerate() {
             assign[i] = argmin_l2(v, &centroids).unwrap_or(0);
         }
-        for cid in 0..k {
+        for (cid, centroid) in centroids.iter_mut().enumerate().take(k) {
             let rows: Vec<Vec<f32>> = vectors
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, v)| (assign[idx] == cid).then_some(v.clone()))
                 .collect();
             if !rows.is_empty() {
-                centroids[cid] = mean(&rows, dim);
+                *centroid = mean(&rows, dim);
             }
         }
     }

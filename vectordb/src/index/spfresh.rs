@@ -185,14 +185,14 @@ impl SpFreshIndex {
         let mut assign = balanced_partition(&points, &centroids);
         for _ in 0..self.cfg.kmeans_iters.max(2) {
             assign = balanced_partition(&points, &centroids);
-            for cid in 0..2 {
+            for (cid, centroid) in centroids.iter_mut().enumerate().take(2) {
                 let bucket: Vec<Vec<f32>> = points
                     .iter()
                     .enumerate()
                     .filter_map(|(i, p)| (assign[i] == cid).then_some(p.clone()))
                     .collect();
                 if !bucket.is_empty() {
-                    centroids[cid] = mean(&bucket, self.cfg.dim);
+                    *centroid = mean(&bucket, self.cfg.dim);
                 }
             }
         }
@@ -475,14 +475,14 @@ fn kmeans(vectors: &[Vec<f32>], k: usize, iters: usize) -> Vec<Vec<f32>> {
         for (i, v) in vectors.iter().enumerate() {
             assign[i] = argmin_l2(v, &centroids).unwrap_or(0);
         }
-        for cid in 0..k {
+        for (cid, centroid) in centroids.iter_mut().enumerate().take(k) {
             let rows: Vec<Vec<f32>> = vectors
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, v)| (assign[idx] == cid).then_some(v.clone()))
                 .collect();
             if !rows.is_empty() {
-                centroids[cid] = mean(&rows, dim);
+                *centroid = mean(&rows, dim);
             }
         }
     }

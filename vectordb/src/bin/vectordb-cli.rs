@@ -162,12 +162,13 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
         .map(|q| exact_knn(&exact_rows, q, args.k))
         .collect();
 
-    let mut stats = Vec::new();
-    stats.push(bench_spfresh(args, &data, &exact_answers));
-    stats.push(bench_spfresh_layerdb(args, &data, &exact_answers)?);
-    stats.push(bench_append_only(args, &data, &exact_answers));
-    stats.push(bench_saq(args, &data, &exact_answers));
-    stats.push(bench_saq_uniform(args, &data, &exact_answers));
+    let stats = vec![
+        bench_spfresh(args, &data, &exact_answers),
+        bench_spfresh_layerdb(args, &data, &exact_answers)?,
+        bench_append_only(args, &data, &exact_answers),
+        bench_saq(args, &data, &exact_answers),
+        bench_saq_uniform(args, &data, &exact_answers),
+    ];
 
     println!(
         "vectordb bench dim={} base={} updates={} queries={} k={}",

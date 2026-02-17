@@ -1,16 +1,17 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
 
 use crate::types::VectorRecord;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyntheticDataset {
     pub base: Vec<VectorRecord>,
     pub updates: Vec<(u64, Vec<f32>)>,
     pub queries: Vec<Vec<f32>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyntheticConfig {
     pub seed: u64,
     pub dim: usize,

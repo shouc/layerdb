@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::time::Instant;
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ enum Command {
     Version,
     Bench(BenchArgs),
     SaqValidate(SaqValidateArgs),
+    DumpDataset(DumpDatasetArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -81,6 +83,22 @@ struct SaqValidateArgs {
     nprobe: usize,
 }
 
+#[derive(Debug, Parser)]
+struct DumpDatasetArgs {
+    #[arg(long)]
+    out: String,
+    #[arg(long, default_value_t = 64)]
+    dim: usize,
+    #[arg(long, default_value_t = 50_000)]
+    base: usize,
+    #[arg(long, default_value_t = 5_000)]
+    updates: usize,
+    #[arg(long, default_value_t = 300)]
+    queries: usize,
+    #[arg(long, default_value_t = 0x5EED_1234_ABCD_u64)]
+    seed: u64,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -89,6 +107,7 @@ fn main() -> Result<()> {
         }
         Command::Bench(args) => run_bench(&args)?,
         Command::SaqValidate(args) => run_saq_validate(&args)?,
+        Command::DumpDataset(args) => run_dump_dataset(&args)?,
     }
     Ok(())
 }
@@ -236,6 +255,23 @@ fn run_saq_validate(args: &SaqValidateArgs) -> Result<()> {
     println!("- same IVF cluster count, nprobe, and bit budget for both variants");
     println!("- SAQ variant enables joint DP + variance-aware ordering + CAQ");
     println!("- uniform variant disables those paper-specific components");
+    Ok(())
+}
+
+fn run_dump_dataset(args: &DumpDatasetArgs) -> Result<()> {
+    let data = generate_synthetic(&SyntheticConfig {
+        seed: args.seed,
+        dim: args.dim,
+        base_count: args.base,
+        update_count: args.updates,
+        query_count: args.queries,
+    });
+    let encoded = serde_json::to_vec_pretty(&data)?;
+    fs::write(&args.out, encoded)?;
+    println!(
+        "wrote dataset to {} (dim={} base={} updates={} queries={} seed={})",
+        args.out, args.dim, args.base, args.updates, args.queries, args.seed
+    );
     Ok(())
 }
 

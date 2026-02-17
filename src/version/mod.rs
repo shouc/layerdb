@@ -1430,8 +1430,8 @@ impl VersionSet {
                 Some(l) => std::cmp::max(l, file.largest_user_key.clone()),
             });
         }
-        let smallest = smallest.unwrap_or_else(Bytes::new);
-        let largest = largest.unwrap_or_else(Bytes::new);
+        let smallest = smallest.unwrap_or_default();
+        let largest = largest.unwrap_or_default();
 
         let mut compact_inputs = Vec::new();
         compact_inputs.extend(l0_in_range.clone());
@@ -1889,10 +1889,8 @@ fn drop_obsolete_range_tombstones_bottommost(
 
     let droppable: Vec<RangeTombstone> = entries
         .iter()
-        .filter_map(|(key, value)| {
-            (key.kind == KeyKind::RangeDel && key.seqno < min_snapshot_seqno)
-                .then(|| RangeTombstone::new(key.user_key.clone(), value.clone(), key.seqno))
-        })
+        .filter(|(key, _)| key.kind == KeyKind::RangeDel && key.seqno < min_snapshot_seqno)
+        .map(|(key, value)| RangeTombstone::new(key.user_key.clone(), value.clone(), key.seqno))
         .collect();
 
     if droppable.is_empty() {

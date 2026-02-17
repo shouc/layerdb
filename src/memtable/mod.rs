@@ -26,6 +26,7 @@ pub(crate) struct MemTable {
     pub(crate) wal_segment_id: u64,
     shards: Vec<MemTableShard>,
     approximate_bytes: AtomicU64,
+    range_tombstone_count: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -117,11 +118,13 @@ impl MemTableManager {
         let mut candidate: Option<(u64, Option<Value>)> = None;
 
         let mutable = self.mutable.read().clone();
+        let mut has_range_tombstones = mutable.has_range_tombstones();
         if let Some((seqno, v)) = mutable.get(key, snapshot_seqno) {
             candidate = Some((seqno, v));
         }
 
         for mem in self.immutables.lock().iter() {
+            has_range_tombstones |= mem.has_range_tombstones();
             if let Some((seqno, v)) = mem.get(key, snapshot_seqno) {
                 match &candidate {
                     Some((best_seq, _)) if *best_seq >= seqno => {}
@@ -130,12 +133,15 @@ impl MemTableManager {
             }
         }
 
-        let tombstone_seq = self
-            .range_tombstones(snapshot_seqno)
-            .iter()
-            .filter(|t| t.start_key.as_ref() <= key && key < t.end_key.as_ref())
-            .map(|t| t.seqno)
-            .max();
+        let tombstone_seq = if has_range_tombstones {
+            self.range_tombstones(snapshot_seqno)
+                .iter()
+                .filter(|t| t.start_key.as_ref() <= key && key < t.end_key.as_ref())
+                .map(|t| t.seqno)
+                .max()
+        } else {
+            None
+        };
 
         let result = match (candidate, tombstone_seq) {
             (Some((seq, value)), Some(tseq)) => {
@@ -199,11 +205,16 @@ impl MemTable {
                 })
                 .collect(),
             approximate_bytes: AtomicU64::new(0),
+            range_tombstone_count: AtomicU64::new(0),
         }
     }
 
     pub(crate) fn approximate_bytes(&self) -> u64 {
         self.approximate_bytes.load(AtomicOrdering::Relaxed)
+    }
+
+    fn has_range_tombstones(&self) -> bool {
+        self.range_tombstone_count.load(AtomicOrdering::Relaxed) > 0
     }
 
     pub(crate) fn to_sorted_entries(&self) -> Vec<(InternalKey, Bytes)> {
@@ -218,6 +229,36 @@ impl MemTable {
     }
 
     fn apply_batch(&self, shard_count: usize, seqno_base: u64, ops: &[Op]) {
+        // Fast path: small foreground batches are latency-sensitive.
+        // Avoid Rayon scheduling overhead and insert directly.
+        if ops.len() <= 64 {
+            for (idx, op) in ops.iter().enumerate() {
+                let seqno = seqno_base + idx as u64;
+                let user_key = op.key.clone();
+                let shard = shard_for_key(shard_count, user_key.as_ref());
+                let (kind, value) = match op.kind {
+                    OpKind::Put => (KeyKind::Put, op.value.clone()),
+                    OpKind::Del => (KeyKind::Del, Bytes::new()),
+                    OpKind::RangeDel => (KeyKind::RangeDel, op.value.clone()),
+                };
+                let entry = InternalEntry {
+                    key: InternalKey::new(user_key, seqno, kind),
+                    value,
+                };
+                if matches!(entry.key.kind, KeyKind::RangeDel) {
+                    self.range_tombstone_count
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                self.shards[shard]
+                    .map
+                    .insert(entry.key.clone(), entry.value.clone());
+                let bytes = entry.key.user_key.len() as u64 + entry.value.len() as u64 + 16;
+                self.approximate_bytes
+                    .fetch_add(bytes, AtomicOrdering::Relaxed);
+            }
+            return;
+        }
+
         let mut per_shard: Vec<Vec<InternalEntry>> = (0..shard_count).map(|_| Vec::new()).collect();
         for (idx, op) in ops.iter().enumerate() {
             let seqno = seqno_base + idx as u64;
@@ -236,6 +277,7 @@ impl MemTable {
         }
 
         let approx = &self.approximate_bytes;
+        let range_tombstone_count = &self.range_tombstone_count;
         self.shards
             .par_iter()
             .enumerate()
@@ -243,6 +285,9 @@ impl MemTable {
                 let local = &per_shard[shard_idx];
                 for entry in local {
                     shard.map.insert(entry.key.clone(), entry.value.clone());
+                    if matches!(entry.key.kind, KeyKind::RangeDel) {
+                        range_tombstone_count.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
                     let bytes = entry.key.user_key.len() as u64 + entry.value.len() as u64 + 16;
                     approx.fetch_add(bytes, AtomicOrdering::Relaxed);
                 }

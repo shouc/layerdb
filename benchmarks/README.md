@@ -6,6 +6,8 @@ This directory stores CI-facing benchmark regression thresholds.
   an allowed multiplicative budget (`max_regression_factor`).
 - Use `scripts/bench_regression.sh` to refresh a Criterion baseline and validate
   results against `baseline.json`.
+- Use `cargo run --bin engine_bench` for direct LayerDB vs RocksDB comparisons.
+- See `benchmarks/rocksdb_comparison.md` for the latest fair-run analysis.
 
 ## Typical workflow
 

@@ -314,6 +314,11 @@ impl VersionSet {
                 .copied()
                 .ok_or_else(|| anyhow::anyhow!("unknown branch: {name}"))?
         };
+        let previous = self.current_branch();
+        if previous == "main" && name != "main" {
+            let main_head = self.current_branch_seqno();
+            self.persist_branch_head("main", main_head)?;
+        }
         *self.current_branch.write() = name.to_string();
         Ok(seqno)
     }
@@ -376,6 +381,19 @@ impl VersionSet {
             .unwrap_or_else(|| self.latest_seqno())
     }
 
+    fn persist_branch_head(&self, name: &str, seqno: u64) -> anyhow::Result<()> {
+        let mut manifest = self.manifest.lock();
+        manifest.append(
+            &ManifestRecord::BranchHead(crate::version::manifest::BranchHead {
+                name: name.to_string(),
+                seqno,
+            }),
+            true,
+        )?;
+        manifest.sync_dir()?;
+        Ok(())
+    }
+
     pub fn advance_current_branch(&self, seqno: u64) -> anyhow::Result<()> {
         let branch_name = self.current_branch();
         let current_head = self.branches.read().get(&branch_name).copied().unwrap_or(0);
@@ -383,17 +401,19 @@ impl VersionSet {
             return Ok(());
         }
 
-        {
-            let mut manifest = self.manifest.lock();
-            manifest.append(
-                &ManifestRecord::BranchHead(crate::version::manifest::BranchHead {
-                    name: branch_name.clone(),
-                    seqno,
-                }),
-                true,
-            )?;
-            manifest.sync_dir()?;
+        // Hot-path optimization: the main branch head can be reconstructed from
+        // WAL/manifest file metadata during recovery, so avoid per-write
+        // manifest fsync for foreground puts/deletes.
+        if branch_name == "main" {
+            let mut branches = self.branches.write();
+            let head = branches.entry(branch_name).or_insert(0);
+            if seqno > *head {
+                *head = seqno;
+            }
+            return Ok(());
         }
+
+        self.persist_branch_head(&branch_name, seqno)?;
 
         let mut branches = self.branches.write();
         let head = branches.entry(branch_name).or_insert(0);

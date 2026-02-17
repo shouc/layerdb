@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::JoinHandle;
@@ -89,6 +89,7 @@ impl SpFreshLayerDbStatsInner {
 
 pub struct SpFreshLayerDbIndex {
     cfg: SpFreshLayerDbConfig,
+    db_path: PathBuf,
     db: Db,
     index: Arc<RwLock<SpFreshIndex>>,
     update_gate: Arc<Mutex<()>>,
@@ -131,6 +132,7 @@ impl SpFreshLayerDbIndex {
 
         Ok(Self {
             cfg,
+            db_path: db_path.to_path_buf(),
             db,
             index,
             update_gate,
@@ -273,6 +275,12 @@ impl SpFreshLayerDbIndex {
     pub fn stats(&self) -> SpFreshLayerDbStats {
         self.stats
             .snapshot(self.pending_ops.load(Ordering::Relaxed) as u64)
+    }
+
+    pub fn health_check(&self) -> anyhow::Result<SpFreshLayerDbStats> {
+        ensure_wal_exists(&self.db_path)?;
+        ensure_metadata(&self.db, &self.cfg)?;
+        Ok(self.stats())
     }
 }
 
@@ -712,6 +720,18 @@ mod tests {
         assert_eq!(idx.len(), 1);
         let got = idx.search(&vec![0.42; 64], 1);
         assert_eq!(got[0].id, 42);
+        Ok(())
+    }
+
+    #[test]
+    fn health_check_reports_stats_and_integrity() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let cfg = SpFreshLayerDbConfig::default();
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(7, vec![0.7; cfg.spfresh.dim])?;
+        let health = idx.health_check()?;
+        assert_eq!(health.total_upserts, 1);
+        assert_eq!(health.persist_errors, 0);
         Ok(())
     }
 }

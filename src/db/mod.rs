@@ -415,7 +415,7 @@ impl Db {
                 let mut iter = reader.iter(u64::MAX)?;
                 iter.seek_to_first();
                 let mut entries = 0u64;
-                while let Some(next) = iter.next() {
+                for next in iter {
                     let _ = next?;
                     entries += 1;
                 }

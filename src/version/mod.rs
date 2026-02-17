@@ -1457,7 +1457,7 @@ impl VersionSet {
             let reader = self.cached_reader(&path)?;
             let mut iter = reader.iter(u64::MAX)?;
             iter.seek_to_first();
-            while let Some(next) = iter.next() {
+            for next in iter {
                 let (user_key, seqno, kind, value) = next?;
                 let key_kind = match kind {
                     OpKind::Put => KeyKind::Put,

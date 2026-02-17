@@ -28,7 +28,7 @@ impl SstIter {
             let reader = SstReader::open(&path)?;
             let mut iter = reader.iter(snapshot_seqno)?;
             iter.seek_to_first();
-            while let Some(next) = iter.next() {
+            for next in iter {
                 let (user_key, seqno, kind, value) = next?;
                 if !range_contains(&bounds, user_key.as_ref()) {
                     continue;

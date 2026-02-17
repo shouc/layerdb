@@ -6,12 +6,27 @@ use std::time::Duration;
 
 use anyhow::Context;
 use layerdb::{Db, DbOptions, Range, ReadOptions, WriteOptions};
+use serde::{Deserialize, Serialize};
 
 use crate::types::{Neighbor, VectorIndex, VectorRecord};
 
 use super::{SpFreshConfig, SpFreshIndex};
 
 const VECTOR_PREFIX: &str = "spfresh/v/";
+const META_CONFIG_KEY: &str = "spfresh/meta/config";
+const META_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SpFreshPersistedMeta {
+    schema_version: u32,
+    dim: usize,
+    initial_postings: usize,
+    split_limit: usize,
+    merge_limit: usize,
+    reassign_range: usize,
+    nprobe: usize,
+    kmeans_iters: usize,
+}
 
 #[derive(Clone, Debug)]
 pub struct SpFreshLayerDbConfig {
@@ -50,10 +65,12 @@ pub struct SpFreshLayerDbIndex {
 
 impl SpFreshLayerDbIndex {
     pub fn open(path: impl AsRef<Path>, cfg: SpFreshLayerDbConfig) -> anyhow::Result<Self> {
+        validate_config(&cfg)?;
         let db_path = path.as_ref();
         let db = Db::open(db_path, cfg.db_options.clone()).context("open layerdb for spfresh")?;
         ensure_wal_exists(db_path)?;
         refresh_read_snapshot(&db)?;
+        ensure_metadata(&db, &cfg)?;
         let rows = load_rows(&db)?;
         let index = SpFreshIndex::build(cfg.spfresh.clone(), &rows);
         let index = Arc::new(RwLock::new(index));
@@ -331,6 +348,92 @@ fn refresh_read_snapshot(db: &Db) -> anyhow::Result<()> {
     .context("refresh layerdb read snapshot for recovery")
 }
 
+fn validate_config(cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> {
+    if cfg.spfresh.dim == 0 {
+        anyhow::bail!("spfresh dim must be > 0");
+    }
+    if cfg.spfresh.initial_postings == 0 {
+        anyhow::bail!("spfresh initial_postings must be > 0");
+    }
+    if cfg.spfresh.nprobe == 0 {
+        anyhow::bail!("spfresh nprobe must be > 0");
+    }
+    if cfg.spfresh.kmeans_iters == 0 {
+        anyhow::bail!("spfresh kmeans_iters must be > 0");
+    }
+    if cfg.spfresh.split_limit < 4 {
+        anyhow::bail!("spfresh split_limit must be >= 4");
+    }
+    if cfg.spfresh.merge_limit == 0 {
+        anyhow::bail!("spfresh merge_limit must be > 0");
+    }
+    if cfg.spfresh.split_limit <= cfg.spfresh.merge_limit {
+        anyhow::bail!(
+            "spfresh split_limit ({}) must be > merge_limit ({})",
+            cfg.spfresh.split_limit,
+            cfg.spfresh.merge_limit
+        );
+    }
+    if cfg.spfresh.reassign_range == 0 {
+        anyhow::bail!("spfresh reassign_range must be > 0");
+    }
+    if cfg.rebuild_pending_ops == 0 {
+        anyhow::bail!("spfresh rebuild_pending_ops must be > 0");
+    }
+    if cfg.rebuild_interval.is_zero() {
+        anyhow::bail!("spfresh rebuild_interval must be > 0");
+    }
+    Ok(())
+}
+
+fn ensure_metadata(db: &Db, cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> {
+    let expected = SpFreshPersistedMeta {
+        schema_version: META_SCHEMA_VERSION,
+        dim: cfg.spfresh.dim,
+        initial_postings: cfg.spfresh.initial_postings,
+        split_limit: cfg.spfresh.split_limit,
+        merge_limit: cfg.spfresh.merge_limit,
+        reassign_range: cfg.spfresh.reassign_range,
+        nprobe: cfg.spfresh.nprobe,
+        kmeans_iters: cfg.spfresh.kmeans_iters,
+    };
+
+    let current = db
+        .get(META_CONFIG_KEY, ReadOptions::default())
+        .context("read spfresh metadata")?;
+    if let Some(value) = current {
+        let actual: SpFreshPersistedMeta =
+            serde_json::from_slice(value.as_ref()).context("decode spfresh metadata")?;
+        if actual.schema_version != expected.schema_version {
+            anyhow::bail!(
+                "spfresh schema version mismatch: stored={} expected={}",
+                actual.schema_version,
+                expected.schema_version
+            );
+        }
+        if actual.dim != expected.dim {
+            anyhow::bail!("spfresh dim mismatch: stored={} expected={}", actual.dim, expected.dim);
+        }
+        if actual.initial_postings != expected.initial_postings
+            || actual.split_limit != expected.split_limit
+            || actual.merge_limit != expected.merge_limit
+            || actual.reassign_range != expected.reassign_range
+            || actual.nprobe != expected.nprobe
+            || actual.kmeans_iters != expected.kmeans_iters
+        {
+            anyhow::bail!(
+                "spfresh config mismatch with stored metadata; use matching config for this index directory"
+            );
+        }
+        return Ok(());
+    }
+
+    let bytes = serde_json::to_vec(&expected).context("encode spfresh metadata")?;
+    db.put(META_CONFIG_KEY, bytes, WriteOptions { sync: true })
+        .context("persist spfresh metadata")?;
+    Ok(())
+}
+
 fn ensure_wal_exists(path: &Path) -> anyhow::Result<()> {
     let wal_dir = path.join("wal");
     if !wal_dir.is_dir() {
@@ -435,6 +538,40 @@ mod tests {
         assert_eq!(idx.len(), 2);
         let got = idx.search(&vec![0.5; 64], 1);
         assert_eq!(got[0].id, 12);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_config() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let mut cfg = SpFreshLayerDbConfig::default();
+        cfg.spfresh.split_limit = 8;
+        cfg.spfresh.merge_limit = 8;
+        let err = match SpFreshLayerDbIndex::open(dir.path(), cfg) {
+            Ok(_) => anyhow::bail!("expected config validation error"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("split_limit"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mismatched_persisted_config() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let cfg = SpFreshLayerDbConfig::default();
+        {
+            let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+            idx.upsert(1, vec![0.1; cfg.spfresh.dim]);
+            idx.close()?;
+        }
+
+        let mut different = cfg.clone();
+        different.spfresh.nprobe = cfg.spfresh.nprobe + 1;
+        let err = match SpFreshLayerDbIndex::open(dir.path(), different) {
+            Ok(_) => anyhow::bail!("expected metadata mismatch"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("config mismatch"));
         Ok(())
     }
 }

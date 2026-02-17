@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::time::Instant;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -7,6 +8,7 @@ use vectordb::dataset::{generate_synthetic, SyntheticConfig};
 use vectordb::ground_truth::{exact_knn, recall_at_k};
 use vectordb::index::{
     AppendOnlyConfig, AppendOnlyIndex, SaqConfig, SaqIndex, SpFreshConfig, SpFreshIndex,
+    SpFreshLayerDbConfig, SpFreshLayerDbIndex,
 };
 use vectordb::types::{VectorIndex, VectorRecord};
 
@@ -53,6 +55,10 @@ struct BenchArgs {
     saq_total_bits: usize,
     #[arg(long, default_value_t = 64)]
     saq_ivf_clusters: usize,
+    #[arg(long, default_value_t = 2000)]
+    spfresh_rebuild_pending_ops: usize,
+    #[arg(long, default_value_t = 500)]
+    spfresh_rebuild_interval_ms: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -117,6 +123,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
 
     let mut stats = Vec::new();
     stats.push(bench_spfresh(args, &data, &exact_answers));
+    stats.push(bench_spfresh_layerdb(args, &data, &exact_answers));
     stats.push(bench_append_only(args, &data, &exact_answers));
     stats.push(bench_saq(args, &data, &exact_answers));
     stats.push(bench_saq_uniform(args, &data, &exact_answers));
@@ -142,11 +149,6 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
     println!("- same update stream and same query set for all engines");
     println!("- recall measured against exact KNN after all updates");
     println!("- same nprobe={} and top-k={}", args.nprobe, args.k);
-    println!();
-    println!(
-        "note: no public cloneable `pinecore` ANN engine repository was found during setup; \
-using append-only partition baseline as pinecore-like reference."
-    );
 
     Ok(())
 }
@@ -323,6 +325,69 @@ fn bench_append_only(
 
     EngineStats {
         name: "append-only",
+        build_ms,
+        update_qps,
+        search_qps,
+        avg_recall: recall_sum / data.queries.len() as f64,
+    }
+}
+
+fn bench_spfresh_layerdb(
+    args: &BenchArgs,
+    data: &vectordb::dataset::SyntheticDataset,
+    exact_answers: &[Vec<vectordb::Neighbor>],
+) -> EngineStats {
+    let sp_cfg = SpFreshConfig {
+        dim: args.dim,
+        initial_postings: args.initial_postings,
+        split_limit: args.split_limit,
+        merge_limit: args.merge_limit,
+        reassign_range: args.reassign_range,
+        nprobe: args.nprobe,
+        kmeans_iters: 8,
+    };
+    let cfg = SpFreshLayerDbConfig {
+        spfresh: sp_cfg,
+        rebuild_pending_ops: args.spfresh_rebuild_pending_ops.max(1),
+        rebuild_interval: Duration::from_millis(args.spfresh_rebuild_interval_ms.max(1)),
+        ..Default::default()
+    };
+
+    let db_dir = tempfile::TempDir::new().expect("create tempdir for spfresh-layerdb");
+
+    let build_start = Instant::now();
+    let mut index = SpFreshLayerDbIndex::open(db_dir.path(), cfg)
+        .expect("open spfresh-layerdb benchmark index");
+    for row in &data.base {
+        index.upsert(row.id, row.values.clone());
+    }
+    index
+        .force_rebuild()
+        .expect("force rebuild after base load for spfresh-layerdb");
+    let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
+
+    let update_start = Instant::now();
+    for (id, v) in &data.updates {
+        index.upsert(*id, v.clone());
+    }
+    let update_s = update_start.elapsed().as_secs_f64().max(1e-9);
+    let update_qps = data.updates.len() as f64 / update_s;
+
+    index
+        .force_rebuild()
+        .expect("force rebuild before recall measurement for spfresh-layerdb");
+
+    let search_start = Instant::now();
+    let mut recall_sum = 0.0f64;
+    for (i, q) in data.queries.iter().enumerate() {
+        let got = index.search(q, exact_answers[i].len());
+        recall_sum += recall_at_k(&got, &exact_answers[i], got.len()) as f64;
+    }
+    let search_s = search_start.elapsed().as_secs_f64().max(1e-9);
+    let search_qps = data.queries.len() as f64 / search_s;
+
+    EngineStats {
+        name: "spfresh-layerdb",
         build_ms,
         update_qps,
         search_qps,

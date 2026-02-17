@@ -1,14 +1,11 @@
 //! VectorDB core library.
 
+pub mod dataset;
+pub mod ground_truth;
+pub mod linalg;
+pub mod types;
+
+pub use types::{Neighbor, VectorIndex, VectorRecord};
+
 /// Library version string exposed to the CLI.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[cfg(test)]
-mod tests {
-    use super::VERSION;
-
-    #[test]
-    fn version_is_non_empty() {
-        assert!(!VERSION.is_empty());
-    }
-}

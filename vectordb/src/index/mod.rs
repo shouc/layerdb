@@ -1,4 +1,5 @@
 pub mod append_only;
+mod kmeans;
 pub mod spfresh;
 pub mod spfresh_layerdb;
 pub mod saq;

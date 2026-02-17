@@ -148,16 +148,26 @@ impl SpFreshLayerDbIndex {
 
     pub fn try_bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
         let _update_guard = lock_mutex(&self.update_gate);
-        let existing = list_vector_keys(&self.db)?;
-        if !existing.is_empty() {
-            for batch in existing.chunks(2_048) {
-                let ops: Vec<layerdb::Op> = batch
-                    .iter()
-                    .map(|key| layerdb::Op::delete(key.clone()))
-                    .collect();
-                self.db
-                    .write_batch(ops, WriteOptions { sync: self.cfg.write_sync })
-                    .context("clear existing spfresh rows")?;
+        if let Some(end) = prefix_exclusive_end(VECTOR_PREFIX.as_bytes()) {
+            self.db
+                .delete_range(
+                    VECTOR_PREFIX.as_bytes().to_vec(),
+                    end,
+                    WriteOptions { sync: self.cfg.write_sync },
+                )
+                .context("clear existing spfresh rows via prefix delete_range")?;
+        } else {
+            let existing = list_vector_keys(&self.db)?;
+            if !existing.is_empty() {
+                for batch in existing.chunks(2_048) {
+                    let ops: Vec<layerdb::Op> = batch
+                        .iter()
+                        .map(|key| layerdb::Op::delete(key.clone()))
+                        .collect();
+                    self.db
+                        .write_batch(ops, WriteOptions { sync: self.cfg.write_sync })
+                        .context("clear existing spfresh rows")?;
+                }
             }
         }
 
@@ -542,6 +552,21 @@ fn vector_key(id: u64) -> String {
     format!("{VECTOR_PREFIX}{id:020}")
 }
 
+fn prefix_exclusive_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut out = prefix.to_vec();
+    for idx in (0..out.len()).rev() {
+        if out[idx] != u8::MAX {
+            out[idx] = out[idx].saturating_add(1);
+            out.truncate(idx + 1);
+            return Some(out);
+        }
+    }
+    None
+}
+
 fn lock_mutex<T>(m: &Arc<Mutex<T>>) -> MutexGuard<'_, T> {
     match m.lock() {
         Ok(guard) => guard,
@@ -569,7 +594,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::types::VectorIndex;
+    use crate::types::{VectorIndex, VectorRecord};
 
     use super::{SpFreshLayerDbConfig, SpFreshLayerDbIndex};
 
@@ -670,6 +695,23 @@ mod tests {
         assert!(stats.rebuild_successes >= 1);
         assert_eq!(stats.rebuild_failures, 0);
         assert_eq!(stats.last_rebuild_rows, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_load_replaces_existing_dataset() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let cfg = SpFreshLayerDbConfig::default();
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(1, vec![0.0; cfg.spfresh.dim])?;
+        idx.try_upsert(2, vec![1.0; cfg.spfresh.dim])?;
+        idx.try_bulk_load(&[VectorRecord::new(42, vec![0.42; cfg.spfresh.dim])])?;
+        idx.close()?;
+
+        let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
+        assert_eq!(idx.len(), 1);
+        let got = idx.search(&vec![0.42; 64], 1);
+        assert_eq!(got[0].id, 42);
         Ok(())
     }
 }

@@ -142,7 +142,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
 
     let mut stats = Vec::new();
     stats.push(bench_spfresh(args, &data, &exact_answers));
-    stats.push(bench_spfresh_layerdb(args, &data, &exact_answers));
+    stats.push(bench_spfresh_layerdb(args, &data, &exact_answers)?);
     stats.push(bench_append_only(args, &data, &exact_answers));
     stats.push(bench_saq(args, &data, &exact_answers));
     stats.push(bench_saq_uniform(args, &data, &exact_answers));
@@ -372,7 +372,7 @@ fn bench_spfresh_layerdb(
     args: &BenchArgs,
     data: &vectordb::dataset::SyntheticDataset,
     exact_answers: &[Vec<vectordb::Neighbor>],
-) -> EngineStats {
+) -> Result<EngineStats> {
     let sp_cfg = SpFreshConfig {
         dim: args.dim,
         initial_postings: args.initial_postings,
@@ -389,26 +389,21 @@ fn bench_spfresh_layerdb(
         ..Default::default()
     };
 
-    let db_dir = tempfile::TempDir::new().expect("create tempdir for spfresh-layerdb");
+    let db_dir = tempfile::TempDir::new()?;
 
     let build_start = Instant::now();
-    let mut index =
-        SpFreshLayerDbIndex::open(db_dir.path(), cfg).expect("open spfresh-layerdb benchmark index");
-    index.try_bulk_load(&data.base).expect("bulk load base rows");
+    let mut index = SpFreshLayerDbIndex::open(db_dir.path(), cfg)?;
+    index.try_bulk_load(&data.base)?;
     let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
 
     let update_start = Instant::now();
     for (id, v) in &data.updates {
-        index
-            .try_upsert(*id, v.clone())
-            .expect("apply spfresh-layerdb update");
+        index.try_upsert(*id, v.clone())?;
     }
     let update_s = update_start.elapsed().as_secs_f64().max(1e-9);
     let update_qps = data.updates.len() as f64 / update_s;
 
-    index
-        .force_rebuild()
-        .expect("force rebuild before recall measurement for spfresh-layerdb");
+    index.force_rebuild()?;
 
     let search_start = Instant::now();
     let mut recall_sum = 0.0f64;
@@ -419,13 +414,13 @@ fn bench_spfresh_layerdb(
     let search_s = search_start.elapsed().as_secs_f64().max(1e-9);
     let search_qps = data.queries.len() as f64 / search_s;
 
-    EngineStats {
+    Ok(EngineStats {
         name: "spfresh-layerdb",
         build_ms,
         update_qps,
         search_qps,
         avg_recall: recall_sum / data.queries.len() as f64,
-    }
+    })
 }
 
 fn bench_saq(

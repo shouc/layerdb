@@ -35,7 +35,12 @@ impl DbIterator {
         self.merged.seek(key.as_ref());
     }
 
-    pub fn next(&mut self) -> Option<anyhow::Result<(bytes::Bytes, Option<Value>)>> {
+}
+
+impl Iterator for DbIterator {
+    type Item = anyhow::Result<(bytes::Bytes, Option<Value>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
         loop {
             let (key, seqno, value) = match self.merged.next()? {
                 Ok(v) => v,

@@ -3,6 +3,10 @@ name = "layerdb"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = ["vectordb"]
+resolver = "2"
+
 
 [features]
 default = ["native-uring"]

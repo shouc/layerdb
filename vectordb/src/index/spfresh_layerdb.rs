@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -52,6 +52,41 @@ impl Default for SpFreshLayerDbConfig {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpFreshLayerDbStats {
+    pub total_upserts: u64,
+    pub total_deletes: u64,
+    pub persist_errors: u64,
+    pub rebuild_successes: u64,
+    pub rebuild_failures: u64,
+    pub last_rebuild_rows: u64,
+    pub pending_ops: u64,
+}
+
+#[derive(Debug, Default)]
+struct SpFreshLayerDbStatsInner {
+    total_upserts: AtomicU64,
+    total_deletes: AtomicU64,
+    persist_errors: AtomicU64,
+    rebuild_successes: AtomicU64,
+    rebuild_failures: AtomicU64,
+    last_rebuild_rows: AtomicU64,
+}
+
+impl SpFreshLayerDbStatsInner {
+    fn snapshot(&self, pending_ops: u64) -> SpFreshLayerDbStats {
+        SpFreshLayerDbStats {
+            total_upserts: self.total_upserts.load(Ordering::Relaxed),
+            total_deletes: self.total_deletes.load(Ordering::Relaxed),
+            persist_errors: self.persist_errors.load(Ordering::Relaxed),
+            rebuild_successes: self.rebuild_successes.load(Ordering::Relaxed),
+            rebuild_failures: self.rebuild_failures.load(Ordering::Relaxed),
+            last_rebuild_rows: self.last_rebuild_rows.load(Ordering::Relaxed),
+            pending_ops,
+        }
+    }
+}
+
 pub struct SpFreshLayerDbIndex {
     cfg: SpFreshLayerDbConfig,
     db: Db,
@@ -61,6 +96,7 @@ pub struct SpFreshLayerDbIndex {
     rebuild_tx: mpsc::Sender<()>,
     stop_worker: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    stats: Arc<SpFreshLayerDbStatsInner>,
 }
 
 impl SpFreshLayerDbIndex {
@@ -77,6 +113,7 @@ impl SpFreshLayerDbIndex {
         let update_gate = Arc::new(Mutex::new(()));
         let pending_ops = Arc::new(AtomicUsize::new(0));
         let stop_worker = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(SpFreshLayerDbStatsInner::default());
         let (rebuild_tx, rebuild_rx) = mpsc::channel::<()>();
 
         let worker = spawn_rebuilder(
@@ -87,6 +124,7 @@ impl SpFreshLayerDbIndex {
             index.clone(),
             update_gate.clone(),
             pending_ops.clone(),
+            stats.clone(),
             rebuild_rx,
             stop_worker.clone(),
         );
@@ -100,6 +138,7 @@ impl SpFreshLayerDbIndex {
             rebuild_tx,
             stop_worker,
             worker: Some(worker),
+            stats,
         })
     }
 
@@ -136,6 +175,9 @@ impl SpFreshLayerDbIndex {
 
         *lock_write(&self.index) = SpFreshIndex::build(self.cfg.spfresh.clone(), rows);
         self.pending_ops.store(0, Ordering::Relaxed);
+        self.stats
+            .last_rebuild_rows
+            .store(rows.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -146,6 +188,7 @@ impl SpFreshLayerDbIndex {
             &self.index,
             &self.update_gate,
             &self.pending_ops,
+            &self.stats,
         )
     }
 
@@ -175,8 +218,12 @@ impl SpFreshLayerDbIndex {
         }
 
         let _update_guard = lock_mutex(&self.update_gate);
-        self.persist_upsert(id, &vector)?;
+        if let Err(err) = self.persist_upsert(id, &vector) {
+            self.stats.persist_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(err);
+        }
         lock_write(&self.index).upsert(id, vector);
+        self.stats.total_upserts.fetch_add(1, Ordering::Relaxed);
         let pending = self.pending_ops.fetch_add(1, Ordering::Relaxed) + 1;
         if pending == self.cfg.rebuild_pending_ops.max(1) {
             let _ = self.rebuild_tx.send(());
@@ -186,9 +233,13 @@ impl SpFreshLayerDbIndex {
 
     pub fn try_delete(&mut self, id: u64) -> anyhow::Result<bool> {
         let _update_guard = lock_mutex(&self.update_gate);
-        self.persist_delete(id)?;
+        if let Err(err) = self.persist_delete(id) {
+            self.stats.persist_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(err);
+        }
         let deleted = lock_write(&self.index).delete(id);
         if deleted {
+            self.stats.total_deletes.fetch_add(1, Ordering::Relaxed);
             let pending = self.pending_ops.fetch_add(1, Ordering::Relaxed) + 1;
             if pending == self.cfg.rebuild_pending_ops.max(1) {
                 let _ = self.rebuild_tx.send(());
@@ -207,6 +258,11 @@ impl SpFreshLayerDbIndex {
         }
         self.force_rebuild()?;
         Ok(())
+    }
+
+    pub fn stats(&self) -> SpFreshLayerDbStats {
+        self.stats
+            .snapshot(self.pending_ops.load(Ordering::Relaxed) as u64)
     }
 }
 
@@ -254,6 +310,7 @@ fn spawn_rebuilder(
     index: Arc<RwLock<SpFreshIndex>>,
     update_gate: Arc<Mutex<()>>,
     pending_ops: Arc<AtomicUsize>,
+    stats: Arc<SpFreshLayerDbStatsInner>,
     rebuild_rx: mpsc::Receiver<()>,
     stop_worker: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
@@ -264,8 +321,16 @@ fn spawn_rebuilder(
                 Ok(_) => {
                     if pending_ops.load(Ordering::Relaxed) > 0 {
                         if let Err(err) =
-                            rebuild_once(&db, &spfresh_cfg, &index, &update_gate, &pending_ops)
+                            rebuild_once(
+                                &db,
+                                &spfresh_cfg,
+                                &index,
+                                &update_gate,
+                                &pending_ops,
+                                &stats,
+                            )
                         {
+                            stats.rebuild_failures.fetch_add(1, Ordering::Relaxed);
                             eprintln!("spfresh-layerdb background rebuild failed: {err:#}");
                         }
                     }
@@ -273,8 +338,16 @@ fn spawn_rebuilder(
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if pending_ops.load(Ordering::Relaxed) >= rebuild_pending_ops {
                         if let Err(err) =
-                            rebuild_once(&db, &spfresh_cfg, &index, &update_gate, &pending_ops)
+                            rebuild_once(
+                                &db,
+                                &spfresh_cfg,
+                                &index,
+                                &update_gate,
+                                &pending_ops,
+                                &stats,
+                            )
                         {
+                            stats.rebuild_failures.fetch_add(1, Ordering::Relaxed);
                             eprintln!("spfresh-layerdb background rebuild failed: {err:#}");
                         }
                     }
@@ -291,6 +364,7 @@ fn rebuild_once(
     index: &Arc<RwLock<SpFreshIndex>>,
     update_gate: &Arc<Mutex<()>>,
     pending_ops: &Arc<AtomicUsize>,
+    stats: &Arc<SpFreshLayerDbStatsInner>,
 ) -> anyhow::Result<()> {
     let _update_guard = lock_mutex(update_gate);
     if pending_ops.load(Ordering::Relaxed) == 0 {
@@ -299,6 +373,10 @@ fn rebuild_once(
     let rows = load_rows(db)?;
     let rebuilt = SpFreshIndex::build(spfresh_cfg.clone(), &rows);
     *lock_write(index) = rebuilt;
+    stats.rebuild_successes.fetch_add(1, Ordering::Relaxed);
+    stats
+        .last_rebuild_rows
+        .store(rows.len() as u64, Ordering::Relaxed);
     pending_ops.store(0, Ordering::Relaxed);
     Ok(())
 }
@@ -572,6 +650,26 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("config mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn stats_track_operations() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let cfg = SpFreshLayerDbConfig::default();
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(1, vec![0.0; cfg.spfresh.dim])?;
+        idx.try_upsert(2, vec![1.0; cfg.spfresh.dim])?;
+        assert!(idx.try_delete(1)?);
+        idx.force_rebuild()?;
+
+        let stats = idx.stats();
+        assert_eq!(stats.total_upserts, 2);
+        assert_eq!(stats.total_deletes, 1);
+        assert_eq!(stats.persist_errors, 0);
+        assert!(stats.rebuild_successes >= 1);
+        assert_eq!(stats.rebuild_failures, 0);
+        assert_eq!(stats.last_rebuild_rows, 1);
         Ok(())
     }
 }

@@ -81,3 +81,9 @@ impl SnapshotTracker {
         }
     }
 }
+
+impl Default for SnapshotTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}

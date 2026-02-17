@@ -358,12 +358,7 @@ fn bench_spfresh_layerdb(
     let build_start = Instant::now();
     let mut index = SpFreshLayerDbIndex::open(db_dir.path(), cfg)
         .expect("open spfresh-layerdb benchmark index");
-    for row in &data.base {
-        index.upsert(row.id, row.values.clone());
-    }
-    index
-        .force_rebuild()
-        .expect("force rebuild after base load for spfresh-layerdb");
+    index.bulk_load(&data.base).expect("bulk load base rows");
     let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
 
     let update_start = Instant::now();

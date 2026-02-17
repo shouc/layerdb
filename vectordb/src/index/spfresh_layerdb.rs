@@ -63,6 +63,7 @@ impl SpFreshLayerDbIndex {
         let worker = spawn_rebuilder(
             db.clone(),
             cfg.spfresh.clone(),
+            cfg.rebuild_pending_ops.max(1),
             cfg.rebuild_interval,
             index.clone(),
             update_gate.clone(),
@@ -81,6 +82,38 @@ impl SpFreshLayerDbIndex {
             stop_worker,
             worker: Some(worker),
         })
+    }
+
+    pub fn bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
+        let _update_guard = lock_mutex(&self.update_gate);
+        let existing = list_vector_keys(&self.db)?;
+        if !existing.is_empty() {
+            for batch in existing.chunks(2_048) {
+                let ops: Vec<layerdb::Op> = batch
+                    .iter()
+                    .map(|key| layerdb::Op::delete(key.clone()))
+                    .collect();
+                self.db
+                    .write_batch(ops, WriteOptions { sync: self.cfg.write_sync })
+                    .context("clear existing spfresh rows")?;
+            }
+        }
+
+        for batch in rows.chunks(1_024) {
+            let mut ops = Vec::with_capacity(batch.len());
+            for row in batch {
+                let value = serde_json::to_vec(row)
+                    .with_context(|| format!("serialize vector row id={}", row.id))?;
+                ops.push(layerdb::Op::put(vector_key(row.id), value));
+            }
+            self.db
+                .write_batch(ops, WriteOptions { sync: self.cfg.write_sync })
+                .context("persist spfresh bulk rows")?;
+        }
+
+        *lock_write(&self.index) = SpFreshIndex::build(self.cfg.spfresh.clone(), rows);
+        self.pending_ops.store(0, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn force_rebuild(&self) -> anyhow::Result<()> {
@@ -134,7 +167,7 @@ impl VectorIndex for SpFreshLayerDbIndex {
 
         lock_write(&self.index).upsert(id, vector);
         let pending = self.pending_ops.fetch_add(1, Ordering::Relaxed) + 1;
-        if pending >= self.cfg.rebuild_pending_ops {
+        if pending == self.cfg.rebuild_pending_ops.max(1) {
             let _ = self.rebuild_tx.send(());
         }
     }
@@ -148,7 +181,7 @@ impl VectorIndex for SpFreshLayerDbIndex {
         let deleted = lock_write(&self.index).delete(id);
         if deleted {
             let pending = self.pending_ops.fetch_add(1, Ordering::Relaxed) + 1;
-            if pending >= self.cfg.rebuild_pending_ops {
+            if pending == self.cfg.rebuild_pending_ops.max(1) {
                 let _ = self.rebuild_tx.send(());
             }
         }
@@ -167,6 +200,7 @@ impl VectorIndex for SpFreshLayerDbIndex {
 fn spawn_rebuilder(
     db: Db,
     spfresh_cfg: SpFreshConfig,
+    rebuild_pending_ops: usize,
     rebuild_interval: Duration,
     index: Arc<RwLock<SpFreshIndex>>,
     update_gate: Arc<Mutex<()>>,
@@ -174,17 +208,26 @@ fn spawn_rebuilder(
     rebuild_rx: mpsc::Receiver<()>,
     stop_worker: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
+    let rebuild_pending_ops = rebuild_pending_ops.max(1);
     std::thread::spawn(move || {
         while !stop_worker.load(Ordering::Relaxed) {
             match rebuild_rx.recv_timeout(rebuild_interval) {
-                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if pending_ops.load(Ordering::Relaxed) == 0 {
-                        continue;
+                Ok(_) => {
+                    if pending_ops.load(Ordering::Relaxed) > 0 {
+                        if let Err(err) =
+                            rebuild_once(&db, &spfresh_cfg, &index, &update_gate, &pending_ops)
+                        {
+                            eprintln!("spfresh-layerdb background rebuild failed: {err:#}");
+                        }
                     }
-                    if let Err(err) =
-                        rebuild_once(&db, &spfresh_cfg, &index, &update_gate, &pending_ops)
-                    {
-                        eprintln!("spfresh-layerdb background rebuild failed: {err:#}");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if pending_ops.load(Ordering::Relaxed) >= rebuild_pending_ops {
+                        if let Err(err) =
+                            rebuild_once(&db, &spfresh_cfg, &index, &update_gate, &pending_ops)
+                        {
+                            eprintln!("spfresh-layerdb background rebuild failed: {err:#}");
+                        }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -227,6 +270,19 @@ fn load_rows(db: &Db) -> anyhow::Result<Vec<VectorRecord>> {
             .with_context(|| format!("decode vector row key={}", String::from_utf8_lossy(&key)))?;
         if !row.deleted {
             out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+fn list_vector_keys(db: &Db) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut iter = db.iter(Range::all(), ReadOptions::default())?;
+    iter.seek_to_first();
+    while let Some(next) = iter.next() {
+        let (key, _value) = next?;
+        if key.starts_with(VECTOR_PREFIX.as_bytes()) {
+            out.push(String::from_utf8_lossy(&key).to_string());
         }
     }
     Ok(out)

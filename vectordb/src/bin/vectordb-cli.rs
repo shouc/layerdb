@@ -392,14 +392,16 @@ fn bench_spfresh_layerdb(
     let db_dir = tempfile::TempDir::new().expect("create tempdir for spfresh-layerdb");
 
     let build_start = Instant::now();
-    let mut index = SpFreshLayerDbIndex::open(db_dir.path(), cfg)
-        .expect("open spfresh-layerdb benchmark index");
-    index.bulk_load(&data.base).expect("bulk load base rows");
+    let mut index =
+        SpFreshLayerDbIndex::open(db_dir.path(), cfg).expect("open spfresh-layerdb benchmark index");
+    index.try_bulk_load(&data.base).expect("bulk load base rows");
     let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
 
     let update_start = Instant::now();
     for (id, v) in &data.updates {
-        index.upsert(*id, v.clone());
+        index
+            .try_upsert(*id, v.clone())
+            .expect("apply spfresh-layerdb update");
     }
     let update_s = update_start.elapsed().as_secs_f64().max(1e-9);
     let update_qps = data.updates.len() as f64 / update_s;

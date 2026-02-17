@@ -87,6 +87,10 @@ impl SpFreshLayerDbIndex {
     }
 
     pub fn bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
+        self.try_bulk_load(rows)
+    }
+
+    pub fn try_bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
         let _update_guard = lock_mutex(&self.update_gate);
         let existing = list_vector_keys(&self.db)?;
         if !existing.is_empty() {
@@ -143,6 +147,50 @@ impl SpFreshLayerDbIndex {
             .with_context(|| format!("delete vector id={id}"))?;
         Ok(())
     }
+
+    pub fn try_upsert(&mut self, id: u64, vector: Vec<f32>) -> anyhow::Result<()> {
+        if vector.len() != self.cfg.spfresh.dim {
+            anyhow::bail!(
+                "invalid vector dim for id={id}: got {}, expected {}",
+                vector.len(),
+                self.cfg.spfresh.dim
+            );
+        }
+
+        let _update_guard = lock_mutex(&self.update_gate);
+        self.persist_upsert(id, &vector)?;
+        lock_write(&self.index).upsert(id, vector);
+        let pending = self.pending_ops.fetch_add(1, Ordering::Relaxed) + 1;
+        if pending == self.cfg.rebuild_pending_ops.max(1) {
+            let _ = self.rebuild_tx.send(());
+        }
+        Ok(())
+    }
+
+    pub fn try_delete(&mut self, id: u64) -> anyhow::Result<bool> {
+        let _update_guard = lock_mutex(&self.update_gate);
+        self.persist_delete(id)?;
+        let deleted = lock_write(&self.index).delete(id);
+        if deleted {
+            let pending = self.pending_ops.fetch_add(1, Ordering::Relaxed) + 1;
+            if pending == self.cfg.rebuild_pending_ops.max(1) {
+                let _ = self.rebuild_tx.send(());
+            }
+        }
+        Ok(deleted)
+    }
+
+    pub fn close(mut self) -> anyhow::Result<()> {
+        self.stop_worker.store(true, Ordering::Relaxed);
+        let _ = self.rebuild_tx.send(());
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                anyhow::bail!("spfresh-layerdb background worker panicked");
+            }
+        }
+        self.force_rebuild()?;
+        Ok(())
+    }
 }
 
 impl Drop for SpFreshLayerDbIndex {
@@ -157,37 +205,19 @@ impl Drop for SpFreshLayerDbIndex {
 
 impl VectorIndex for SpFreshLayerDbIndex {
     fn upsert(&mut self, id: u64, vector: Vec<f32>) {
-        if vector.len() != self.cfg.spfresh.dim {
-            return;
-        }
-
-        let _update_guard = lock_mutex(&self.update_gate);
-        if let Err(err) = self.persist_upsert(id, &vector) {
-            eprintln!("spfresh-layerdb upsert persist failed for id={id}: {err:#}");
-            return;
-        }
-
-        lock_write(&self.index).upsert(id, vector);
-        let pending = self.pending_ops.fetch_add(1, Ordering::Relaxed) + 1;
-        if pending == self.cfg.rebuild_pending_ops.max(1) {
-            let _ = self.rebuild_tx.send(());
+        if let Err(err) = self.try_upsert(id, vector) {
+            eprintln!("spfresh-layerdb upsert failed for id={id}: {err:#}");
         }
     }
 
     fn delete(&mut self, id: u64) -> bool {
-        let _update_guard = lock_mutex(&self.update_gate);
-        if let Err(err) = self.persist_delete(id) {
-            eprintln!("spfresh-layerdb delete persist failed for id={id}: {err:#}");
-            return false;
-        }
-        let deleted = lock_write(&self.index).delete(id);
-        if deleted {
-            let pending = self.pending_ops.fetch_add(1, Ordering::Relaxed) + 1;
-            if pending == self.cfg.rebuild_pending_ops.max(1) {
-                let _ = self.rebuild_tx.send(());
+        match self.try_delete(id) {
+            Ok(deleted) => deleted,
+            Err(err) => {
+                eprintln!("spfresh-layerdb delete failed for id={id}: {err:#}");
+                false
             }
         }
-        deleted
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {

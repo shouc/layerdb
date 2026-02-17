@@ -231,6 +231,7 @@ impl UringExecutor {
         let path = path.as_ref();
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)
@@ -412,6 +413,7 @@ impl UringExecutor {
         let path = path.as_ref();
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)

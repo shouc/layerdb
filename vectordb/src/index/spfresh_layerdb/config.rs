@@ -1,0 +1,46 @@
+use std::time::Duration;
+
+use layerdb::DbOptions;
+use serde::{Deserialize, Serialize};
+
+use crate::index::SpFreshConfig;
+
+pub(crate) const VECTOR_PREFIX: &str = "spfresh/v/";
+pub(crate) const META_CONFIG_KEY: &str = "spfresh/meta/config";
+pub(crate) const META_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SpFreshPersistedMeta {
+    pub schema_version: u32,
+    pub dim: usize,
+    pub initial_postings: usize,
+    pub split_limit: usize,
+    pub merge_limit: usize,
+    pub reassign_range: usize,
+    pub nprobe: usize,
+    pub kmeans_iters: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpFreshLayerDbConfig {
+    pub spfresh: SpFreshConfig,
+    pub db_options: DbOptions,
+    pub write_sync: bool,
+    pub rebuild_pending_ops: usize,
+    pub rebuild_interval: Duration,
+}
+
+impl Default for SpFreshLayerDbConfig {
+    fn default() -> Self {
+        Self {
+            spfresh: SpFreshConfig::default(),
+            db_options: DbOptions {
+                fsync_writes: true,
+                ..Default::default()
+            },
+            write_sync: true,
+            rebuild_pending_ops: 2_000,
+            rebuild_interval: Duration::from_millis(500),
+        }
+    }
+}

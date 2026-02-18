@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
@@ -15,6 +15,7 @@ pub(crate) struct RebuilderRuntime {
     pub spfresh_cfg: SpFreshConfig,
     pub rebuild_pending_ops: usize,
     pub rebuild_interval: std::time::Duration,
+    pub active_generation: Arc<AtomicU64>,
     pub index: Arc<RwLock<SpFreshIndex>>,
     pub update_gate: Arc<Mutex<()>>,
     pub pending_ops: Arc<AtomicUsize>,
@@ -71,7 +72,8 @@ pub(crate) fn rebuild_once(runtime: &RebuilderRuntime) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let rows = load_rows(&runtime.db)?;
+    let generation = runtime.active_generation.load(Ordering::Relaxed);
+    let rows = load_rows(&runtime.db, generation)?;
     let rebuilt = SpFreshIndex::build(runtime.spfresh_cfg.clone(), &rows);
     *lock_write(&runtime.index) = rebuilt;
     runtime.stats.inc_rebuild_successes();

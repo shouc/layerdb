@@ -8,7 +8,7 @@ mod sync_utils;
 mod tests;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
@@ -18,12 +18,12 @@ use layerdb::{Db, DbOptions, WriteOptions};
 use crate::types::{Neighbor, VectorIndex, VectorRecord};
 
 use super::{SpFreshConfig, SpFreshIndex};
-use config::VECTOR_PREFIX;
 use rebuilder::{rebuild_once, spawn_rebuilder, RebuilderRuntime};
 use stats::SpFreshLayerDbStatsInner;
 use storage::{
-    ensure_metadata, ensure_wal_exists, load_metadata, load_rows, prefix_exclusive_end,
-    refresh_read_snapshot, validate_config, vector_key,
+    ensure_active_generation, ensure_metadata, ensure_wal_exists, load_metadata, load_rows,
+    prefix_exclusive_end, refresh_read_snapshot, set_active_generation, validate_config,
+    vector_key, vector_prefix,
 };
 use sync_utils::{lock_mutex, lock_read, lock_write};
 
@@ -34,6 +34,7 @@ pub struct SpFreshLayerDbIndex {
     cfg: SpFreshLayerDbConfig,
     db_path: PathBuf,
     db: Db,
+    active_generation: Arc<AtomicU64>,
     index: Arc<RwLock<SpFreshIndex>>,
     update_gate: Arc<Mutex<()>>,
     pending_ops: Arc<AtomicUsize>,
@@ -86,8 +87,10 @@ impl SpFreshLayerDbIndex {
     }
 
     fn open_with_db(db_path: &Path, db: Db, cfg: SpFreshLayerDbConfig) -> anyhow::Result<Self> {
-        let rows = load_rows(&db)?;
+        let generation = ensure_active_generation(&db)?;
+        let rows = load_rows(&db, generation)?;
         let index = Arc::new(RwLock::new(SpFreshIndex::build(cfg.spfresh.clone(), &rows)));
+        let active_generation = Arc::new(AtomicU64::new(generation));
         let update_gate = Arc::new(Mutex::new(()));
         let pending_ops = Arc::new(AtomicUsize::new(0));
         let stop_worker = Arc::new(AtomicBool::new(false));
@@ -100,6 +103,7 @@ impl SpFreshLayerDbIndex {
                 spfresh_cfg: cfg.spfresh.clone(),
                 rebuild_pending_ops: cfg.rebuild_pending_ops.max(1),
                 rebuild_interval: cfg.rebuild_interval,
+                active_generation: active_generation.clone(),
                 index: index.clone(),
                 update_gate: update_gate.clone(),
                 pending_ops: pending_ops.clone(),
@@ -113,6 +117,7 @@ impl SpFreshLayerDbIndex {
             cfg,
             db_path: db_path.to_path_buf(),
             db,
+            active_generation,
             index,
             update_gate,
             pending_ops,
@@ -129,6 +134,7 @@ impl SpFreshLayerDbIndex {
             spfresh_cfg: self.cfg.spfresh.clone(),
             rebuild_pending_ops: self.cfg.rebuild_pending_ops.max(1),
             rebuild_interval: self.cfg.rebuild_interval,
+            active_generation: self.active_generation.clone(),
             index: self.index.clone(),
             update_gate: self.update_gate.clone(),
             pending_ops: self.pending_ops.clone(),
@@ -144,23 +150,17 @@ impl SpFreshLayerDbIndex {
     pub fn try_bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
         let _update_guard = lock_mutex(&self.update_gate);
 
-        let end = prefix_exclusive_end(VECTOR_PREFIX.as_bytes())?;
-        self.db
-            .delete_range(
-                VECTOR_PREFIX.as_bytes().to_vec(),
-                end,
-                WriteOptions {
-                    sync: self.cfg.write_sync,
-                },
-            )
-            .context("clear existing spfresh rows via prefix delete_range")?;
+        let old_generation = self.active_generation.load(Ordering::Relaxed);
+        let new_generation = old_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("active generation overflow"))?;
 
         for batch in rows.chunks(1_024) {
             let mut ops = Vec::with_capacity(batch.len());
             for row in batch {
-                let value = serde_json::to_vec(row)
+                let value = bincode::serialize(row)
                     .with_context(|| format!("serialize vector row id={}", row.id))?;
-                ops.push(layerdb::Op::put(vector_key(row.id), value));
+                ops.push(layerdb::Op::put(vector_key(new_generation, row.id), value));
             }
             self.db
                 .write_batch(
@@ -170,6 +170,24 @@ impl SpFreshLayerDbIndex {
                     },
                 )
                 .context("persist spfresh bulk rows")?;
+        }
+        set_active_generation(&self.db, new_generation, self.cfg.write_sync)?;
+        self.active_generation.store(new_generation, Ordering::Relaxed);
+
+        // best-effort cleanup of the old generation after pointer switch.
+        let old_prefix = vector_prefix(old_generation);
+        let old_prefix_bytes = old_prefix.as_bytes().to_vec();
+        let old_end = prefix_exclusive_end(&old_prefix_bytes)?;
+        if let Err(err) = self.db.delete_range(
+            old_prefix_bytes,
+            old_end,
+            WriteOptions {
+                sync: false,
+            },
+        ) {
+            eprintln!(
+                "spfresh-layerdb bulk-load old generation cleanup failed: {err:#}"
+            );
         }
 
         *lock_write(&self.index) = SpFreshIndex::build(self.cfg.spfresh.clone(), rows);
@@ -184,11 +202,12 @@ impl SpFreshLayerDbIndex {
     }
 
     fn persist_upsert(&self, id: u64, vector: &[f32]) -> anyhow::Result<()> {
+        let generation = self.active_generation.load(Ordering::Relaxed);
         let row = VectorRecord::new(id, vector.to_vec());
-        let value = serde_json::to_vec(&row).context("serialize vector row")?;
+        let value = bincode::serialize(&row).context("serialize vector row")?;
         self.db
             .put(
-                vector_key(id),
+                vector_key(generation, id),
                 value,
                 WriteOptions {
                     sync: self.cfg.write_sync,
@@ -199,9 +218,10 @@ impl SpFreshLayerDbIndex {
     }
 
     fn persist_delete(&self, id: u64) -> anyhow::Result<()> {
+        let generation = self.active_generation.load(Ordering::Relaxed);
         self.db
             .delete(
-                vector_key(id),
+                vector_key(generation, id),
                 WriteOptions {
                     sync: self.cfg.write_sync,
                 },
@@ -270,6 +290,7 @@ impl SpFreshLayerDbIndex {
     pub fn health_check(&self) -> anyhow::Result<SpFreshLayerDbStats> {
         ensure_wal_exists(&self.db_path)?;
         ensure_metadata(&self.db, &self.cfg)?;
+        let _ = ensure_active_generation(&self.db)?;
         Ok(self.stats())
     }
 }

@@ -1,12 +1,15 @@
+use std::ops::Bound;
 use std::path::Path;
 
 use anyhow::Context;
+use bytes::Bytes;
 use layerdb::{Db, Range, ReadOptions, WriteOptions};
 
 use crate::types::VectorRecord;
 
 use super::config::{
-    SpFreshLayerDbConfig, SpFreshPersistedMeta, META_CONFIG_KEY, META_SCHEMA_VERSION, VECTOR_PREFIX,
+    SpFreshLayerDbConfig, SpFreshPersistedMeta, META_ACTIVE_GENERATION_KEY, META_CONFIG_KEY,
+    META_SCHEMA_VERSION, VECTOR_ROOT_PREFIX,
 };
 
 pub(crate) fn validate_config(cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> {
@@ -47,25 +50,53 @@ pub(crate) fn validate_config(cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> 
     Ok(())
 }
 
-pub(crate) fn load_rows(db: &Db) -> anyhow::Result<Vec<VectorRecord>> {
+pub(crate) fn load_rows(db: &Db, generation: u64) -> anyhow::Result<Vec<VectorRecord>> {
     let mut out = Vec::new();
-    let mut iter = db.iter(Range::all(), ReadOptions::default())?;
+    let prefix = vector_prefix(generation);
+    let prefix_bytes = prefix.as_bytes().to_vec();
+    let end = prefix_exclusive_end(&prefix_bytes)?;
+    let mut iter = db.iter(
+        Range {
+            start: Bound::Included(Bytes::from(prefix_bytes.clone())),
+            end: Bound::Excluded(Bytes::from(end)),
+        },
+        ReadOptions::default(),
+    )?;
     iter.seek_to_first();
     for next in iter {
         let (key, value) = next?;
-        if !key.starts_with(VECTOR_PREFIX.as_bytes()) {
+        if !key.starts_with(prefix_bytes.as_slice()) {
             continue;
         }
         let Some(value) = value else {
             continue;
         };
-        let row: VectorRecord = serde_json::from_slice(value.as_ref())
+        let row: VectorRecord = bincode::deserialize(value.as_ref())
             .with_context(|| format!("decode vector row key={}", String::from_utf8_lossy(&key)))?;
         if !row.deleted {
             out.push(row);
         }
     }
     Ok(out)
+}
+
+pub(crate) fn ensure_active_generation(db: &Db) -> anyhow::Result<u64> {
+    match db
+        .get(META_ACTIVE_GENERATION_KEY, ReadOptions::default())
+        .context("read spfresh active generation")?
+    {
+        Some(bytes) => bincode::deserialize(bytes.as_ref()).context("decode active generation"),
+        None => {
+            set_active_generation(db, 0, true)?;
+            Ok(0)
+        }
+    }
+}
+
+pub(crate) fn set_active_generation(db: &Db, generation: u64, sync: bool) -> anyhow::Result<()> {
+    let bytes = bincode::serialize(&generation).context("encode active generation")?;
+    db.put(META_ACTIVE_GENERATION_KEY, bytes, WriteOptions { sync })
+        .context("persist active generation")
 }
 
 pub(crate) fn refresh_read_snapshot(db: &Db) -> anyhow::Result<()> {
@@ -116,7 +147,7 @@ pub(crate) fn load_metadata(db: &Db) -> anyhow::Result<Option<SpFreshPersistedMe
         return Ok(None);
     };
     let meta: SpFreshPersistedMeta =
-        serde_json::from_slice(value.as_ref()).context("decode spfresh metadata")?;
+        bincode::deserialize(value.as_ref()).context("decode spfresh metadata")?;
     Ok(Some(meta))
 }
 
@@ -158,17 +189,23 @@ pub(crate) fn ensure_metadata(db: &Db, cfg: &SpFreshLayerDbConfig) -> anyhow::Re
                 "spfresh config mismatch with stored metadata; use matching config for this index directory"
             );
         }
+        let _ = ensure_active_generation(db)?;
         return Ok(());
     }
 
-    let bytes = serde_json::to_vec(&expected).context("encode spfresh metadata")?;
+    let bytes = bincode::serialize(&expected).context("encode spfresh metadata")?;
     db.put(META_CONFIG_KEY, bytes, WriteOptions { sync: true })
         .context("persist spfresh metadata")?;
+    set_active_generation(db, 0, true)?;
     Ok(())
 }
 
-pub(crate) fn vector_key(id: u64) -> String {
-    format!("{VECTOR_PREFIX}{id:020}")
+pub(crate) fn vector_prefix(generation: u64) -> String {
+    format!("{VECTOR_ROOT_PREFIX}{generation:016x}/")
+}
+
+pub(crate) fn vector_key(generation: u64, id: u64) -> String {
+    format!("{}{id:020}", vector_prefix(generation))
 }
 
 pub(crate) fn prefix_exclusive_end(prefix: &[u8]) -> anyhow::Result<Vec<u8>> {

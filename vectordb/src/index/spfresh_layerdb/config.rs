@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::index::SpFreshConfig;
 
-pub(crate) const VECTOR_PREFIX: &str = "spfresh/v/";
+pub(crate) const VECTOR_ROOT_PREFIX: &str = "spfresh/v/";
 pub(crate) const META_CONFIG_KEY: &str = "spfresh/meta/config";
+pub(crate) const META_ACTIVE_GENERATION_KEY: &str = "spfresh/meta/active_generation";
 pub(crate) const META_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

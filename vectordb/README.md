@@ -21,6 +21,8 @@ cargo run -p vectordb --bin vectordb-cli -- bench \
   --saq-total-bits 256 --saq-ivf-clusters 128
 ```
 
+For higher recall operating points in SPFresh, raise `--nprobe` (for example `--nprobe 32`).
+
 Export a reproducible benchmark dataset:
 ```bash
 cargo run -p vectordb --bin vectordb-cli -- dump-dataset \

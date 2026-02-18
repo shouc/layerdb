@@ -317,6 +317,36 @@ impl SpFreshLayerDbIndex {
         let _ = ensure_active_generation(&self.db)?;
         Ok(self.stats())
     }
+
+    /// Flush and compact vector data, then freeze level-1 SSTs into S3 tier.
+    ///
+    /// This is the primary durability/tiering operation for SPFresh-on-LayerDB.
+    pub fn sync_to_s3(&self, max_files: Option<usize>) -> anyhow::Result<usize> {
+        let _update_guard = lock_write(&self.update_gate);
+        self.db
+            .compact_range(None)
+            .context("compact before freeze-to-s3")?;
+        self.db
+            .freeze_level_to_s3(1, max_files)
+            .context("freeze level-1 to s3")
+    }
+
+    /// Thaw frozen level-1 SSTs back to local tier.
+    pub fn thaw_from_s3(&self, max_files: Option<usize>) -> anyhow::Result<usize> {
+        let _update_guard = lock_write(&self.update_gate);
+        self.db
+            .thaw_level_from_s3(1, max_files)
+            .context("thaw level-1 from s3")
+    }
+
+    /// Garbage collect orphaned S3 objects that are no longer referenced.
+    pub fn gc_orphaned_s3(&self) -> anyhow::Result<usize> {
+        self.db.gc_orphaned_s3_files().context("gc orphaned s3 files")
+    }
+
+    pub fn frozen_objects(&self) -> Vec<layerdb::version::FrozenObjectMeta> {
+        self.db.frozen_objects()
+    }
 }
 
 impl Drop for SpFreshLayerDbIndex {

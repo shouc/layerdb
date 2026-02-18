@@ -418,6 +418,7 @@ impl VectorIndex for SpFreshIndex {
             .cfg
             .nprobe
             .max(k.saturating_mul(2))
+            .saturating_mul(4)
             .max(1)
             .min(self.postings.len().max(1));
         let probes = self.nearest_postings(query, probe_count);

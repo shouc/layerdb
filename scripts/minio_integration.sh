@@ -50,13 +50,15 @@ done
 echo "MinIO ready at http://127.0.0.1:${PORT_API}"
 
 cd "$ROOT_DIR"
-LAYERDB_MINIO_INTEGRATION=1 \
-LAYERDB_S3_ENDPOINT="http://127.0.0.1:${PORT_API}" \
-LAYERDB_S3_ACCESS_KEY=minioadmin \
-LAYERDB_S3_SECRET_KEY=minioadmin \
-LAYERDB_S3_BUCKET=layerdb-test \
-LAYERDB_S3_REGION=us-east-1 \
-LAYERDB_S3_PREFIX=layerdb-integration \
-LAYERDB_S3_SECURE=0 \
-LAYERDB_S3_AUTO_CREATE_BUCKET=1 \
+export LAYERDB_MINIO_INTEGRATION=1
+export LAYERDB_S3_ENDPOINT="http://127.0.0.1:${PORT_API}"
+export LAYERDB_S3_ACCESS_KEY=minioadmin
+export LAYERDB_S3_SECRET_KEY=minioadmin
+export LAYERDB_S3_BUCKET=layerdb-test
+export LAYERDB_S3_REGION=us-east-1
+export LAYERDB_S3_PREFIX=layerdb-integration
+export LAYERDB_S3_SECURE=0
+export LAYERDB_S3_AUTO_CREATE_BUCKET=1
+
 cargo test --test freeze_s3_minio -- --nocapture
+cargo test -p vectordb s3_sync_round_trip_against_minio_when_enabled -- --nocapture

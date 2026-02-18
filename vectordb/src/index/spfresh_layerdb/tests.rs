@@ -7,6 +7,13 @@ use crate::types::{VectorIndex, VectorRecord};
 
 use super::{SpFreshLayerDbConfig, SpFreshLayerDbIndex};
 
+fn minio_enabled() -> bool {
+    matches!(
+        std::env::var("LAYERDB_MINIO_INTEGRATION").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
 #[test]
 fn persists_and_recovers_vectors() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
@@ -198,5 +205,37 @@ fn s3_gc_removes_local_emulation_orphans() -> anyhow::Result<()> {
     assert!(removed >= 1);
     assert!(!orphan_meta.exists());
     assert!(!orphan_sb.exists());
+    Ok(())
+}
+
+#[test]
+fn s3_sync_round_trip_against_minio_when_enabled() -> anyhow::Result<()> {
+    if !minio_enabled() {
+        eprintln!("skipping minio integration test (set LAYERDB_MINIO_INTEGRATION=1)");
+        return Ok(());
+    }
+
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig::default();
+    if cfg.db_options.s3.is_none() {
+        anyhow::bail!("minio integration requires LAYERDB_S3_* env vars");
+    }
+
+    let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+    idx.try_upsert(5, vec![0.5; cfg.spfresh.dim])?;
+    idx.try_upsert(8, vec![0.8; cfg.spfresh.dim])?;
+
+    let moved = idx.sync_to_s3(None)?;
+    assert!(moved >= 1);
+    assert!(!idx.frozen_objects().is_empty());
+
+    let got_frozen = idx.search(&vec![0.8; cfg.spfresh.dim], 1);
+    assert_eq!(got_frozen[0].id, 8);
+
+    let thawed = idx.thaw_from_s3(None)?;
+    assert!(thawed >= 1);
+
+    let got_thawed = idx.search(&vec![0.8; cfg.spfresh.dim], 1);
+    assert_eq!(got_thawed[0].id, 8);
     Ok(())
 }

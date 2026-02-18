@@ -1,6 +1,9 @@
 use std::fs;
+use std::collections::HashMap;
 
 use layerdb::{Db, DbOptions, WriteOptions};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
 use crate::types::{VectorIndex, VectorRecord};
@@ -12,6 +15,27 @@ fn minio_enabled() -> bool {
         std::env::var("LAYERDB_MINIO_INTEGRATION").ok().as_deref(),
         Some("1") | Some("true") | Some("yes")
     )
+}
+
+fn assert_index_matches_model(
+    idx: &SpFreshLayerDbIndex,
+    expected: &HashMap<u64, Vec<f32>>,
+) -> anyhow::Result<()> {
+    assert_eq!(idx.len(), expected.len());
+    if expected.is_empty() {
+        return Ok(());
+    }
+
+    let k = expected.len();
+    for (id, vector) in expected {
+        let got = idx.search(vector, k);
+        anyhow::ensure!(
+            got.iter().any(|n| n.id == *id),
+            "expected id={} missing from search results",
+            id
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -213,6 +237,48 @@ fn startup_replays_wal_tail_after_checkpoint() -> anyhow::Result<()> {
     let got = idx.search(&vec![0.2; 64], 2);
     assert!(got.iter().any(|n| n.id == 1));
     assert!(got.iter().any(|n| n.id == 2));
+    Ok(())
+}
+
+#[test]
+fn randomized_restarts_preserve_model_state() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let mut cfg = SpFreshLayerDbConfig::default();
+    cfg.spfresh.dim = 16;
+    cfg.spfresh.initial_postings = 8;
+
+    let mut rng = StdRng::seed_from_u64(0x5EED_BEEF);
+    let mut expected: HashMap<u64, Vec<f32>> = HashMap::new();
+    let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+
+    let total_ops = 2_000usize;
+    let restart_every = 125usize;
+    for step in 1..=total_ops {
+        let id = rng.gen_range(0..500) as u64;
+        if rng.gen_bool(0.25) {
+            let model_deleted = expected.remove(&id).is_some();
+            let deleted = idx.try_delete(id)?;
+            assert_eq!(deleted, model_deleted);
+        } else {
+            let vector: Vec<f32> = (0..cfg.spfresh.dim).map(|_| rng.gen::<f32>()).collect();
+            idx.try_upsert(id, vector.clone())?;
+            expected.insert(id, vector);
+        }
+
+        if step % restart_every == 0 {
+            if rng.gen_bool(0.5) {
+                idx.close()?;
+            } else {
+                drop(idx);
+            }
+            idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+            assert_index_matches_model(&idx, &expected)?;
+        }
+    }
+
+    idx.close()?;
+    let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
+    assert_index_matches_model(&idx, &expected)?;
     Ok(())
 }
 

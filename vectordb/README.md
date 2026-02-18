@@ -35,6 +35,12 @@ python3 scripts/bench_milvus.py \
   --dataset /tmp/vectordb_dataset.json --k 10 --nprobe 8 --nlist 64 --update-batch 1
 ```
 
+Compare the same dataset with LanceDB (Rust API):
+```bash
+cargo run --release -p vectordb --bin bench_lancedb -- \
+  --dataset /tmp/vectordb_dataset.json --k 10 --nprobe 8 --nlist 64 --update-batch 1
+```
+
 Check SPFresh LayerDB index health:
 ```bash
 cargo run -p vectordb --bin vectordb-cli -- spfresh-health \

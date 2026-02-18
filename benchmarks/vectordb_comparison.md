@@ -166,10 +166,32 @@ python3 scripts/bench_milvus.py \
 | spfresh-layerdb | 691.4 | 172 | 1128 | 0.9605 |
 | milvus-ivf-flat | 3765.4 | 148.6 | 177.5 | 0.8990 |
 
+## LanceDB (Rust API) Spot Check (10k / 2k / 200)
+
+Standalone Rust benchmark binary:
+```bash
+cargo run --release -p vectordb --bin bench_lancedb -- \
+  --dataset /tmp/vectordb_dataset_10000_2000_200_seed404.json \
+  --k 10 --nlist 64 --nprobe 8 --update-batch 1
+```
+
+High-recall variant:
+```bash
+cargo run --release -p vectordb --bin bench_lancedb -- \
+  --dataset /tmp/vectordb_dataset_10000_2000_200_seed404.json \
+  --k 10 --nlist 64 --nprobe 32 --update-batch 1
+```
+
+| engine | build ms | update qps | search qps | recall@10 |
+|---|---:|---:|---:|---:|
+| lancedb-ivf-flat (`nprobe=8`) | 69.1 | 13.7 | 15.3 | 0.5320 |
+| lancedb-ivf-flat (`nprobe=32`) | 64.1 | 13.5 | 14.8 | 0.8920 |
+
 ## Key Findings
 - At `nprobe=8`, `spfresh-layerdb` outperformed Milvus IVF_FLAT on the 20k/5k/400 workload in recall (`0.7018` vs `0.5512`) and search throughput (`3301 qps` vs `173 qps`) under one-by-one updates.
 - Tuning SPFresh probe scaling to make `nprobe` a first-class control (`max(nprobe, k) * 8`) enabled a high-recall mode at `nprobe=32`.
 - In that high-recall mode, `spfresh-layerdb` reached `0.9605` recall@10 at `1128 qps`, while Milvus reached `0.8990` at `177.5 qps` on the same dataset and metric.
+- LanceDB Rust API benchmark is now available as a standalone binary (`bench_lancedb`) using the same exported dataset format and fairness metrics.
 - SAQ variants remain the highest-update-throughput options in this crate, with lower recall than tuned SPFresh on these runs.
 
 ## SAQ Paper Validation (arXiv:2509.12086)

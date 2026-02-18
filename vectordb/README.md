@@ -57,6 +57,18 @@ cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
   - `open_existing` to recover config from persisted metadata
   - `close` for graceful worker shutdown + final rebuild
   - `health_check` and `stats` for operational monitoring
+  - `sync_to_s3`, `thaw_from_s3`, `gc_orphaned_s3` for S3 lifecycle management
+
+S3 tiering usage (via LayerDB backend):
+```rust
+let moved = index.sync_to_s3(None)?;
+let thawed = index.thaw_from_s3(None)?;
+let removed = index.gc_orphaned_s3()?;
+println!("moved={moved} thawed={thawed} removed={removed}");
+```
+
+To use real object storage (instead of local `sst_s3/` emulation), set
+`SpFreshLayerDbConfig.db_options.s3` (or `LAYERDB_S3_*` env vars used by LayerDB defaults).
 
 SAQ paper-style validation (vs uniform ablation):
 ```bash

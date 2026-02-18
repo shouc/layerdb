@@ -8,8 +8,9 @@ use layerdb::{Db, Range, ReadOptions, WriteOptions};
 use crate::types::VectorRecord;
 
 use super::config::{
-    SpFreshLayerDbConfig, SpFreshPersistedMeta, META_ACTIVE_GENERATION_KEY, META_CONFIG_KEY,
-    META_INDEX_CHECKPOINT_KEY, META_SCHEMA_VERSION, VECTOR_ROOT_PREFIX,
+    SpFreshLayerDbConfig, SpFreshPersistedMeta, INDEX_WAL_PREFIX, META_ACTIVE_GENERATION_KEY,
+    META_CONFIG_KEY, META_INDEX_CHECKPOINT_KEY, META_INDEX_WAL_NEXT_SEQ_KEY, META_SCHEMA_VERSION,
+    VECTOR_ROOT_PREFIX,
 };
 
 pub(crate) fn validate_config(cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> {
@@ -110,6 +111,25 @@ pub(crate) fn set_active_generation(db: &Db, generation: u64, sync: bool) -> any
     let bytes = bincode::serialize(&generation).context("encode active generation")?;
     db.put(META_ACTIVE_GENERATION_KEY, bytes, WriteOptions { sync })
         .context("persist active generation")
+}
+
+pub(crate) fn ensure_wal_next_seq(db: &Db) -> anyhow::Result<u64> {
+    match db
+        .get(META_INDEX_WAL_NEXT_SEQ_KEY, ReadOptions::default())
+        .context("read spfresh wal next seq")?
+    {
+        Some(bytes) => bincode::deserialize(bytes.as_ref()).context("decode wal next seq"),
+        None => {
+            set_wal_next_seq(db, 0, true)?;
+            Ok(0)
+        }
+    }
+}
+
+pub(crate) fn set_wal_next_seq(db: &Db, next_seq: u64, sync: bool) -> anyhow::Result<()> {
+    let bytes = bincode::serialize(&next_seq).context("encode wal next seq")?;
+    db.put(META_INDEX_WAL_NEXT_SEQ_KEY, bytes, WriteOptions { sync })
+        .context("persist wal next seq")
 }
 
 pub(crate) fn refresh_read_snapshot(db: &Db) -> anyhow::Result<()> {
@@ -227,6 +247,50 @@ pub(crate) fn persist_index_checkpoint_bytes(
 ) -> anyhow::Result<()> {
     db.put(META_INDEX_CHECKPOINT_KEY, bytes, WriteOptions { sync })
         .context("persist spfresh index checkpoint")
+}
+
+pub(crate) fn wal_key(seq: u64) -> String {
+    format!("{INDEX_WAL_PREFIX}{seq:020}")
+}
+
+pub(crate) fn load_wal_touched_ids_since(db: &Db, start_seq: u64) -> anyhow::Result<Vec<u64>> {
+    let mut out = Vec::new();
+    let prefix_bytes = INDEX_WAL_PREFIX.as_bytes().to_vec();
+    let start = wal_key(start_seq).into_bytes();
+    let end = prefix_exclusive_end(&prefix_bytes)?;
+    let mut iter = db.iter(
+        Range {
+            start: Bound::Included(Bytes::from(start)),
+            end: Bound::Excluded(Bytes::from(end)),
+        },
+        ReadOptions::default(),
+    )?;
+    iter.seek_to_first();
+    for next in iter {
+        let (key, value) = next?;
+        if !key.starts_with(prefix_bytes.as_slice()) {
+            continue;
+        }
+        let Some(value) = value else {
+            continue;
+        };
+        let id: u64 = bincode::deserialize(value.as_ref())
+            .with_context(|| format!("decode wal id key={}", String::from_utf8_lossy(&key)))?;
+        out.push(id);
+    }
+    Ok(out)
+}
+
+pub(crate) fn prune_wal_before(db: &Db, seq_exclusive: u64, sync: bool) -> anyhow::Result<()> {
+    if seq_exclusive == 0 {
+        return Ok(());
+    }
+    db.delete_range(
+        wal_key(0).into_bytes(),
+        wal_key(seq_exclusive).into_bytes(),
+        WriteOptions { sync },
+    )
+    .context("prune spfresh wal")
 }
 
 pub(crate) fn vector_prefix(generation: u64) -> String {

@@ -24,9 +24,10 @@ use super::{SpFreshConfig, SpFreshIndex};
 use rebuilder::{rebuild_once, spawn_rebuilder, RebuilderRuntime};
 use stats::SpFreshLayerDbStatsInner;
 use storage::{
-    ensure_active_generation, ensure_metadata, ensure_wal_exists, load_metadata, load_rows,
-    load_index_checkpoint_bytes, persist_index_checkpoint_bytes, prefix_exclusive_end,
-    refresh_read_snapshot, set_active_generation, validate_config, vector_key, vector_prefix,
+    ensure_active_generation, ensure_metadata, ensure_wal_exists, ensure_wal_next_seq, load_metadata,
+    load_row, load_rows, load_index_checkpoint_bytes, load_wal_touched_ids_since,
+    persist_index_checkpoint_bytes, prefix_exclusive_end, prune_wal_before, refresh_read_snapshot,
+    set_active_generation, validate_config, wal_key, vector_key, vector_prefix,
 };
 use sync_utils::{lock_mutex, lock_read, lock_write};
 
@@ -50,6 +51,7 @@ pub struct SpFreshLayerDbIndex {
     update_gate: Arc<RwLock<()>>,
     dirty_ids: Arc<Mutex<HashSet<u64>>>,
     pending_ops: Arc<AtomicUsize>,
+    wal_next_seq: Arc<AtomicU64>,
     rebuild_tx: mpsc::Sender<()>,
     stop_worker: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -100,13 +102,19 @@ impl SpFreshLayerDbIndex {
 
     fn open_with_db(db_path: &Path, db: Db, cfg: SpFreshLayerDbConfig) -> anyhow::Result<Self> {
         let generation = ensure_active_generation(&db)?;
-        let index = Arc::new(RwLock::new(Self::load_or_rebuild_index(
-            &db, &cfg, generation,
-        )?));
+        let wal_next_seq = ensure_wal_next_seq(&db)?;
+        let (mut index_state, applied_wal_seq) =
+            Self::load_or_rebuild_index(&db, &cfg, generation, wal_next_seq)?;
+        let replay_from = applied_wal_seq.map_or(0, |seq| seq.saturating_add(1));
+        if replay_from < wal_next_seq {
+            Self::replay_wal_tail(&db, generation, &mut index_state, replay_from)?;
+        }
+        let index = Arc::new(RwLock::new(index_state));
         let active_generation = Arc::new(AtomicU64::new(generation));
         let update_gate = Arc::new(RwLock::new(()));
         let dirty_ids = Arc::new(Mutex::new(HashSet::new()));
         let pending_ops = Arc::new(AtomicUsize::new(0));
+        let wal_next_seq = Arc::new(AtomicU64::new(wal_next_seq));
         let stop_worker = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(SpFreshLayerDbStatsInner::default());
         let (rebuild_tx, rebuild_rx) = mpsc::channel::<()>();
@@ -136,6 +144,7 @@ impl SpFreshLayerDbIndex {
             update_gate,
             dirty_ids,
             pending_ops,
+            wal_next_seq,
             rebuild_tx,
             stop_worker,
             worker: Some(worker),
@@ -147,14 +156,15 @@ impl SpFreshLayerDbIndex {
         db: &Db,
         cfg: &SpFreshLayerDbConfig,
         generation: u64,
-    ) -> anyhow::Result<SpFreshIndex> {
+        wal_next_seq: u64,
+    ) -> anyhow::Result<(SpFreshIndex, Option<u64>)> {
         if let Some(raw) = load_index_checkpoint_bytes(db)? {
             match bincode::deserialize::<PersistedIndexCheckpoint>(raw.as_ref()) {
                 Ok(checkpoint)
                     if checkpoint.schema_version == config::META_INDEX_CHECKPOINT_SCHEMA_VERSION
                         && checkpoint.generation == generation =>
                 {
-                    return Ok(checkpoint.index);
+                    return Ok((checkpoint.index, checkpoint.applied_wal_seq));
                 }
                 Ok(_) => {}
                 Err(err) => {
@@ -164,19 +174,54 @@ impl SpFreshLayerDbIndex {
         }
 
         let rows = load_rows(db, generation)?;
-        Ok(SpFreshIndex::build(cfg.spfresh.clone(), &rows))
+        let applied_wal_seq = wal_next_seq.checked_sub(1);
+        Ok((
+            SpFreshIndex::build(cfg.spfresh.clone(), &rows),
+            applied_wal_seq,
+        ))
+    }
+
+    fn replay_wal_tail(
+        db: &Db,
+        generation: u64,
+        index: &mut SpFreshIndex,
+        from_seq: u64,
+    ) -> anyhow::Result<()> {
+        let touched_ids = load_wal_touched_ids_since(db, from_seq)?;
+        if touched_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut unique = HashSet::with_capacity(touched_ids.len());
+        for id in touched_ids {
+            unique.insert(id);
+        }
+        for id in unique {
+            match load_row(db, generation, id)? {
+                Some(row) => index.upsert(row.id, row.values),
+                None => {
+                    let _ = index.delete(id);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn persist_index_checkpoint(&self) -> anyhow::Result<()> {
+        let next_wal_seq = self.wal_next_seq.load(Ordering::Relaxed);
         let snapshot = lock_read(&self.index).clone();
         let checkpoint = PersistedIndexCheckpoint {
             schema_version: config::META_INDEX_CHECKPOINT_SCHEMA_VERSION,
             generation: self.active_generation.load(Ordering::Relaxed),
-            applied_wal_seq: None,
+            applied_wal_seq: next_wal_seq.checked_sub(1),
             index: snapshot,
         };
         let bytes = bincode::serialize(&checkpoint).context("encode spfresh index checkpoint")?;
-        persist_index_checkpoint_bytes(&self.db, bytes, self.cfg.write_sync)
+        persist_index_checkpoint_bytes(&self.db, bytes, self.cfg.write_sync)?;
+        if let Err(err) = prune_wal_before(&self.db, next_wal_seq, false) {
+            eprintln!("spfresh-layerdb wal prune failed: {err:#}");
+        }
+        Ok(())
     }
 
     fn runtime(&self) -> RebuilderRuntime {
@@ -260,33 +305,39 @@ impl SpFreshLayerDbIndex {
         rebuild_once(&runtime)
     }
 
+    fn persist_with_wal(&self, id: u64, vector_op: layerdb::Op) -> anyhow::Result<()> {
+        let seq = self.wal_next_seq.load(Ordering::Relaxed);
+        let next_seq = seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("spfresh wal sequence overflow"))?;
+        let wal_id = bincode::serialize(&id).context("encode spfresh wal id")?;
+        let wal_next = bincode::serialize(&next_seq).context("encode spfresh wal next seq")?;
+        self.db
+            .write_batch(
+                vec![
+                    vector_op,
+                    layerdb::Op::put(wal_key(seq), wal_id),
+                    layerdb::Op::put(config::META_INDEX_WAL_NEXT_SEQ_KEY, wal_next),
+                ],
+                WriteOptions {
+                    sync: self.cfg.write_sync,
+                },
+            )
+            .with_context(|| format!("persist vector+wal id={id} seq={seq}"))?;
+        self.wal_next_seq.store(next_seq, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn persist_upsert(&self, id: u64, vector: &[f32]) -> anyhow::Result<()> {
         let generation = self.active_generation.load(Ordering::Relaxed);
         let row = VectorRecord::new(id, vector.to_vec());
         let value = bincode::serialize(&row).context("serialize vector row")?;
-        self.db
-            .put(
-                vector_key(generation, id),
-                value,
-                WriteOptions {
-                    sync: self.cfg.write_sync,
-                },
-            )
-            .with_context(|| format!("persist vector id={id}"))?;
-        Ok(())
+        self.persist_with_wal(id, layerdb::Op::put(vector_key(generation, id), value))
     }
 
     fn persist_delete(&self, id: u64) -> anyhow::Result<()> {
         let generation = self.active_generation.load(Ordering::Relaxed);
-        self.db
-            .delete(
-                vector_key(generation, id),
-                WriteOptions {
-                    sync: self.cfg.write_sync,
-                },
-            )
-            .with_context(|| format!("delete vector id={id}"))?;
-        Ok(())
+        self.persist_with_wal(id, layerdb::Op::delete(vector_key(generation, id)))
     }
 
     pub fn try_upsert(&mut self, id: u64, vector: Vec<f32>) -> anyhow::Result<()> {

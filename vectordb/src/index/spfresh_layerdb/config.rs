@@ -9,6 +9,8 @@ pub(crate) const VECTOR_ROOT_PREFIX: &str = "spfresh/v/";
 pub(crate) const META_CONFIG_KEY: &str = "spfresh/meta/config";
 pub(crate) const META_ACTIVE_GENERATION_KEY: &str = "spfresh/meta/active_generation";
 pub(crate) const META_INDEX_CHECKPOINT_KEY: &str = "spfresh/meta/index_checkpoint";
+pub(crate) const META_INDEX_WAL_NEXT_SEQ_KEY: &str = "spfresh/meta/index_wal_next_seq";
+pub(crate) const INDEX_WAL_PREFIX: &str = "spfresh/wal/";
 pub(crate) const META_SCHEMA_VERSION: u32 = 1;
 pub(crate) const META_INDEX_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 

@@ -414,7 +414,13 @@ impl VectorIndex for SpFreshIndex {
             return Vec::new();
         }
 
-        let probes = self.nearest_postings(query, self.cfg.nprobe.max(1));
+        let probe_count = self
+            .cfg
+            .nprobe
+            .max(k.saturating_mul(2))
+            .max(1)
+            .min(self.postings.len().max(1));
+        let probes = self.nearest_postings(query, probe_count);
         let mut out = Vec::new();
         for (pid, _) in probes {
             let Some(posting) = self.postings.get(&pid) else {

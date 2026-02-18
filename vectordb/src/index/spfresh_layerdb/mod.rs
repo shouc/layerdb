@@ -38,7 +38,7 @@ pub struct SpFreshLayerDbIndex {
     db: Db,
     active_generation: Arc<AtomicU64>,
     index: Arc<RwLock<SpFreshIndex>>,
-    update_gate: Arc<Mutex<()>>,
+    update_gate: Arc<RwLock<()>>,
     dirty_ids: Arc<Mutex<HashSet<u64>>>,
     pending_ops: Arc<AtomicUsize>,
     rebuild_tx: mpsc::Sender<()>,
@@ -94,7 +94,7 @@ impl SpFreshLayerDbIndex {
         let rows = load_rows(&db, generation)?;
         let index = Arc::new(RwLock::new(SpFreshIndex::build(cfg.spfresh.clone(), &rows)));
         let active_generation = Arc::new(AtomicU64::new(generation));
-        let update_gate = Arc::new(Mutex::new(()));
+        let update_gate = Arc::new(RwLock::new(()));
         let dirty_ids = Arc::new(Mutex::new(HashSet::new()));
         let pending_ops = Arc::new(AtomicUsize::new(0));
         let stop_worker = Arc::new(AtomicBool::new(false));
@@ -159,7 +159,7 @@ impl SpFreshLayerDbIndex {
     }
 
     pub fn try_bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
-        let _update_guard = lock_mutex(&self.update_gate);
+        let _update_guard = lock_write(&self.update_gate);
 
         let old_generation = self.active_generation.load(Ordering::Relaxed);
         let new_generation = old_generation
@@ -251,7 +251,7 @@ impl SpFreshLayerDbIndex {
             );
         }
 
-        let _update_guard = lock_mutex(&self.update_gate);
+        let _update_guard = lock_read(&self.update_gate);
         let persist_started = Instant::now();
         if let Err(err) = self.persist_upsert(id, &vector) {
             self.stats
@@ -272,7 +272,7 @@ impl SpFreshLayerDbIndex {
     }
 
     pub fn try_delete(&mut self, id: u64) -> anyhow::Result<bool> {
-        let _update_guard = lock_mutex(&self.update_gate);
+        let _update_guard = lock_read(&self.update_gate);
         let persist_started = Instant::now();
         if let Err(err) = self.persist_delete(id) {
             self.stats

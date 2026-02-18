@@ -17,7 +17,7 @@ pub(crate) struct RebuilderRuntime {
     pub rebuild_interval: std::time::Duration,
     pub active_generation: Arc<AtomicU64>,
     pub index: Arc<RwLock<SpFreshIndex>>,
-    pub update_gate: Arc<Mutex<()>>,
+    pub update_gate: Arc<RwLock<()>>,
     pub dirty_ids: Arc<Mutex<std::collections::HashSet<u64>>>,
     pub pending_ops: Arc<AtomicUsize>,
     pub stats: Arc<SpFreshLayerDbStatsInner>,
@@ -65,10 +65,7 @@ pub(crate) fn spawn_rebuilder(
 
 pub(crate) fn rebuild_once(runtime: &RebuilderRuntime) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
-    let _update_guard = match runtime.update_gate.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let _update_guard = lock_write(&runtime.update_gate);
 
     if !runtime.has_pending_work() {
         return Ok(());

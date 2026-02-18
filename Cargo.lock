@@ -2372,6 +2372,8 @@ name = "vectordb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
+ "bytes",
  "clap",
  "layerdb",
  "rand 0.8.5",

@@ -250,7 +250,7 @@ fn make_reader(
     let id_array = Arc::new(Int64Array::from(ids));
     let vector_array = Arc::new(
         FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            vectors.into_iter(),
+            vectors,
             dim as i32,
         ),
     );

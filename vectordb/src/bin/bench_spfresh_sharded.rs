@@ -1,0 +1,256 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use serde::Deserialize;
+use vectordb::ground_truth::recall_at_k;
+use vectordb::index::{SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig, SpFreshLayerDbShardedIndex};
+use vectordb::types::{VectorIndex, VectorRecord};
+
+#[derive(Debug, Parser)]
+#[command(name = "bench_spfresh_sharded")]
+#[command(about = "Run sharded SPFresh LayerDB benchmark on vectordb exported dataset")]
+struct Args {
+    #[arg(long)]
+    dataset: PathBuf,
+    #[arg(long, default_value_t = 10)]
+    k: usize,
+    #[arg(long, default_value_t = 4)]
+    shards: usize,
+    #[arg(long, default_value_t = 64)]
+    initial_postings: usize,
+    #[arg(long, default_value_t = 8)]
+    nprobe: usize,
+    #[arg(long, default_value_t = 512)]
+    split_limit: usize,
+    #[arg(long, default_value_t = 64)]
+    merge_limit: usize,
+    #[arg(long, default_value_t = 16)]
+    reassign_range: usize,
+    #[arg(long, default_value_t = 2000)]
+    rebuild_pending_ops: usize,
+    #[arg(long, default_value_t = 500)]
+    rebuild_interval_ms: u64,
+    #[arg(long)]
+    db: Option<PathBuf>,
+    #[arg(long)]
+    keep_db: bool,
+    #[arg(long, default_value_t = false)]
+    durable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct Dataset {
+    base: Vec<DatasetRow>,
+    updates: Vec<(u64, Vec<f32>)>,
+    queries: Vec<Vec<f32>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DatasetRow {
+    id: u64,
+    values: Vec<f32>,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    if args.k == 0 {
+        anyhow::bail!("--k must be > 0");
+    }
+    if args.shards == 0 {
+        anyhow::bail!("--shards must be > 0");
+    }
+    if args.nprobe == 0 {
+        anyhow::bail!("--nprobe must be > 0");
+    }
+
+    let dataset: Dataset = serde_json::from_slice(
+        &fs::read(&args.dataset).with_context(|| format!("read {}", args.dataset.display()))?,
+    )
+    .with_context(|| format!("parse dataset json {}", args.dataset.display()))?;
+    if dataset.base.is_empty() {
+        anyhow::bail!("base dataset is empty");
+    }
+    let dim = dataset.base[0].values.len();
+    if dim == 0 {
+        anyhow::bail!("vector dim must be > 0");
+    }
+    for row in &dataset.base {
+        if row.values.len() != dim {
+            anyhow::bail!("base vector dim mismatch for id={}", row.id);
+        }
+    }
+    for (id, vector) in &dataset.updates {
+        if vector.len() != dim {
+            anyhow::bail!("update vector dim mismatch for id={id}");
+        }
+    }
+    for (idx, query) in dataset.queries.iter().enumerate() {
+        if query.len() != dim {
+            anyhow::bail!("query dim mismatch at index={idx}");
+        }
+    }
+
+    let temp_db;
+    let db_path = if let Some(path) = args.db.clone() {
+        path
+    } else {
+        temp_db = tempfile::tempdir().context("create temp sharded db dir")?;
+        temp_db.path().to_path_buf()
+    };
+    prepare_db_path(&db_path, args.keep_db)?;
+
+    let mut shard_cfg = SpFreshLayerDbConfig {
+        spfresh: vectordb::index::SpFreshConfig {
+            dim,
+            initial_postings: args.initial_postings,
+            split_limit: args.split_limit,
+            merge_limit: args.merge_limit,
+            reassign_range: args.reassign_range,
+            nprobe: args.nprobe,
+            kmeans_iters: 8,
+        },
+        rebuild_pending_ops: args.rebuild_pending_ops.max(1),
+        rebuild_interval: Duration::from_millis(args.rebuild_interval_ms.max(1)),
+        ..Default::default()
+    };
+    if !args.durable {
+        shard_cfg.write_sync = false;
+        shard_cfg.db_options.fsync_writes = false;
+    }
+    let cfg = SpFreshLayerDbShardedConfig {
+        shard_count: args.shards,
+        shard: shard_cfg,
+    };
+
+    let base_rows: Vec<VectorRecord> = dataset
+        .base
+        .iter()
+        .map(|r| VectorRecord::new(r.id, r.values.clone()))
+        .collect();
+
+    let build_start = Instant::now();
+    let mut index = SpFreshLayerDbShardedIndex::open(&db_path, cfg)?;
+    index.try_bulk_load(&base_rows)?;
+    let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
+
+    let update_start = Instant::now();
+    for (id, v) in &dataset.updates {
+        index.try_upsert(*id, v.clone())?;
+    }
+    let update_s = update_start.elapsed().as_secs_f64().max(1e-9);
+    let update_qps = dataset.updates.len() as f64 / update_s;
+
+    index.force_rebuild()?;
+
+    let (final_ids, final_vectors) = final_rows_after_updates(&dataset);
+    let expected = exact_topk_ids(&final_ids, &final_vectors, &dataset.queries, args.k);
+
+    let search_start = Instant::now();
+    let mut recall_sum = 0.0f64;
+    for (i, query) in dataset.queries.iter().enumerate() {
+        let got = index.search(query, args.k);
+        recall_sum += recall_at_k(&got, &expected[i], args.k) as f64;
+    }
+    let search_s = search_start.elapsed().as_secs_f64().max(1e-9);
+    let search_qps = dataset.queries.len() as f64 / search_s;
+
+    let output = serde_json::json!({
+        "engine": "spfresh-layerdb-sharded",
+        "dataset": args.dataset,
+        "db": db_path,
+        "dim": dim,
+        "base": dataset.base.len(),
+        "updates": dataset.updates.len(),
+        "queries": dataset.queries.len(),
+        "k": args.k,
+        "shards": args.shards,
+        "initial_postings": args.initial_postings,
+        "nprobe": args.nprobe,
+        "split_limit": args.split_limit,
+        "merge_limit": args.merge_limit,
+        "reassign_range": args.reassign_range,
+        "durable": args.durable,
+        "build_ms": build_ms,
+        "update_qps": update_qps,
+        "search_qps": search_qps,
+        "recall_at_k": recall_sum / dataset.queries.len() as f64,
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+
+    index.close()?;
+    Ok(())
+}
+
+fn prepare_db_path(path: &Path, keep_db: bool) -> Result<()> {
+    if keep_db {
+        fs::create_dir_all(path).with_context(|| format!("create db dir {}", path.display()))?;
+        return Ok(());
+    }
+    if path.exists() {
+        fs::remove_dir_all(path).with_context(|| format!("remove db dir {}", path.display()))?;
+    }
+    fs::create_dir_all(path).with_context(|| format!("create db dir {}", path.display()))?;
+    Ok(())
+}
+
+fn final_rows_after_updates(dataset: &Dataset) -> (Vec<u64>, Vec<Vec<f32>>) {
+    let mut rows: HashMap<u64, Vec<f32>> = dataset
+        .base
+        .iter()
+        .map(|r| (r.id, r.values.clone()))
+        .collect();
+    for (id, vec) in &dataset.updates {
+        rows.insert(*id, vec.clone());
+    }
+    let mut ids: Vec<u64> = rows.keys().copied().collect();
+    ids.sort_unstable();
+    let vectors = ids
+        .iter()
+        .map(|id| rows.get(id).cloned().expect("id exists"))
+        .collect();
+    (ids, vectors)
+}
+
+fn exact_topk_ids(
+    ids: &[u64],
+    vectors: &[Vec<f32>],
+    queries: &[Vec<f32>],
+    k: usize,
+) -> Vec<Vec<vectordb::Neighbor>> {
+    let mut out = Vec::with_capacity(queries.len());
+    for query in queries {
+        let mut pairs: Vec<vectordb::Neighbor> = ids
+            .iter()
+            .zip(vectors.iter())
+            .map(|(id, vector)| vectordb::Neighbor {
+                id: *id,
+                distance: squared_l2(query, vector),
+            })
+            .collect();
+        pairs.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if pairs.len() > k {
+            pairs.truncate(k);
+        }
+        out.push(pairs);
+    }
+    out
+}
+
+fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
+}

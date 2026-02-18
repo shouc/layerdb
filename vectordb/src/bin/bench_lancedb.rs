@@ -140,10 +140,13 @@ async fn main() -> Result<()> {
 
     let update_start = Instant::now();
     for chunk in dataset.updates.chunks(args.update_batch) {
-        let batch_rows: Vec<(u64, Vec<f32>)> = chunk
-            .iter()
-            .map(|(id, values)| (*id, values.clone()))
-            .collect();
+        // Merge-insert requires one source row per id in each batch.
+        // Keep the last update for duplicate ids within a chunk.
+        let mut dedup: HashMap<u64, Vec<f32>> = HashMap::with_capacity(chunk.len());
+        for (id, values) in chunk {
+            dedup.insert(*id, values.clone());
+        }
+        let batch_rows: Vec<(u64, Vec<f32>)> = dedup.into_iter().collect();
         let mut merge = table.merge_insert(&["id"]);
         merge
             .when_matched_update_all(None)

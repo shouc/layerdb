@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use layerdb::{Db, DbOptions, WriteOptions};
+use serde::{Deserialize, Serialize};
 
 use crate::types::{Neighbor, VectorIndex, VectorRecord};
 
@@ -24,13 +25,21 @@ use rebuilder::{rebuild_once, spawn_rebuilder, RebuilderRuntime};
 use stats::SpFreshLayerDbStatsInner;
 use storage::{
     ensure_active_generation, ensure_metadata, ensure_wal_exists, load_metadata, load_rows,
-    prefix_exclusive_end, refresh_read_snapshot, set_active_generation, validate_config,
-    vector_key, vector_prefix,
+    load_index_checkpoint_bytes, persist_index_checkpoint_bytes, prefix_exclusive_end,
+    refresh_read_snapshot, set_active_generation, validate_config, vector_key, vector_prefix,
 };
 use sync_utils::{lock_mutex, lock_read, lock_write};
 
 pub use config::SpFreshLayerDbConfig;
 pub use stats::SpFreshLayerDbStats;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedIndexCheckpoint {
+    schema_version: u32,
+    generation: u64,
+    applied_wal_seq: Option<u64>,
+    index: SpFreshIndex,
+}
 
 pub struct SpFreshLayerDbIndex {
     cfg: SpFreshLayerDbConfig,
@@ -91,8 +100,9 @@ impl SpFreshLayerDbIndex {
 
     fn open_with_db(db_path: &Path, db: Db, cfg: SpFreshLayerDbConfig) -> anyhow::Result<Self> {
         let generation = ensure_active_generation(&db)?;
-        let rows = load_rows(&db, generation)?;
-        let index = Arc::new(RwLock::new(SpFreshIndex::build(cfg.spfresh.clone(), &rows)));
+        let index = Arc::new(RwLock::new(Self::load_or_rebuild_index(
+            &db, &cfg, generation,
+        )?));
         let active_generation = Arc::new(AtomicU64::new(generation));
         let update_gate = Arc::new(RwLock::new(()));
         let dirty_ids = Arc::new(Mutex::new(HashSet::new()));
@@ -131,6 +141,42 @@ impl SpFreshLayerDbIndex {
             worker: Some(worker),
             stats,
         })
+    }
+
+    fn load_or_rebuild_index(
+        db: &Db,
+        cfg: &SpFreshLayerDbConfig,
+        generation: u64,
+    ) -> anyhow::Result<SpFreshIndex> {
+        if let Some(raw) = load_index_checkpoint_bytes(db)? {
+            match bincode::deserialize::<PersistedIndexCheckpoint>(raw.as_ref()) {
+                Ok(checkpoint)
+                    if checkpoint.schema_version == config::META_INDEX_CHECKPOINT_SCHEMA_VERSION
+                        && checkpoint.generation == generation =>
+                {
+                    return Ok(checkpoint.index);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("spfresh-layerdb checkpoint decode failed, rebuilding index: {err:#}");
+                }
+            }
+        }
+
+        let rows = load_rows(db, generation)?;
+        Ok(SpFreshIndex::build(cfg.spfresh.clone(), &rows))
+    }
+
+    fn persist_index_checkpoint(&self) -> anyhow::Result<()> {
+        let snapshot = lock_read(&self.index).clone();
+        let checkpoint = PersistedIndexCheckpoint {
+            schema_version: config::META_INDEX_CHECKPOINT_SCHEMA_VERSION,
+            generation: self.active_generation.load(Ordering::Relaxed),
+            applied_wal_seq: None,
+            index: snapshot,
+        };
+        let bytes = bincode::serialize(&checkpoint).context("encode spfresh index checkpoint")?;
+        persist_index_checkpoint_bytes(&self.db, bytes, self.cfg.write_sync)
     }
 
     fn runtime(&self) -> RebuilderRuntime {
@@ -205,6 +251,7 @@ impl SpFreshLayerDbIndex {
         lock_mutex(&self.dirty_ids).clear();
         self.pending_ops.store(0, Ordering::Relaxed);
         self.stats.set_last_rebuild_rows(rows.len());
+        self.persist_index_checkpoint()?;
         Ok(())
     }
 
@@ -303,6 +350,7 @@ impl SpFreshLayerDbIndex {
             }
         }
         self.force_rebuild()?;
+        self.persist_index_checkpoint()?;
         Ok(())
     }
 

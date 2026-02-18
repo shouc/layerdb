@@ -9,7 +9,7 @@ use crate::types::VectorRecord;
 
 use super::config::{
     SpFreshLayerDbConfig, SpFreshPersistedMeta, META_ACTIVE_GENERATION_KEY, META_CONFIG_KEY,
-    META_SCHEMA_VERSION, VECTOR_ROOT_PREFIX,
+    META_INDEX_CHECKPOINT_KEY, META_SCHEMA_VERSION, VECTOR_ROOT_PREFIX,
 };
 
 pub(crate) fn validate_config(cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> {
@@ -211,6 +211,22 @@ pub(crate) fn ensure_metadata(db: &Db, cfg: &SpFreshLayerDbConfig) -> anyhow::Re
         .context("persist spfresh metadata")?;
     set_active_generation(db, 0, true)?;
     Ok(())
+}
+
+pub(crate) fn load_index_checkpoint_bytes(db: &Db) -> anyhow::Result<Option<Vec<u8>>> {
+    let current = db
+        .get(META_INDEX_CHECKPOINT_KEY, ReadOptions::default())
+        .context("read spfresh index checkpoint")?;
+    Ok(current.map(|bytes| bytes.to_vec()))
+}
+
+pub(crate) fn persist_index_checkpoint_bytes(
+    db: &Db,
+    bytes: Vec<u8>,
+    sync: bool,
+) -> anyhow::Result<()> {
+    db.put(META_INDEX_CHECKPOINT_KEY, bytes, WriteOptions { sync })
+        .context("persist spfresh index checkpoint")
 }
 
 pub(crate) fn vector_prefix(generation: u64) -> String {

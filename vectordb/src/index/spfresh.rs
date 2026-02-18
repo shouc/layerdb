@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::linalg::{mean, squared_l2};
 use crate::types::{Neighbor, VectorIndex, VectorRecord};
 
 use super::kmeans::l2_kmeans;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpFreshConfig {
     pub dim: usize,
     pub initial_postings: usize,
@@ -30,13 +32,14 @@ impl Default for SpFreshConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Posting {
     id: usize,
     centroid: Vec<f32>,
     members: Vec<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpFreshIndex {
     cfg: SpFreshConfig,
     postings: HashMap<usize, Posting>,

@@ -1,6 +1,6 @@
 # VectorDB Benchmark Report
 
-Date: 2026-02-17
+Date: 2026-02-18
 
 ## Scope
 This report covers:
@@ -65,6 +65,54 @@ python3 scripts/bench_milvus.py \
 | saq-uniform | 5834.0 | 9109 | 338 | 0.4045 |
 | milvus-ivf-flat | 3311.2 | 139 | 205 | 0.5430 |
 
+## Post-Hardening Re-Run (10k / 2k / 200)
+
+After production-hardening changes (binary storage, atomic generation switch on bulk-load, incremental dirty-id rebuilder, tuned SPFresh probe fanout):
+
+```bash
+cargo run -p vectordb --bin vectordb-cli -- bench \
+  --seed 404 --dim 64 --base 10000 --updates 2000 --queries 200 --k 10 \
+  --initial-postings 64 --nprobe 8 --split-limit 64 --merge-limit 16 --reassign-range 32 \
+  --saq-total-bits 256 --saq-ivf-clusters 64
+```
+
+| engine | build ms | update qps | search qps | recall@10 |
+|---|---:|---:|---:|---:|
+| spfresh | 5833.3 | 530 | 159 | 0.8275 |
+| spfresh-layerdb | 5982.1 | 118 | 165 | 0.8355 |
+| append-only | 5761.7 | 3377 | 523 | 0.4165 |
+| saq | 5952.6 | 8206 | 329 | 0.4035 |
+| saq-uniform | 5819.8 | 9213 | 345 | 0.4045 |
+
+## Milvus Spot Check (2k / 400 / 100)
+
+Dataset:
+```bash
+cargo run -p vectordb --bin vectordb-cli -- dump-dataset \
+  --out /tmp/vectordb_eval_2000_400_100_seed777.json \
+  --seed 777 --dim 64 --base 2000 --updates 400 --queries 100
+```
+
+vectordb:
+```bash
+cargo run -p vectordb --bin vectordb-cli -- bench \
+  --seed 777 --dim 64 --base 2000 --updates 400 --queries 100 --k 10 \
+  --initial-postings 64 --nprobe 8 --split-limit 64 --merge-limit 16 --reassign-range 32 \
+  --saq-total-bits 256 --saq-ivf-clusters 64
+```
+
+milvus:
+```bash
+python3 scripts/bench_milvus.py \
+  --dataset /tmp/vectordb_eval_2000_400_100_seed777.json \
+  --k 10 --nprobe 8 --nlist 64 --update-batch 1
+```
+
+| engine | build ms | update qps | search qps | recall@10 |
+|---|---:|---:|---:|---:|
+| spfresh-layerdb | 1272.8 | 168 | 857 | 0.7510 |
+| milvus-ivf-flat | 6306.1 | 79.7 | 423.7 | 0.5810 |
+
 ## Stress Comparison (20k / 5k / 400)
 
 vectordb run:
@@ -92,9 +140,10 @@ python3 scripts/bench_milvus.py \
 | milvus-ivf-flat | 3749.1 | 141 | 155 | 0.5512 |
 
 ## Key Findings
-- LayerDB-backed SPFresh substantially improves recall under heavy updates versus in-memory SPFresh by using background rebuild.
-- `spfresh-layerdb` remains below Milvus recall in these settings but outperforms Milvus on one-by-one update throughput and search QPS.
-- SAQ variants remain strong on update throughput but lower on recall than `spfresh-layerdb` and Milvus in these L2 IVF settings.
+- Hardening + tuned probe fanout materially improved SPFresh recall on the 10k/2k/200 workload (`spfresh-layerdb` from `0.4380` to `0.8355`).
+- This recall gain trades off search throughput on that workload (`spfresh-layerdb` to ~`165 qps`).
+- On the 2k/400/100 spot check, `spfresh-layerdb` beat Milvus IVF_FLAT on both recall and QPS with one-by-one updates.
+- SAQ variants remain the highest-update-throughput options in this crate, with lower recall than tuned SPFresh on these runs.
 
 ## SAQ Paper Validation (arXiv:2509.12086)
 Implemented in `SaqIndex`:

@@ -7,6 +7,7 @@ mod sync_utils;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -37,6 +38,7 @@ pub struct SpFreshLayerDbIndex {
     active_generation: Arc<AtomicU64>,
     index: Arc<RwLock<SpFreshIndex>>,
     update_gate: Arc<Mutex<()>>,
+    dirty_ids: Arc<Mutex<HashSet<u64>>>,
     pending_ops: Arc<AtomicUsize>,
     rebuild_tx: mpsc::Sender<()>,
     stop_worker: Arc<AtomicBool>,
@@ -92,6 +94,7 @@ impl SpFreshLayerDbIndex {
         let index = Arc::new(RwLock::new(SpFreshIndex::build(cfg.spfresh.clone(), &rows)));
         let active_generation = Arc::new(AtomicU64::new(generation));
         let update_gate = Arc::new(Mutex::new(()));
+        let dirty_ids = Arc::new(Mutex::new(HashSet::new()));
         let pending_ops = Arc::new(AtomicUsize::new(0));
         let stop_worker = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(SpFreshLayerDbStatsInner::default());
@@ -100,12 +103,12 @@ impl SpFreshLayerDbIndex {
         let worker = spawn_rebuilder(
             RebuilderRuntime {
                 db: db.clone(),
-                spfresh_cfg: cfg.spfresh.clone(),
                 rebuild_pending_ops: cfg.rebuild_pending_ops.max(1),
                 rebuild_interval: cfg.rebuild_interval,
                 active_generation: active_generation.clone(),
                 index: index.clone(),
                 update_gate: update_gate.clone(),
+                dirty_ids: dirty_ids.clone(),
                 pending_ops: pending_ops.clone(),
                 stats: stats.clone(),
                 stop_worker: stop_worker.clone(),
@@ -120,6 +123,7 @@ impl SpFreshLayerDbIndex {
             active_generation,
             index,
             update_gate,
+            dirty_ids,
             pending_ops,
             rebuild_tx,
             stop_worker,
@@ -131,16 +135,22 @@ impl SpFreshLayerDbIndex {
     fn runtime(&self) -> RebuilderRuntime {
         RebuilderRuntime {
             db: self.db.clone(),
-            spfresh_cfg: self.cfg.spfresh.clone(),
             rebuild_pending_ops: self.cfg.rebuild_pending_ops.max(1),
             rebuild_interval: self.cfg.rebuild_interval,
             active_generation: self.active_generation.clone(),
             index: self.index.clone(),
             update_gate: self.update_gate.clone(),
+            dirty_ids: self.dirty_ids.clone(),
             pending_ops: self.pending_ops.clone(),
             stats: self.stats.clone(),
             stop_worker: self.stop_worker.clone(),
         }
+    }
+
+    fn mark_dirty(&self, id: u64) {
+        let mut dirty = lock_mutex(&self.dirty_ids);
+        dirty.insert(id);
+        self.pending_ops.store(dirty.len(), Ordering::Relaxed);
     }
 
     pub fn bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
@@ -191,6 +201,7 @@ impl SpFreshLayerDbIndex {
         }
 
         *lock_write(&self.index) = SpFreshIndex::build(self.cfg.spfresh.clone(), rows);
+        lock_mutex(&self.dirty_ids).clear();
         self.pending_ops.store(0, Ordering::Relaxed);
         self.stats.set_last_rebuild_rows(rows.len());
         Ok(())
@@ -245,8 +256,9 @@ impl SpFreshLayerDbIndex {
             return Err(err);
         }
         lock_write(&self.index).upsert(id, vector);
+        self.mark_dirty(id);
         self.stats.inc_upserts();
-        let pending = self.pending_ops.fetch_add(1, Ordering::Relaxed) + 1;
+        let pending = self.pending_ops.load(Ordering::Relaxed);
         if pending == self.cfg.rebuild_pending_ops.max(1) {
             let _ = self.rebuild_tx.send(());
         }
@@ -261,8 +273,9 @@ impl SpFreshLayerDbIndex {
         }
         let deleted = lock_write(&self.index).delete(id);
         if deleted {
+            self.mark_dirty(id);
             self.stats.inc_deletes();
-            let pending = self.pending_ops.fetch_add(1, Ordering::Relaxed) + 1;
+            let pending = self.pending_ops.load(Ordering::Relaxed);
             if pending == self.cfg.rebuild_pending_ops.max(1) {
                 let _ = self.rebuild_tx.send(());
             }

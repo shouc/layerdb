@@ -80,6 +80,19 @@ pub(crate) fn load_rows(db: &Db, generation: u64) -> anyhow::Result<Vec<VectorRe
     Ok(out)
 }
 
+pub(crate) fn load_row(db: &Db, generation: u64, id: u64) -> anyhow::Result<Option<VectorRecord>> {
+    let key = vector_key(generation, id);
+    let raw = db
+        .get(key.as_bytes(), ReadOptions::default())
+        .with_context(|| format!("load vector row id={id} generation={generation}"))?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let row: VectorRecord = bincode::deserialize(raw.as_ref())
+        .with_context(|| format!("decode vector row id={id} generation={generation}"))?;
+    Ok((!row.deleted).then_some(row))
+}
+
 pub(crate) fn ensure_active_generation(db: &Db) -> anyhow::Result<u64> {
     match db
         .get(META_ACTIVE_GENERATION_KEY, ReadOptions::default())

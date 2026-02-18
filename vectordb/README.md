@@ -3,6 +3,7 @@
 Experimental vector index crate with:
 - `SPFreshIndex`: partitioned incremental update with split/reassign
 - `SpFreshLayerDbIndex`: SPFresh system architecture with LayerDB durability + background rebuild
+- `SpFreshLayerDbShardedIndex`: shard-scaled SPFresh LayerDB index for larger corpora
 - `AppendOnlyIndex`: partitioned append-only baseline
 - `SaqIndex`: scalar additive quantization index inspired by arXiv:2509.12086
 
@@ -39,6 +40,13 @@ Compare the same dataset with LanceDB (Rust API):
 ```bash
 cargo run --release -p vectordb --bin bench_lancedb -- \
   --dataset /tmp/vectordb_dataset.json --k 10 --nprobe 8 --nlist 64 --update-batch 1
+```
+
+Compare the same dataset with sharded SPFresh LayerDB:
+```bash
+cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
+  --dataset /tmp/vectordb_dataset.json --k 10 --shards 4 \
+  --initial-postings 64 --nprobe 8 --split-limit 256 --merge-limit 64 --reassign-range 16
 ```
 
 Check SPFresh LayerDB index health:

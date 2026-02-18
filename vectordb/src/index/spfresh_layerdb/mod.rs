@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use anyhow::Context;
 use layerdb::{Db, DbOptions, WriteOptions};
@@ -251,10 +252,15 @@ impl SpFreshLayerDbIndex {
         }
 
         let _update_guard = lock_mutex(&self.update_gate);
+        let persist_started = Instant::now();
         if let Err(err) = self.persist_upsert(id, &vector) {
+            self.stats
+                .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
             self.stats.inc_persist_errors();
             return Err(err);
         }
+        self.stats
+            .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
         lock_write(&self.index).upsert(id, vector);
         self.mark_dirty(id);
         self.stats.inc_upserts();
@@ -267,10 +273,15 @@ impl SpFreshLayerDbIndex {
 
     pub fn try_delete(&mut self, id: u64) -> anyhow::Result<bool> {
         let _update_guard = lock_mutex(&self.update_gate);
+        let persist_started = Instant::now();
         if let Err(err) = self.persist_delete(id) {
+            self.stats
+                .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
             self.stats.inc_persist_errors();
             return Err(err);
         }
+        self.stats
+            .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
         let deleted = lock_write(&self.index).delete(id);
         if deleted {
             self.mark_dirty(id);
@@ -320,23 +331,21 @@ impl Drop for SpFreshLayerDbIndex {
 
 impl VectorIndex for SpFreshLayerDbIndex {
     fn upsert(&mut self, id: u64, vector: Vec<f32>) {
-        if let Err(err) = self.try_upsert(id, vector) {
-            eprintln!("spfresh-layerdb upsert failed for id={id}: {err:#}");
-        }
+        self.try_upsert(id, vector)
+            .unwrap_or_else(|err| panic!("spfresh-layerdb upsert failed for id={id}: {err:#}"));
     }
 
     fn delete(&mut self, id: u64) -> bool {
-        match self.try_delete(id) {
-            Ok(deleted) => deleted,
-            Err(err) => {
-                eprintln!("spfresh-layerdb delete failed for id={id}: {err:#}");
-                false
-            }
-        }
+        self.try_delete(id)
+            .unwrap_or_else(|err| panic!("spfresh-layerdb delete failed for id={id}: {err:#}"))
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
-        lock_read(&self.index).search(query, k)
+        let started = Instant::now();
+        let out = lock_read(&self.index).search(query, k);
+        self.stats
+            .record_search(started.elapsed().as_micros() as u64);
+        out
     }
 
     fn len(&self) -> usize {

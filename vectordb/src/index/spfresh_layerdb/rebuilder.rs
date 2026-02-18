@@ -64,6 +64,7 @@ pub(crate) fn spawn_rebuilder(
 }
 
 pub(crate) fn rebuild_once(runtime: &RebuilderRuntime) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     let _update_guard = match runtime.update_gate.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -107,6 +108,12 @@ pub(crate) fn rebuild_once(runtime: &RebuilderRuntime) -> anyhow::Result<()> {
     }
     runtime.pending_ops.store(guard.len(), Ordering::Relaxed);
     runtime.stats.inc_rebuild_successes();
+    runtime
+        .stats
+        .add_rebuild_applied_ids(dirty_ids.len() as u64);
+    runtime
+        .stats
+        .set_last_rebuild_duration_ms(started.elapsed().as_millis() as u64);
     runtime.stats.set_last_rebuild_rows(live_rows);
     Ok(())
 }

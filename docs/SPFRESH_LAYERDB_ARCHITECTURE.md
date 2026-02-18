@@ -75,5 +75,7 @@ This implementation follows the same system split:
 - recovery: restore serving state from durable storage
 
 Code reference:
-- `vectordb/src/index/spfresh_layerdb.rs`
+- `vectordb/src/index/spfresh_layerdb/mod.rs`
+- `vectordb/src/index/spfresh_layerdb/rebuilder.rs`
+- `vectordb/src/index/spfresh_layerdb/storage.rs`
 - `vectordb/src/index/spfresh.rs`

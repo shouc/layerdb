@@ -9,7 +9,8 @@ use vectordb::dataset::{generate_synthetic, SyntheticConfig};
 use vectordb::ground_truth::{exact_knn, recall_at_k};
 use vectordb::index::{
     AppendOnlyConfig, AppendOnlyIndex, SaqConfig, SaqIndex, SpFreshConfig, SpFreshIndex,
-    SpFreshLayerDbConfig, SpFreshLayerDbIndex,
+    SpFreshLayerDbConfig, SpFreshLayerDbIndex, SpFreshLayerDbShardedConfig,
+    SpFreshLayerDbShardedIndex,
 };
 use vectordb::types::{VectorIndex, VectorRecord};
 
@@ -62,6 +63,8 @@ struct BenchArgs {
     spfresh_rebuild_pending_ops: usize,
     #[arg(long, default_value_t = 500)]
     spfresh_rebuild_interval_ms: u64,
+    #[arg(long, default_value_t = 4)]
+    spfresh_shards: usize,
 }
 
 #[derive(Debug, Parser)]
@@ -165,6 +168,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
     let stats = vec![
         bench_spfresh(args, &data, &exact_answers),
         bench_spfresh_layerdb(args, &data, &exact_answers)?,
+        bench_spfresh_layerdb_sharded(args, &data, &exact_answers)?,
         bench_append_only(args, &data, &exact_answers),
         bench_saq(args, &data, &exact_answers),
         bench_saq_uniform(args, &data, &exact_answers),
@@ -478,6 +482,64 @@ fn bench_spfresh_layerdb(
 
     Ok(EngineStats {
         name: "spfresh-layerdb",
+        build_ms,
+        update_qps,
+        search_qps,
+        avg_recall: recall_sum / data.queries.len() as f64,
+    })
+}
+
+fn bench_spfresh_layerdb_sharded(
+    args: &BenchArgs,
+    data: &vectordb::dataset::SyntheticDataset,
+    exact_answers: &[Vec<vectordb::Neighbor>],
+) -> Result<EngineStats> {
+    let sp_cfg = SpFreshConfig {
+        dim: args.dim,
+        initial_postings: args.initial_postings,
+        split_limit: args.split_limit,
+        merge_limit: args.merge_limit,
+        reassign_range: args.reassign_range,
+        nprobe: args.nprobe,
+        kmeans_iters: 8,
+    };
+    let cfg = SpFreshLayerDbShardedConfig {
+        shard_count: args.spfresh_shards.max(1),
+        shard: SpFreshLayerDbConfig {
+            spfresh: sp_cfg,
+            rebuild_pending_ops: args.spfresh_rebuild_pending_ops.max(1),
+            rebuild_interval: Duration::from_millis(args.spfresh_rebuild_interval_ms.max(1)),
+            ..Default::default()
+        },
+    };
+
+    let db_dir = tempfile::TempDir::new()?;
+
+    let build_start = Instant::now();
+    let mut index = SpFreshLayerDbShardedIndex::open(db_dir.path(), cfg)?;
+    index.try_bulk_load(&data.base)?;
+    let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
+
+    let update_start = Instant::now();
+    for (id, v) in &data.updates {
+        index.try_upsert(*id, v.clone())?;
+    }
+    let update_s = update_start.elapsed().as_secs_f64().max(1e-9);
+    let update_qps = data.updates.len() as f64 / update_s;
+
+    index.force_rebuild()?;
+
+    let search_start = Instant::now();
+    let mut recall_sum = 0.0f64;
+    for (i, q) in data.queries.iter().enumerate() {
+        let got = index.search(q, exact_answers[i].len());
+        recall_sum += recall_at_k(&got, &exact_answers[i], got.len()) as f64;
+    }
+    let search_s = search_start.elapsed().as_secs_f64().max(1e-9);
+    let search_qps = data.queries.len() as f64 / search_s;
+
+    Ok(EngineStats {
+        name: "spfresh-sharded",
         build_ms,
         update_qps,
         search_qps,

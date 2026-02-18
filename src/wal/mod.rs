@@ -28,6 +28,7 @@ pub enum WalError {
 pub struct Wal {
     tx: mpsc::UnboundedSender<WalRequest>,
     flush_tx: mpsc::UnboundedSender<FlushSignal>,
+    versions: Arc<VersionSet>,
     next_seqno: Arc<AtomicU64>,
     last_ack_seqno: Arc<AtomicU64>,
     last_durable_seqno: Arc<AtomicU64>,
@@ -135,7 +136,7 @@ impl Wal {
                 dir: dir.to_path_buf(),
                 options: options.clone(),
                 memtables,
-                versions,
+                versions: versions.clone(),
                 next_seqno: next_seqno.clone(),
                 last_ack_seqno: last_ack_seqno.clone(),
                 last_durable_seqno: last_durable_seqno.clone(),
@@ -152,6 +153,7 @@ impl Wal {
         Ok(Self {
             tx,
             flush_tx,
+            versions,
             next_seqno,
             last_ack_seqno,
             last_durable_seqno,
@@ -233,6 +235,10 @@ impl Drop for Wal {
         }
         if let Some(handle) = self.flush_thread.take() {
             let _ = handle.join();
+        }
+
+        if let Err(err) = self.versions.persist_main_branch_head() {
+            eprintln!("layerdb: failed to persist main branch head on wal shutdown: {err:#}");
         }
     }
 }

@@ -421,6 +421,11 @@ impl VersionSet {
         Ok(())
     }
 
+    pub fn persist_main_branch_head(&self) -> anyhow::Result<()> {
+        let seqno = self.branches.read().get("main").copied().unwrap_or(0);
+        self.persist_branch_head("main", seqno)
+    }
+
     fn cached_reader(&self, path: &Path) -> anyhow::Result<Arc<SstReader>> {
         let key = path.to_path_buf();
         if let Some(reader) = self.reader_cache.get(&key) {

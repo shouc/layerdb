@@ -345,6 +345,44 @@ fn offheap_diskmeta_replays_wal_tail_without_row_rebuild() -> anyhow::Result<()>
 }
 
 #[test]
+fn offheap_diskmeta_rebuilds_without_posting_map_keys() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig {
+        memory_mode: SpFreshMemoryMode::OffHeapDiskMeta,
+        spfresh: crate::index::SpFreshConfig {
+            dim: 16,
+            initial_postings: 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(1, vec![0.1; cfg.spfresh.dim])?;
+        idx.try_upsert(2, vec![0.2; cfg.spfresh.dim])?;
+        idx.try_upsert(3, vec![0.3; cfg.spfresh.dim])?;
+        idx.close()?;
+    }
+
+    let db = Db::open(dir.path(), cfg.db_options.clone())?;
+    db.delete(super::config::META_INDEX_CHECKPOINT_KEY, WriteOptions { sync: true })?;
+    let generation = super::storage::ensure_active_generation(&db)?;
+    let prefix = super::storage::posting_map_prefix(generation);
+    let prefix_bytes = prefix.into_bytes();
+    let end = super::storage::prefix_exclusive_end(&prefix_bytes)?;
+    db.delete_range(prefix_bytes, end, WriteOptions { sync: true })?;
+
+    let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
+    assert_eq!(idx.memory_mode(), SpFreshMemoryMode::OffHeapDiskMeta);
+    assert_eq!(idx.len(), 3);
+    let got = idx.search(&[0.3; 16], 3);
+    assert!(got.iter().any(|n| n.id == 1));
+    assert!(got.iter().any(|n| n.id == 2));
+    assert!(got.iter().any(|n| n.id == 3));
+    Ok(())
+}
+
+#[test]
 fn posting_metadata_helpers_round_trip() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let cfg = SpFreshLayerDbConfig::default();
@@ -571,10 +609,20 @@ fn offheap_diskmeta_bulk_load_populates_metadata() -> anyhow::Result<()> {
     let db = Db::open(dir.path(), cfg.db_options.clone())?;
     let generation = super::storage::ensure_active_generation(&db)?;
     for row in rows {
-        let posting = super::storage::load_posting_assignment(&db, generation, row.id)?;
+        let mut posting = super::storage::load_posting_assignment(&db, generation, row.id)?;
+        if posting.is_none() {
+            let raw = db.get(
+                super::storage::vector_key(generation, row.id),
+                layerdb::ReadOptions::default(),
+            )?;
+            if let Some(raw) = raw {
+                let decoded = super::storage::decode_vector_row_with_posting(raw.as_ref())?;
+                posting = decoded.posting_id;
+            }
+        }
         assert!(
             posting.is_some(),
-            "missing posting assignment for id={}",
+            "missing posting assignment (map+row) for id={}",
             row.id
         );
     }

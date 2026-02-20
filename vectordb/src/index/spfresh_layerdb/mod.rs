@@ -29,10 +29,12 @@ use super::{SpFreshConfig, SpFreshIndex};
 use rebuilder::{rebuild_once, spawn_rebuilder, RebuilderRuntime};
 use stats::SpFreshLayerDbStatsInner;
 use storage::{
-    decode_vector_row_value, encode_vector_row_value, encode_wal_entry, ensure_active_generation,
+    decode_vector_row_value, decode_vector_row_with_posting, encode_vector_row_value,
+    encode_vector_row_value_with_posting, encode_wal_entry, ensure_active_generation,
     ensure_metadata, ensure_wal_exists, ensure_wal_next_seq, load_index_checkpoint_bytes,
     load_metadata, load_posting_assignments, load_posting_members, load_row, load_rows,
-    load_wal_entries_since, persist_index_checkpoint_bytes, posting_assignment_value,
+    load_rows_with_posting_assignments,
+    load_wal_entries_since, persist_index_checkpoint_bytes,
     posting_map_key, posting_map_prefix, posting_member_key, posting_member_value_with_residual,
     posting_members_generation_prefix, prefix_exclusive_end, prune_wal_before,
     refresh_read_snapshot, set_active_generation, validate_config, vector_key, vector_prefix,
@@ -447,17 +449,24 @@ impl SpFreshLayerDbIndex {
             }
         }
 
-        let rows = load_rows(db, generation)?;
         let applied_wal_seq = wal_next_seq.checked_sub(1);
         let index = match cfg.memory_mode {
             SpFreshMemoryMode::Resident => {
+                let rows = load_rows(db, generation)?;
                 RuntimeSpFreshIndex::Resident(SpFreshIndex::build(cfg.spfresh.clone(), &rows))
             }
             SpFreshMemoryMode::OffHeap => {
+                let rows = load_rows(db, generation)?;
                 RuntimeSpFreshIndex::OffHeap(SpFreshOffHeapIndex::build(cfg.spfresh.clone(), &rows))
             }
             SpFreshMemoryMode::OffHeapDiskMeta => {
-                let assignments = load_posting_assignments(db, generation)?;
+                let (rows, mut assignments) = load_rows_with_posting_assignments(db, generation)?;
+                if assignments.len() < rows.len() {
+                    let legacy_assignments = load_posting_assignments(db, generation)?;
+                    for (id, posting) in legacy_assignments {
+                        assignments.entry(id).or_insert(posting);
+                    }
+                }
                 let (index, _assigned_now) = SpFreshDiskMetaIndex::build_from_rows_with_assignments(
                     cfg.spfresh.clone(),
                     &rows,
@@ -884,13 +893,13 @@ impl SpFreshLayerDbIndex {
         for batch in rows.chunks(1_024) {
             let mut ops = Vec::with_capacity(batch.len().saturating_mul(3));
             for row in batch {
-                let value = encode_vector_row_value(row)
-                    .with_context(|| format!("serialize vector row id={}", row.id))?;
-                ops.push(layerdb::Op::put(vector_key(new_generation, row.id), value));
                 if let Some(assignments) = &disk_assignments {
                     let posting = assignments.get(&row.id).copied().ok_or_else(|| {
                         anyhow::anyhow!("missing diskmeta assignment for id={}", row.id)
                     })?;
+                    let value = encode_vector_row_value_with_posting(row, Some(posting))
+                        .with_context(|| format!("serialize vector row id={}", row.id))?;
+                    ops.push(layerdb::Op::put(vector_key(new_generation, row.id), value));
                     let centroid = disk_index
                         .as_ref()
                         .and_then(|idx| idx.posting_centroid(posting))
@@ -901,13 +910,13 @@ impl SpFreshLayerDbIndex {
                             )
                         })?;
                     ops.push(layerdb::Op::put(
-                        posting_map_key(new_generation, row.id),
-                        posting_assignment_value(posting)?,
-                    ));
-                    ops.push(layerdb::Op::put(
                         posting_member_key(new_generation, posting, row.id),
                         posting_member_value_with_residual(row.id, &row.values, centroid)?,
                     ));
+                } else {
+                    let value = encode_vector_row_value(row)
+                        .with_context(|| format!("serialize vector row id={}", row.id))?;
+                    ops.push(layerdb::Op::put(vector_key(new_generation, row.id), value));
                 }
             }
             self.db
@@ -1063,48 +1072,61 @@ impl SpFreshLayerDbIndex {
             return Ok(out);
         }
 
-        let posting_keys: Vec<Bytes> = ids
-            .iter()
-            .map(|id| Bytes::from(posting_map_key(generation, *id)))
-            .collect();
         let row_keys: Vec<Bytes> = ids
             .iter()
             .map(|id| Bytes::from(vector_key(generation, *id)))
             .collect();
-        let posting_values = self
-            .db
-            .multi_get(&posting_keys, ReadOptions::default())
-            .context("diskmeta multi_get posting assignments")?;
         let row_values = self
             .db
             .multi_get(&row_keys, ReadOptions::default())
             .context("diskmeta multi_get vector rows")?;
 
-        for ((id, posting_raw), row_raw) in ids
-            .iter()
-            .copied()
-            .zip(posting_values.into_iter())
-            .zip(row_values.into_iter())
-        {
-            let posting = match posting_raw {
-                Some(raw) => {
-                    let pid_u64: u64 = bincode::deserialize(raw.as_ref())
-                        .with_context(|| format!("decode posting assignment id={id}"))?;
-                    Some(usize::try_from(pid_u64).context("posting id does not fit usize")?)
-                }
-                None => None,
+        let mut needs_legacy_posting_lookup = Vec::new();
+        let mut pending_rows = HashMap::new();
+        for (id, row_raw) in ids.iter().copied().zip(row_values.into_iter()) {
+            let Some(raw) = row_raw else {
+                out.insert(id, None);
+                continue;
             };
-            let row = match row_raw {
-                Some(raw) => Some(decode_vector_row_value(raw.as_ref()).with_context(|| {
-                    format!("decode vector row id={id} generation={generation}")
-                })?),
-                None => None,
-            };
-            let state = match (posting, row) {
-                (Some(posting), Some(row)) if !row.deleted => Some((posting, row.values)),
-                _ => None,
-            };
-            out.insert(id, state);
+            let decoded = decode_vector_row_with_posting(raw.as_ref())
+                .with_context(|| format!("decode vector row id={id} generation={generation}"))?;
+            if decoded.row.deleted {
+                out.insert(id, None);
+                continue;
+            }
+            if let Some(posting_id) = decoded.posting_id {
+                out.insert(id, Some((posting_id, decoded.row.values)));
+            } else {
+                needs_legacy_posting_lookup.push(id);
+                pending_rows.insert(id, decoded.row.values);
+            }
+        }
+
+        if !needs_legacy_posting_lookup.is_empty() {
+            let posting_keys: Vec<Bytes> = needs_legacy_posting_lookup
+                .iter()
+                .map(|id| Bytes::from(posting_map_key(generation, *id)))
+                .collect();
+            let posting_values = self
+                .db
+                .multi_get(&posting_keys, ReadOptions::default())
+                .context("diskmeta legacy multi_get posting assignments")?;
+            for (id, posting_raw) in needs_legacy_posting_lookup
+                .into_iter()
+                .zip(posting_values.into_iter())
+            {
+                let posting = match posting_raw {
+                    Some(raw) => {
+                        let pid_u64: u64 = bincode::deserialize(raw.as_ref())
+                            .with_context(|| format!("decode posting assignment id={id}"))?;
+                        Some(usize::try_from(pid_u64).context("posting id does not fit usize")?)
+                    }
+                    None => None,
+                };
+                let state = posting
+                    .and_then(|posting| pending_rows.remove(&id).map(|values| (posting, values)));
+                out.insert(id, state);
+            }
         }
         Ok(out)
     }
@@ -1153,13 +1175,10 @@ impl SpFreshLayerDbIndex {
                     .unwrap_or(vector.as_slice());
                 let sketch = Self::residual_sketch_for_member(*id, vector, centroid);
                 let row = VectorRecord::new(*id, vector.clone());
-                let value = encode_vector_row_value(&row).context("serialize vector row")?;
+                let value = encode_vector_row_value_with_posting(&row, Some(new_posting))
+                    .context("serialize vector row")?;
                 let mut ops = vec![
                     layerdb::Op::put(vector_key(generation, *id), value),
-                    layerdb::Op::put(
-                        posting_map_key(generation, *id),
-                        posting_assignment_value(new_posting)?,
-                    ),
                     layerdb::Op::put(
                         posting_member_key(generation, new_posting, *id),
                         posting_member_value_with_residual(*id, vector, centroid)?,
@@ -1313,10 +1332,7 @@ impl SpFreshLayerDbIndex {
             let mut apply_entries = Vec::with_capacity(mutations.len());
             for id in &mutations {
                 let old = states.get(id).cloned().unwrap_or(None);
-                let mut ops = vec![
-                    layerdb::Op::delete(vector_key(generation, *id)),
-                    layerdb::Op::delete(posting_map_key(generation, *id)),
-                ];
+                let mut ops = vec![layerdb::Op::delete(vector_key(generation, *id))];
                 if let Some((old_posting, _)) = &old {
                     ops.push(layerdb::Op::delete(posting_member_key(
                         generation,

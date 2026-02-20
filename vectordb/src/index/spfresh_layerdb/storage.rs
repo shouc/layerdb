@@ -17,6 +17,7 @@ use super::config::{
 };
 
 const VECTOR_ROW_RKYV_TAG: &[u8] = b"vr1";
+const VECTOR_ROW_RKYV_V2_TAG: &[u8] = b"vr2";
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug)]
 #[archive(check_bytes)]
@@ -27,7 +28,47 @@ struct VectorRowValueRkyv {
     deleted: bool,
 }
 
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug)]
+#[archive(check_bytes)]
+struct VectorRowValueRkyvV2 {
+    id: u64,
+    values: Vec<f32>,
+    version: u32,
+    deleted: bool,
+    posting_id: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DecodedVectorRow {
+    pub row: VectorRecord,
+    pub posting_id: Option<usize>,
+}
+
 pub(crate) fn encode_vector_row_value(row: &VectorRecord) -> anyhow::Result<Vec<u8>> {
+    encode_vector_row_value_with_posting(row, None)
+}
+
+pub(crate) fn encode_vector_row_value_with_posting(
+    row: &VectorRecord,
+    posting_id: Option<usize>,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(posting_id) = posting_id {
+        let posting_id = u64::try_from(posting_id).context("posting id does not fit u64")?;
+        let payload = VectorRowValueRkyvV2 {
+            id: row.id,
+            values: row.values.clone(),
+            version: row.version,
+            deleted: row.deleted,
+            posting_id: Some(posting_id),
+        };
+        let archived = rkyv::to_bytes::<_, 1_024>(&payload)
+            .context("encode vector row value v2 with rkyv")?;
+        let mut out = Vec::with_capacity(VECTOR_ROW_RKYV_V2_TAG.len() + archived.len());
+        out.extend_from_slice(VECTOR_ROW_RKYV_V2_TAG);
+        out.extend_from_slice(archived.as_ref());
+        return Ok(out);
+    }
+
     let payload = VectorRowValueRkyv {
         id: row.id,
         values: row.values.clone(),
@@ -43,20 +84,54 @@ pub(crate) fn encode_vector_row_value(row: &VectorRecord) -> anyhow::Result<Vec<
 }
 
 pub(crate) fn decode_vector_row_value(raw: &[u8]) -> anyhow::Result<VectorRecord> {
+    Ok(decode_vector_row_with_posting(raw)?.row)
+}
+
+pub(crate) fn decode_vector_row_with_posting(raw: &[u8]) -> anyhow::Result<DecodedVectorRow> {
+    if raw.starts_with(VECTOR_ROW_RKYV_V2_TAG) {
+        let mut aligned =
+            rkyv::AlignedVec::with_capacity(raw.len() - VECTOR_ROW_RKYV_V2_TAG.len());
+        aligned.extend_from_slice(&raw[VECTOR_ROW_RKYV_V2_TAG.len()..]);
+        let archived = rkyv::check_archived_root::<VectorRowValueRkyvV2>(&aligned)
+            .map_err(|err| anyhow::anyhow!("decode rkyv vector row v2: {err}"))?;
+        let posting_id = match archived.posting_id.as_ref() {
+            Some(v) => {
+                Some(usize::try_from(*v).context("posting id does not fit usize")?)
+            }
+            None => None,
+        };
+        return Ok(DecodedVectorRow {
+            row: VectorRecord {
+                id: archived.id,
+                values: archived.values.iter().copied().collect(),
+                version: archived.version,
+                deleted: archived.deleted,
+            },
+            posting_id,
+        });
+    }
     if raw.starts_with(VECTOR_ROW_RKYV_TAG) {
         let mut aligned = rkyv::AlignedVec::with_capacity(raw.len() - VECTOR_ROW_RKYV_TAG.len());
         aligned.extend_from_slice(&raw[VECTOR_ROW_RKYV_TAG.len()..]);
         let archived = rkyv::check_archived_root::<VectorRowValueRkyv>(&aligned)
             .map_err(|err| anyhow::anyhow!("decode rkyv vector row: {err}"))?;
-        return Ok(VectorRecord {
-            id: archived.id,
-            values: archived.values.iter().copied().collect(),
-            version: archived.version,
-            deleted: archived.deleted,
+        return Ok(DecodedVectorRow {
+            row: VectorRecord {
+                id: archived.id,
+                values: archived.values.iter().copied().collect(),
+                version: archived.version,
+                deleted: archived.deleted,
+            },
+            posting_id: None,
         });
     }
     // Backward compatibility with legacy bincode row payloads.
-    bincode::deserialize::<VectorRecord>(raw).context("decode legacy vector row payload")
+    let row = bincode::deserialize::<VectorRecord>(raw)
+        .context("decode legacy vector row payload")?;
+    Ok(DecodedVectorRow {
+        row,
+        posting_id: None,
+    })
 }
 
 pub(crate) fn validate_config(cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> {
@@ -138,6 +213,45 @@ pub(crate) fn load_row(db: &Db, generation: u64, id: u64) -> anyhow::Result<Opti
     let row = decode_vector_row_value(raw.as_ref())
         .with_context(|| format!("decode vector row id={id} generation={generation}"))?;
     Ok((!row.deleted).then_some(row))
+}
+
+pub(crate) fn load_rows_with_posting_assignments(
+    db: &Db,
+    generation: u64,
+) -> anyhow::Result<(Vec<VectorRecord>, HashMap<u64, usize>)> {
+    let mut rows = Vec::new();
+    let mut assignments = HashMap::new();
+    let prefix = vector_prefix(generation);
+    let prefix_bytes = prefix.as_bytes().to_vec();
+    let end = prefix_exclusive_end(&prefix_bytes)?;
+    let mut iter = db.iter(
+        Range {
+            start: Bound::Included(Bytes::from(prefix_bytes.clone())),
+            end: Bound::Excluded(Bytes::from(end)),
+        },
+        ReadOptions::default(),
+    )?;
+    iter.seek_to_first();
+    for next in iter {
+        let (key, value) = next?;
+        if !key.starts_with(prefix_bytes.as_slice()) {
+            continue;
+        }
+        let Some(value) = value else {
+            continue;
+        };
+        let decoded = decode_vector_row_with_posting(value.as_ref()).with_context(|| {
+            format!("decode vector row key={}", String::from_utf8_lossy(&key))
+        })?;
+        if decoded.row.deleted {
+            continue;
+        }
+        if let Some(posting_id) = decoded.posting_id {
+            assignments.insert(decoded.row.id, posting_id);
+        }
+        rows.push(decoded.row);
+    }
+    Ok((rows, assignments))
 }
 
 pub(crate) fn ensure_active_generation(db: &Db) -> anyhow::Result<u64> {
@@ -394,6 +508,7 @@ pub(crate) fn posting_map_key(generation: u64, id: u64) -> String {
     format!("{}{id:020}", posting_map_prefix(generation))
 }
 
+#[cfg(test)]
 pub(crate) fn posting_assignment_value(posting_id: usize) -> anyhow::Result<Vec<u8>> {
     let pid = u64::try_from(posting_id).context("posting id does not fit u64")?;
     bincode::serialize(&pid).context("encode posting assignment value")

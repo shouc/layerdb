@@ -52,7 +52,13 @@ fn io_backend_default_is_platform_aware() {
     }
 
     let io = UringExecutor::default();
-    assert_eq!(io.backend(), DbOptions::default().io_backend);
+    let desired = DbOptions::default().io_backend;
+    let expected = match desired {
+        IoBackend::Uring if !UringExecutor::supports_native_uring() => IoBackend::Blocking,
+        IoBackend::Kqueue if !UringExecutor::supports_kqueue() => IoBackend::Blocking,
+        other => other,
+    };
+    assert_eq!(io.backend(), expected);
 }
 
 #[test]

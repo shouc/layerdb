@@ -143,6 +143,7 @@ fn main() -> Result<()> {
     if !args.durable {
         shard_cfg.write_sync = false;
         shard_cfg.db_options.fsync_writes = false;
+        shard_cfg.unsafe_nondurable_fast_path = true;
     }
     let memory_mode = shard_cfg.memory_mode;
     let cfg = SpFreshLayerDbShardedConfig {

@@ -71,6 +71,7 @@ pub struct VectorMutationBatchResult {
 
 type DiskMetaRowState = Option<(usize, Vec<f32>)>;
 type DiskMetaStateMap = HashMap<u64, DiskMetaRowState>;
+type EphemeralPostingMembers = HashMap<usize, HashMap<u64, PostingMemberSketch>>;
 type DistanceRow = (u64, f32);
 type DistanceLoadResult = (Vec<DistanceRow>, Vec<u64>);
 const DISKMETA_RERANK_FACTOR: usize = 8;
@@ -252,6 +253,7 @@ pub struct SpFreshLayerDbIndex {
     vector_cache: Arc<Mutex<VectorCache>>,
     vector_blocks: Arc<Mutex<VectorBlockStore>>,
     posting_members_cache: Arc<Mutex<PostingMembersCache>>,
+    ephemeral_posting_members: Arc<Mutex<Option<EphemeralPostingMembers>>>,
     diskmeta_search_snapshot: Arc<ArcSwapOption<SpFreshDiskMetaIndex>>,
     wal_next_seq: Arc<AtomicU64>,
     posting_event_next_seq: Arc<AtomicU64>,
@@ -338,6 +340,7 @@ impl SpFreshLayerDbIndex {
             cfg.posting_delta_compact_interval_ops,
             cfg.posting_delta_compact_budget_entries,
         )));
+        let ephemeral_posting_members = Arc::new(Mutex::new(None));
         let replay_from = applied_wal_seq.map_or(0, |seq| seq.saturating_add(1));
         if replay_from < wal_next_seq {
             if matches!(index_state, RuntimeSpFreshIndex::OffHeapDiskMeta(_)) {
@@ -415,7 +418,7 @@ impl SpFreshLayerDbIndex {
             rebuild_rx,
         );
 
-        Ok(Self {
+        let out = Self {
             cfg,
             db_path: db_path.to_path_buf(),
             db,
@@ -427,6 +430,7 @@ impl SpFreshLayerDbIndex {
             vector_cache,
             vector_blocks,
             posting_members_cache,
+            ephemeral_posting_members,
             diskmeta_search_snapshot,
             wal_next_seq,
             posting_event_next_seq,
@@ -440,7 +444,11 @@ impl SpFreshLayerDbIndex {
             stop_worker,
             worker: Some(worker),
             stats,
-        })
+        };
+        if out.use_nondurable_fast_path() && out.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
+            out.refresh_ephemeral_posting_members_from_storage()?;
+        }
+        Ok(out)
     }
 
     fn load_or_rebuild_index(
@@ -731,6 +739,11 @@ impl SpFreshLayerDbIndex {
         generation: u64,
         posting_id: usize,
     ) -> anyhow::Result<Arc<Vec<PostingMemberSketch>>> {
+        if self.use_nondurable_fast_path() {
+            if let Some(members) = self.load_ephemeral_posting_members_for(posting_id) {
+                return Ok(members);
+            }
+        }
         if let Some(ids) = lock_mutex(&self.posting_members_cache).get(generation, posting_id) {
             return Ok(ids);
         }
@@ -793,6 +806,97 @@ impl SpFreshLayerDbIndex {
         Ok(())
     }
 
+    fn refresh_ephemeral_posting_members_from_storage(&self) -> anyhow::Result<()> {
+        if !self.use_nondurable_fast_path()
+            || self.cfg.memory_mode != SpFreshMemoryMode::OffHeapDiskMeta
+        {
+            *lock_mutex(&self.ephemeral_posting_members) = None;
+            return Ok(());
+        }
+        let generation = self.active_generation.load(Ordering::Relaxed);
+        let mut refreshed: EphemeralPostingMembers = HashMap::new();
+        if let Some(snapshot) = self.diskmeta_search_snapshot.load_full() {
+            for posting_id in snapshot.posting_ids() {
+                let loaded = load_posting_members(&self.db, generation, posting_id)
+                    .with_context(|| format!("load posting members for posting={posting_id}"))?;
+                let mut posting_members = HashMap::with_capacity(loaded.members.len());
+                for member in loaded.members {
+                    posting_members.insert(member.id, PostingMemberSketch::from_loaded(&member));
+                }
+                refreshed.insert(posting_id, posting_members);
+            }
+        }
+        *lock_mutex(&self.ephemeral_posting_members) = Some(refreshed);
+        Ok(())
+    }
+
+    fn apply_ephemeral_posting_upsert_deltas(&self, deltas: Vec<(u64, Option<usize>, usize)>) {
+        if deltas.is_empty() {
+            return;
+        }
+        let mut guard = lock_mutex(&self.ephemeral_posting_members);
+        let Some(postings) = guard.as_mut() else {
+            return;
+        };
+        for (id, old_posting, new_posting) in deltas {
+            if let Some(old_posting) = old_posting {
+                if old_posting != new_posting {
+                    let mut remove_old = false;
+                    if let Some(members) = postings.get_mut(&old_posting) {
+                        members.remove(&id);
+                        remove_old = members.is_empty();
+                    }
+                    if remove_old {
+                        postings.remove(&old_posting);
+                    }
+                }
+            }
+            postings
+                .entry(new_posting)
+                .or_insert_with(HashMap::new)
+                .insert(
+                    id,
+                    PostingMemberSketch {
+                        id,
+                        residual_scale: None,
+                        residual_code: None,
+                    },
+                );
+        }
+    }
+
+    fn apply_ephemeral_posting_delete_deltas(&self, deltas: Vec<(u64, usize)>) {
+        if deltas.is_empty() {
+            return;
+        }
+        let mut guard = lock_mutex(&self.ephemeral_posting_members);
+        let Some(postings) = guard.as_mut() else {
+            return;
+        };
+        for (id, posting_id) in deltas {
+            let mut remove_posting = false;
+            if let Some(members) = postings.get_mut(&posting_id) {
+                members.remove(&id);
+                remove_posting = members.is_empty();
+            }
+            if remove_posting {
+                postings.remove(&posting_id);
+            }
+        }
+    }
+
+    fn load_ephemeral_posting_members_for(
+        &self,
+        posting_id: usize,
+    ) -> Option<Arc<Vec<PostingMemberSketch>>> {
+        let guard = lock_mutex(&self.ephemeral_posting_members);
+        let postings = guard.as_ref()?;
+        let members = postings.get(&posting_id)?;
+        let mut out: Vec<PostingMemberSketch> = members.values().cloned().collect();
+        out.sort_by_key(|m| m.id);
+        Some(Arc::new(out))
+    }
+
     fn set_commit_error(&self, err: anyhow::Error) {
         let mut slot = lock_mutex(&self.commit_error);
         if slot.is_none() {
@@ -805,6 +909,10 @@ impl SpFreshLayerDbIndex {
             anyhow::bail!("async commit pipeline failed: {err}");
         }
         Ok(())
+    }
+
+    fn use_nondurable_fast_path(&self) -> bool {
+        self.cfg.unsafe_nondurable_fast_path && !self.cfg.write_sync
     }
 
     fn handle_commit_result(&self, result: anyhow::Result<()>) -> anyhow::Result<()> {
@@ -1153,6 +1261,10 @@ impl SpFreshLayerDbIndex {
             Self::extract_diskmeta_snapshot(&guard)
         };
         self.diskmeta_search_snapshot.store(snapshot);
+        if self.use_nondurable_fast_path() && self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta
+        {
+            self.refresh_ephemeral_posting_members_from_storage()?;
+        }
         {
             let mut cache = lock_mutex(&self.vector_cache);
             cache.map.clear();
@@ -1379,42 +1491,50 @@ impl SpFreshLayerDbIndex {
                 RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.clone(),
                 _ => anyhow::bail!("diskmeta upsert batch called for non-diskmeta index"),
             };
-            let mut posting_event_next_seq =
-                self.posting_event_next_seq.load(Ordering::Relaxed);
-
+            let use_fast_path = self.use_nondurable_fast_path();
+            let mut posting_event_next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(3));
             let mut touched_ids = Vec::with_capacity(mutations.len());
             let mut new_postings = HashMap::with_capacity(mutations.len());
             let mut dirty_postings = HashSet::with_capacity(mutations.len().saturating_mul(2));
+            let mut ephemeral_deltas = Vec::with_capacity(mutations.len());
             for (id, vector) in &mutations {
                 let old = states.get(id).and_then(|state| state.as_ref());
                 let new_posting = shadow.choose_posting(vector).unwrap_or(0);
-                let centroid = shadow
-                    .posting_centroid(new_posting)
-                    .unwrap_or(vector.as_slice());
-                let value = encode_vector_row_fields(*id, 0, false, vector.as_slice(), Some(new_posting))
-                    .context("serialize vector row")?;
-                let upsert_event_seq = posting_event_next_seq;
-                posting_event_next_seq = posting_event_next_seq.saturating_add(1);
-                batch_ops.push(layerdb::Op::put(vector_key(generation, *id), value));
-                batch_ops.push(layerdb::Op::put(
-                    posting_member_event_key(generation, new_posting, upsert_event_seq, *id),
-                    posting_member_event_upsert_value_with_residual(*id, vector, centroid)?,
-                ));
-                if let Some((old_posting, _)) = old {
-                    if *old_posting != new_posting {
-                        let tombstone_event_seq = posting_event_next_seq;
-                        posting_event_next_seq = posting_event_next_seq.saturating_add(1);
-                        batch_ops.push(layerdb::Op::put(posting_member_event_key(
-                            generation,
-                            *old_posting,
-                            tombstone_event_seq,
-                            *id,
-                        ), posting_member_event_tombstone_value(*id)?));
-                    }
-                }
-                touched_ids.push(*id);
                 let old_posting = old.map(|(posting, _)| *posting);
+                if !use_fast_path {
+                    let value =
+                        encode_vector_row_fields(*id, 0, false, vector.as_slice(), Some(new_posting))
+                            .context("serialize vector row")?;
+                    batch_ops.push(layerdb::Op::put(vector_key(generation, *id), value));
+                    let centroid = shadow
+                        .posting_centroid(new_posting)
+                        .unwrap_or(vector.as_slice());
+                    let upsert_event_seq = posting_event_next_seq;
+                    posting_event_next_seq = posting_event_next_seq.saturating_add(1);
+                    batch_ops.push(layerdb::Op::put(
+                        posting_member_event_key(generation, new_posting, upsert_event_seq, *id),
+                        posting_member_event_upsert_value_with_residual(*id, vector, centroid)?,
+                    ));
+                    if let Some(old_posting) = old_posting {
+                        if old_posting != new_posting {
+                            let tombstone_event_seq = posting_event_next_seq;
+                            posting_event_next_seq = posting_event_next_seq.saturating_add(1);
+                            batch_ops.push(layerdb::Op::put(
+                                posting_member_event_key(
+                                    generation,
+                                    old_posting,
+                                    tombstone_event_seq,
+                                    *id,
+                                ),
+                                posting_member_event_tombstone_value(*id)?,
+                            ));
+                        }
+                    }
+                    touched_ids.push(*id);
+                } else {
+                    ephemeral_deltas.push((*id, old_posting, new_posting));
+                }
                 if let Some(old_posting) = old_posting {
                     dirty_postings.insert(old_posting);
                 }
@@ -1426,27 +1546,31 @@ impl SpFreshLayerDbIndex {
                 );
                 new_postings.insert(*id, new_posting);
             }
-            let posting_event_next = bincode::serialize(&posting_event_next_seq)
-                .context("encode posting-event next seq")?;
-            let trailer_ops = vec![layerdb::Op::put(
-                config::META_POSTING_EVENT_NEXT_SEQ_KEY,
-                posting_event_next,
-            )];
-
-            let persist_entries = vec![(
-                IndexWalEntry::TouchBatch { ids: touched_ids },
-                batch_ops,
-            )];
-            if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, trailer_ops) {
+            if use_fast_path {
                 self.stats
                     .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
-                self.stats.inc_persist_errors();
-                return Err(err);
+            } else {
+                let posting_event_next = bincode::serialize(&posting_event_next_seq)
+                    .context("encode posting-event next seq")?;
+                let trailer_ops = vec![layerdb::Op::put(
+                    config::META_POSTING_EVENT_NEXT_SEQ_KEY,
+                    posting_event_next,
+                )];
+                let persist_entries = vec![(
+                    IndexWalEntry::TouchBatch { ids: touched_ids },
+                    batch_ops,
+                )];
+                if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, trailer_ops) {
+                    self.stats
+                        .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
+                    self.stats.inc_persist_errors();
+                    return Err(err);
+                }
+                self.posting_event_next_seq
+                    .store(posting_event_next_seq, Ordering::Relaxed);
+                self.stats
+                    .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
             }
-            self.stats
-                .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
-            self.posting_event_next_seq
-                .store(posting_event_next_seq, Ordering::Relaxed);
             {
                 let mut blocks = lock_mutex(&self.vector_blocks);
                 if let Err(err) =
@@ -1477,29 +1601,34 @@ impl SpFreshLayerDbIndex {
                     members_cache.invalidate(generation, posting_id);
                 }
             }
+            if use_fast_path {
+                self.apply_ephemeral_posting_upsert_deltas(ephemeral_deltas);
+            }
             for _ in 0..mutations.len() {
                 self.stats.inc_upserts();
             }
             return Ok(mutations.len());
         }
 
-        let mut batch_ops = Vec::with_capacity(mutations.len());
-        let mut touched_ids = Vec::with_capacity(mutations.len());
-        for (id, vector) in &mutations {
-            let value = encode_vector_row_fields(*id, 0, false, vector.as_slice(), None)
-                .context("serialize vector row")?;
-            batch_ops.push(layerdb::Op::put(vector_key(generation, *id), value));
-            touched_ids.push(*id);
-        }
-        let persist_entries = vec![(
-            IndexWalEntry::TouchBatch { ids: touched_ids },
-            batch_ops,
-        )];
-        if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, Vec::new()) {
-            self.stats
-                .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
-            self.stats.inc_persist_errors();
-            return Err(err);
+        if !self.use_nondurable_fast_path() {
+            let mut batch_ops = Vec::with_capacity(mutations.len());
+            let mut touched_ids = Vec::with_capacity(mutations.len());
+            for (id, vector) in &mutations {
+                let value = encode_vector_row_fields(*id, 0, false, vector.as_slice(), None)
+                    .context("serialize vector row")?;
+                batch_ops.push(layerdb::Op::put(vector_key(generation, *id), value));
+                touched_ids.push(*id);
+            }
+            let persist_entries = vec![(
+                IndexWalEntry::TouchBatch { ids: touched_ids },
+                batch_ops,
+            )];
+            if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, Vec::new()) {
+                self.stats
+                    .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
+                self.stats.inc_persist_errors();
+                return Err(err);
+            }
         }
         self.stats
             .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
@@ -1572,49 +1701,69 @@ impl SpFreshLayerDbIndex {
                 RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.clone(),
                 _ => anyhow::bail!("diskmeta delete batch called for non-diskmeta index"),
             };
+            let use_fast_path = self.use_nondurable_fast_path();
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(2));
             let mut touched_ids = Vec::with_capacity(mutations.len());
             let mut deleted = 0usize;
             let mut dirty_postings = HashSet::with_capacity(mutations.len());
+            let mut ephemeral_deletions = Vec::with_capacity(mutations.len());
             let mut posting_event_next_seq =
                 self.posting_event_next_seq.load(Ordering::Relaxed);
             for id in &mutations {
                 let old = states.get(id).cloned().unwrap_or(None);
-                batch_ops.push(layerdb::Op::delete(vector_key(generation, *id)));
+                if !use_fast_path {
+                    batch_ops.push(layerdb::Op::delete(vector_key(generation, *id)));
+                }
                 if let Some((old_posting, _)) = &old {
                     dirty_postings.insert(*old_posting);
-                    let tombstone_event_seq = posting_event_next_seq;
-                    posting_event_next_seq = posting_event_next_seq.saturating_add(1);
-                    batch_ops.push(layerdb::Op::put(
-                        posting_member_event_key(generation, *old_posting, tombstone_event_seq, *id),
-                        posting_member_event_tombstone_value(*id)?,
-                    ));
+                    if use_fast_path {
+                        ephemeral_deletions.push((*id, *old_posting));
+                    } else {
+                        let tombstone_event_seq = posting_event_next_seq;
+                        posting_event_next_seq = posting_event_next_seq.saturating_add(1);
+                        batch_ops.push(layerdb::Op::put(
+                            posting_member_event_key(
+                                generation,
+                                *old_posting,
+                                tombstone_event_seq,
+                                *id,
+                            ),
+                            posting_member_event_tombstone_value(*id)?,
+                        ));
+                    }
                 }
-                touched_ids.push(*id);
+                if !use_fast_path {
+                    touched_ids.push(*id);
+                }
                 if shadow.apply_delete(old) {
                     deleted = deleted.saturating_add(1);
                 }
             }
-            let posting_event_next = bincode::serialize(&posting_event_next_seq)
-                .context("encode posting-event next seq")?;
-            let trailer_ops = vec![layerdb::Op::put(
-                config::META_POSTING_EVENT_NEXT_SEQ_KEY,
-                posting_event_next,
-            )];
-            let persist_entries = vec![(
-                IndexWalEntry::TouchBatch { ids: touched_ids },
-                batch_ops,
-            )];
-            if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, trailer_ops) {
+            if use_fast_path {
                 self.stats
                     .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
-                self.stats.inc_persist_errors();
-                return Err(err);
+            } else {
+                let posting_event_next = bincode::serialize(&posting_event_next_seq)
+                    .context("encode posting-event next seq")?;
+                let trailer_ops = vec![layerdb::Op::put(
+                    config::META_POSTING_EVENT_NEXT_SEQ_KEY,
+                    posting_event_next,
+                )];
+                let persist_entries = vec![(
+                    IndexWalEntry::TouchBatch { ids: touched_ids },
+                    batch_ops,
+                )];
+                if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, trailer_ops) {
+                    self.stats
+                        .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
+                    self.stats.inc_persist_errors();
+                    return Err(err);
+                }
+                self.posting_event_next_seq
+                    .store(posting_event_next_seq, Ordering::Relaxed);
+                self.stats
+                    .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
             }
-            self.stats
-                .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
-            self.posting_event_next_seq
-                .store(posting_event_next_seq, Ordering::Relaxed);
             {
                 let mut blocks = lock_mutex(&self.vector_blocks);
                 if let Err(err) = blocks.append_delete_batch(&mutations) {
@@ -1643,27 +1792,32 @@ impl SpFreshLayerDbIndex {
                     members_cache.invalidate(generation, posting_id);
                 }
             }
+            if use_fast_path {
+                self.apply_ephemeral_posting_delete_deltas(ephemeral_deletions);
+            }
             for _ in 0..deleted {
                 self.stats.inc_deletes();
             }
             return Ok(deleted);
         }
 
-        let mut batch_ops = Vec::with_capacity(mutations.len());
-        let mut touched_ids = Vec::with_capacity(mutations.len());
-        for id in &mutations {
-            batch_ops.push(layerdb::Op::delete(vector_key(generation, *id)));
-            touched_ids.push(*id);
-        }
-        let persist_entries = vec![(
-            IndexWalEntry::TouchBatch { ids: touched_ids },
-            batch_ops,
-        )];
-        if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, Vec::new()) {
-            self.stats
-                .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
-            self.stats.inc_persist_errors();
-            return Err(err);
+        if !self.use_nondurable_fast_path() {
+            let mut batch_ops = Vec::with_capacity(mutations.len());
+            let mut touched_ids = Vec::with_capacity(mutations.len());
+            for id in &mutations {
+                batch_ops.push(layerdb::Op::delete(vector_key(generation, *id)));
+                touched_ids.push(*id);
+            }
+            let persist_entries = vec![(
+                IndexWalEntry::TouchBatch { ids: touched_ids },
+                batch_ops,
+            )];
+            if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, Vec::new()) {
+                self.stats
+                    .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
+                self.stats.inc_persist_errors();
+                return Err(err);
+            }
         }
         self.stats
             .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);

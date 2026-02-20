@@ -42,6 +42,7 @@ pub struct SpFreshLayerDbConfig {
     pub spfresh: SpFreshConfig,
     pub db_options: DbOptions,
     pub write_sync: bool,
+    pub unsafe_nondurable_fast_path: bool,
     pub rebuild_pending_ops: usize,
     pub rebuild_interval: Duration,
     pub memory_mode: SpFreshMemoryMode,
@@ -60,6 +61,7 @@ impl Default for SpFreshLayerDbConfig {
                 ..Default::default()
             },
             write_sync: true,
+            unsafe_nondurable_fast_path: false,
             rebuild_pending_ops: 2_000,
             rebuild_interval: Duration::from_millis(500),
             memory_mode: SpFreshMemoryMode::Resident,

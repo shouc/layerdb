@@ -15,7 +15,8 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use anyhow::Context;
-use layerdb::{Db, DbOptions, WriteOptions};
+use bytes::Bytes;
+use layerdb::{Db, DbOptions, ReadOptions, WriteOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Neighbor, VectorIndex, VectorRecord};
@@ -438,6 +439,57 @@ impl SpFreshLayerDbIndex {
         Ok(Some(values))
     }
 
+    fn load_vectors_for_ids(
+        db: &Db,
+        vector_cache: &Arc<Mutex<VectorCache>>,
+        generation: u64,
+        ids: &[u64],
+    ) -> anyhow::Result<Vec<(u64, Vec<f32>)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        let mut misses = Vec::new();
+        {
+            let cache = lock_mutex(vector_cache);
+            for id in ids.iter().copied() {
+                if let Some(values) = cache.get(id) {
+                    out.push((id, values));
+                } else {
+                    misses.push(id);
+                }
+            }
+        }
+        if misses.is_empty() {
+            return Ok(out);
+        }
+
+        let keys: Vec<Bytes> = misses
+            .iter()
+            .map(|id| Bytes::from(vector_key(generation, *id)))
+            .collect();
+        let rows = db
+            .multi_get(&keys, ReadOptions::default())
+            .context("diskmeta multi_get vector rows")?;
+        let mut fetched = Vec::new();
+        for (id, raw) in misses.into_iter().zip(rows.into_iter()) {
+            let Some(raw) = raw else {
+                continue;
+            };
+            let row: VectorRecord = bincode::deserialize(raw.as_ref())
+                .with_context(|| format!("decode vector row id={id} generation={generation}"))?;
+            if row.deleted {
+                continue;
+            }
+            out.push((id, row.values.clone()));
+            fetched.push((id, row.values));
+        }
+        if !fetched.is_empty() {
+            let mut cache = lock_mutex(vector_cache);
+            for (id, values) in fetched {
+                cache.put(id, values);
+            }
+        }
+        Ok(out)
+    }
+
     fn loader_for<'a>(
         db: &'a Db,
         vector_cache: &'a Arc<Mutex<VectorCache>>,
@@ -476,6 +528,31 @@ impl SpFreshLayerDbIndex {
         let ids = Arc::new(ids);
         lock_mutex(&self.posting_members_cache).put_arc(generation, posting_id, ids.clone());
         Ok(ids)
+    }
+
+    fn neighbor_cmp(a: &Neighbor, b: &Neighbor) -> std::cmp::Ordering {
+        a.distance
+            .total_cmp(&b.distance)
+            .then_with(|| a.id.cmp(&b.id))
+    }
+
+    fn push_neighbor_topk(top: &mut Vec<Neighbor>, candidate: Neighbor, k: usize) {
+        if k == 0 {
+            return;
+        }
+        if top.len() < k {
+            top.push(candidate);
+            return;
+        }
+        let mut worst_idx = 0usize;
+        for idx in 1..top.len() {
+            if Self::neighbor_cmp(&top[idx], &top[worst_idx]).is_gt() {
+                worst_idx = idx;
+            }
+        }
+        if Self::neighbor_cmp(&candidate, &top[worst_idx]).is_lt() {
+            top[worst_idx] = candidate;
+        }
     }
 
     fn mark_dirty(&self, id: u64) {
@@ -935,7 +1012,7 @@ impl VectorIndex for SpFreshLayerDbIndex {
                 }
             }
             RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
-                let mut out = Vec::new();
+                let mut top = Vec::with_capacity(k);
                 let postings = index.choose_probe_postings(query, k);
                 for posting_id in postings {
                     let member_ids = self
@@ -943,32 +1020,26 @@ impl VectorIndex for SpFreshLayerDbIndex {
                         .unwrap_or_else(|err| {
                             panic!("offheap-diskmeta load members failed: {err:#}")
                         });
-                    for id in member_ids.iter().copied() {
-                        let values =
-                            Self::load_vector_for_id(&self.db, &self.vector_cache, generation, id)
-                                .unwrap_or_else(|err| {
-                                    panic!("offheap-diskmeta load vector failed: {err:#}")
-                                });
-                        let Some(values) = values else {
-                            continue;
-                        };
-                        out.push(Neighbor {
-                            id,
-                            distance: crate::linalg::squared_l2(query, &values),
-                        });
+                    let vectors = Self::load_vectors_for_ids(
+                        &self.db,
+                        &self.vector_cache,
+                        generation,
+                        member_ids.as_ref(),
+                    )
+                    .unwrap_or_else(|err| panic!("offheap-diskmeta load vectors failed: {err:#}"));
+                    for (id, values) in vectors {
+                        Self::push_neighbor_topk(
+                            &mut top,
+                            Neighbor {
+                                id,
+                                distance: crate::linalg::squared_l2(query, &values),
+                            },
+                            k,
+                        );
                     }
                 }
-                let cmp = |a: &Neighbor, b: &Neighbor| {
-                    a.distance
-                        .total_cmp(&b.distance)
-                        .then_with(|| a.id.cmp(&b.id))
-                };
-                if out.len() > k {
-                    out.select_nth_unstable_by(k - 1, cmp);
-                    out.truncate(k);
-                }
-                out.sort_by(cmp);
-                out
+                top.sort_by(Self::neighbor_cmp);
+                top
             }
         };
         self.stats

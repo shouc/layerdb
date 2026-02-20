@@ -279,40 +279,21 @@ impl Db {
     }
 
     pub fn get(&self, key: impl AsRef<[u8]>, opts: ReadOptions) -> anyhow::Result<Option<Value>> {
-        let snapshot = match opts.snapshot {
-            Some(snapshot) => self
-                .inner
-                .versions
-                .snapshots()
-                .resolve_read_snapshot(Some(snapshot))?,
-            None => self.default_read_snapshot(),
-        };
+        let snapshot = self.resolve_read_snapshot(opts)?;
+        self.get_at_snapshot(key.as_ref(), snapshot)
+    }
 
-        let mem = self
-            .inner
-            .memtables
-            .get(key.as_ref(), snapshot)
-            .context("memtable get")?;
-        let sst = self
-            .inner
-            .versions
-            .get(key.as_ref(), snapshot)
-            .context("sst get")?;
-
-        let chosen = match (mem, sst) {
-            (Some(a), Some(b)) => {
-                if a.seqno >= b.seqno {
-                    Some(a)
-                } else {
-                    Some(b)
-                }
-            }
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-
-        Ok(chosen.and_then(|r| r.value))
+    pub fn multi_get(
+        &self,
+        keys: &[bytes::Bytes],
+        opts: ReadOptions,
+    ) -> anyhow::Result<Vec<Option<Value>>> {
+        let snapshot = self.resolve_read_snapshot(opts)?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            out.push(self.get_at_snapshot(key.as_ref(), snapshot)?);
+        }
+        Ok(out)
     }
 
     pub fn iter(&self, range: Range, opts: ReadOptions) -> anyhow::Result<crate::db::DbIterator> {
@@ -496,6 +477,40 @@ impl Db {
 
     fn default_read_snapshot(&self) -> u64 {
         self.read_snapshot.load(Ordering::Relaxed)
+    }
+
+    fn resolve_read_snapshot(&self, opts: ReadOptions) -> anyhow::Result<u64> {
+        match opts.snapshot {
+            Some(snapshot) => self
+                .inner
+                .versions
+                .snapshots()
+                .resolve_read_snapshot(Some(snapshot)),
+            None => Ok(self.default_read_snapshot()),
+        }
+    }
+
+    fn get_at_snapshot(&self, key: &[u8], snapshot: u64) -> anyhow::Result<Option<Value>> {
+        let mem = self
+            .inner
+            .memtables
+            .get(key, snapshot)
+            .context("memtable get")?;
+        let sst = self.inner.versions.get(key, snapshot).context("sst get")?;
+
+        let chosen = match (mem, sst) {
+            (Some(a), Some(b)) => {
+                if a.seqno >= b.seqno {
+                    Some(a)
+                } else {
+                    Some(b)
+                }
+            }
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        Ok(chosen.and_then(|r| r.value))
     }
 }
 

@@ -22,7 +22,8 @@ cargo run -p vectordb --bin vectordb-cli -- bench \
   --saq-total-bits 256 --saq-ivf-clusters 128
 ```
 
-Use `--spfresh-offheap` to run LayerDB-backed SPFresh variants in off-heap mode.
+Use `--spfresh-offheap` (vector payload off-heap) or `--spfresh-diskmeta`
+(vector payload + posting metadata off-heap) to run LayerDB-backed SPFresh variants in low-RAM modes.
 
 For higher recall operating points in SPFresh, raise `--nprobe` (for example `--nprobe 32`).
 
@@ -59,6 +60,14 @@ cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
   --offheap
 ```
 
+Run sharded SPFresh with disk-backed metadata (hot posting/member lists cached in RAM):
+```bash
+cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
+  --dataset /tmp/vectordb_dataset.json --k 10 --shards 4 \
+  --initial-postings 64 --nprobe 8 --split-limit 256 --merge-limit 64 --reassign-range 16 \
+  --diskmeta
+```
+
 Check SPFresh LayerDB index health:
 ```bash
 cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
@@ -74,6 +83,9 @@ cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
   - `SpFreshMemoryMode::Resident` (default): keeps full SPFresh vectors in RAM.
   - `SpFreshMemoryMode::OffHeap`: keeps SPFresh posting metadata in RAM and loads vector
     payloads from LayerDB on demand (with cache via `offheap_cache_capacity`).
+  - `SpFreshMemoryMode::OffHeapDiskMeta`: keeps centroids/statistics in RAM while storing
+    vector payload, `id -> posting`, and `posting -> member ids` in LayerDB. Hot posting
+    lists are cached in memory (`offheap_posting_cache_entries`).
 - prefer fallible APIs in services:
   - `try_upsert`, `try_delete`, `try_bulk_load`
   - `open_existing` to recover config from persisted metadata

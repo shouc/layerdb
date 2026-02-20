@@ -151,16 +151,22 @@ To align closer with SPFresh-style disk-first scaling, `SpFreshLayerDbIndex` now
 - `SpFreshMemoryMode::Resident` (existing behavior): full vectors kept in RAM.
 - `SpFreshMemoryMode::OffHeap` (new): in-memory state keeps postings + id->posting mapping,
   while vector payloads stay in LayerDB and are fetched on demand with cache.
+- `SpFreshMemoryMode::OffHeapDiskMeta` (new): in-memory state keeps centroids/statistics only;
+  vector payload and posting metadata (`id->posting`, `posting->member`) stay in LayerDB, with
+  bounded hot posting-list cache.
 
 Implementation:
 - New off-heap core: `vectordb/src/index/spfresh_offheap.rs`
-- LayerDB runtime enum + checkpoint support for resident/offheap:
+- New disk-metadata core: `vectordb/src/index/spfresh_diskmeta.rs`
+- LayerDB runtime enum + checkpoint support for resident/offheap/diskmeta:
   `vectordb/src/index/spfresh_layerdb/mod.rs`
 - Rebuilder support in offheap mode:
   `vectordb/src/index/spfresh_layerdb/rebuilder.rs`
 - New tests:
   - `offheap_persists_and_recovers_vectors`
   - `offheap_randomized_restarts_preserve_model_state`
+  - `offheap_diskmeta_persists_and_recovers_vectors`
+  - `offheap_diskmeta_bulk_load_populates_metadata`
 
 This addresses the primary memory blocker for 100B+ planning on small machines:
 resident RAM no longer needs to scale with full vector payload.
@@ -191,6 +197,12 @@ SPFresh-sharded offheap (`shards=4, nprobe=8`, non-durable mode):
 - search_qps: 660.61
 - recall@k: 1.0000
 
+SPFresh-sharded diskmeta (`shards=4, nprobe=8`, non-durable mode):
+- build_ms: 555.86
+- update_qps: 2373.68
+- search_qps: 104.98
+- recall@k: 0.9955
+
 ### Small dataset
 
 Dataset: `dim=64, base=5000, updates=1000, queries=200`
@@ -219,6 +231,9 @@ Interpretation:
 - Durable SPFresh mode trades update throughput for stronger write durability, as expected.
 - Offheap SPFresh substantially reduces memory residency pressure while preserving recall;
   throughput drops versus resident mode due to on-demand vector loads.
+- Diskmeta mode pushes memory usage lower by moving posting metadata to LayerDB; current
+  implementation is update-safe and restart-safe, but search throughput is significantly lower
+  than resident/offheap and remains below LanceDB in this benchmark.
 
 ## Production Readiness Checks Performed
 
@@ -265,6 +280,17 @@ cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
   --split-limit 256 --merge-limit 64 --reassign-range 16 \
   --rebuild-pending-ops 1000 --rebuild-interval-ms 250 \
   --offheap
+```
+
+SPFresh-sharded diskmeta:
+
+```bash
+cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
+  --dataset output/bench/vdb_dataset_medium.json \
+  --k 10 --shards 4 --initial-postings 96 --nprobe 8 \
+  --split-limit 256 --merge-limit 64 --reassign-range 16 \
+  --rebuild-pending-ops 1000 --rebuild-interval-ms 250 \
+  --diskmeta
 ```
 
 Durable SPFresh-sharded:

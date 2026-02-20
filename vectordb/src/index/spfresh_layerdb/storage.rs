@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::Context;
 use bytes::Bytes;
 use layerdb::{Db, Range, ReadOptions, WriteOptions};
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -349,8 +350,17 @@ pub(crate) fn posting_member_key(generation: u64, posting_id: usize, id: u64) ->
     format!("{}{id:020}", posting_members_prefix(generation, posting_id))
 }
 
+const POSTING_MEMBER_RKYV_TAG: &[u8] = b"rk1";
+
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug)]
+#[archive(check_bytes)]
+struct PostingMemberValueRkyv {
+    id: u64,
+    values: Vec<f32>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PostingMemberValue {
+struct PostingMemberValueLegacy {
     id: u64,
     values: Vec<f32>,
 }
@@ -362,11 +372,16 @@ pub(crate) struct PostingMember {
 }
 
 pub(crate) fn posting_member_value(id: u64, values: &[f32]) -> anyhow::Result<Vec<u8>> {
-    let payload = PostingMemberValue {
+    let payload = PostingMemberValueRkyv {
         id,
         values: values.to_vec(),
     };
-    bincode::serialize(&payload).context("encode posting member value")
+    let archived =
+        rkyv::to_bytes::<_, 1_024>(&payload).context("encode posting member value with rkyv")?;
+    let mut out = Vec::with_capacity(POSTING_MEMBER_RKYV_TAG.len() + archived.len());
+    out.extend_from_slice(POSTING_MEMBER_RKYV_TAG);
+    out.extend_from_slice(archived.as_ref());
+    Ok(out)
 }
 
 pub(crate) fn load_posting_members(
@@ -394,21 +409,35 @@ pub(crate) fn load_posting_members(
         let Some(value) = value else {
             continue;
         };
-        let decoded = bincode::deserialize::<PostingMemberValue>(value.as_ref())
-            .map(|payload| PostingMember {
-                id: payload.id,
-                values: Some(payload.values),
-            })
-            .or_else(|_| {
-                bincode::deserialize::<u64>(value.as_ref())
-                    .map(|id| PostingMember { id, values: None })
-            })
-            .with_context(|| {
-                format!(
-                    "decode posting member key={}",
-                    String::from_utf8_lossy(&key)
-                )
-            })?;
+        let raw = value.as_ref();
+        let decoded = (|| -> anyhow::Result<PostingMember> {
+            if raw.starts_with(POSTING_MEMBER_RKYV_TAG) {
+                let mut aligned = rkyv::AlignedVec::with_capacity(
+                    raw.len().saturating_sub(POSTING_MEMBER_RKYV_TAG.len()),
+                );
+                aligned.extend_from_slice(&raw[POSTING_MEMBER_RKYV_TAG.len()..]);
+                let archived = rkyv::check_archived_root::<PostingMemberValueRkyv>(&aligned)
+                    .map_err(|err| anyhow::anyhow!("decode rkyv posting member: {err}"))?;
+                return Ok(PostingMember {
+                    id: archived.id,
+                    values: Some(archived.values.iter().copied().collect()),
+                });
+            }
+            if let Ok(payload) = bincode::deserialize::<PostingMemberValueLegacy>(raw) {
+                return Ok(PostingMember {
+                    id: payload.id,
+                    values: Some(payload.values),
+                });
+            }
+            let id = bincode::deserialize::<u64>(raw)?;
+            Ok(PostingMember { id, values: None })
+        })()
+        .with_context(|| {
+            format!(
+                "decode posting member key={}",
+                String::from_utf8_lossy(&key)
+            )
+        })?;
         out.push(decoded);
     }
     Ok(out)

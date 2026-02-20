@@ -197,6 +197,10 @@ impl PostingMembersCache {
         self.map.get(&(generation, posting_id)).cloned()
     }
 
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     fn put_arc(
         &mut self,
         generation: u64,
@@ -1084,6 +1088,34 @@ impl SpFreshLayerDbIndex {
         }
     }
 
+    fn maybe_prewarm_posting_members_cache(&self) {
+        if self.cfg.memory_mode != SpFreshMemoryMode::OffHeapDiskMeta {
+            return;
+        }
+        let generation = self.active_generation.load(Ordering::Relaxed);
+        let Some(index) = self.diskmeta_search_snapshot.load_full() else {
+            return;
+        };
+        let posting_ids = index.posting_ids();
+        if posting_ids.is_empty() {
+            return;
+        }
+        let capacity = lock_mutex(&self.posting_members_cache).capacity();
+        if posting_ids.len() > capacity {
+            return;
+        }
+
+        for posting_id in posting_ids {
+            if let Err(err) = self.load_posting_members_for(generation, posting_id) {
+                eprintln!(
+                    "spfresh-layerdb posting-members cache prewarm failed generation={} posting={}: {err:#}",
+                    generation, posting_id
+                );
+                break;
+            }
+        }
+    }
+
     pub fn bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
         self.try_bulk_load(rows)
     }
@@ -1211,8 +1243,9 @@ impl SpFreshLayerDbIndex {
             cache.map.clear();
             cache.order.clear();
         }
-        self.maybe_prewarm_vector_cache_from_blocks();
         lock_mutex(&self.posting_members_cache).clear();
+        self.maybe_prewarm_vector_cache_from_blocks();
+        self.maybe_prewarm_posting_members_cache();
         lock_mutex(&self.dirty_ids).clear();
         self.pending_ops.store(0, Ordering::Relaxed);
         self.stats.set_last_rebuild_rows(rows.len());
@@ -1225,6 +1258,7 @@ impl SpFreshLayerDbIndex {
         let runtime = self.runtime();
         rebuild_once(&runtime)?;
         self.maybe_prewarm_vector_cache_from_blocks();
+        self.maybe_prewarm_posting_members_cache();
         Ok(())
     }
 

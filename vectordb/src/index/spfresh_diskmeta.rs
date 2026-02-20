@@ -305,6 +305,12 @@ impl SpFreshDiskMetaIndex {
         self.postings.get(&posting_id).map(|p| p.centroid.as_slice())
     }
 
+    pub(crate) fn posting_ids(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = self.postings.keys().copied().collect();
+        out.sort_unstable();
+        out
+    }
+
     pub(crate) fn choose_probe_postings(&self, query: &[f32], k: usize) -> Vec<usize> {
         if query.len() != self.cfg.dim || k == 0 {
             return Vec::new();

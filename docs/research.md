@@ -1,6 +1,6 @@
 # SPFresh at 10B-1T: OpenReview Research and Implementation
 
-Date: February 18, 2026
+Date: February 20, 2026
 
 ## Goal
 
@@ -144,6 +144,27 @@ Features:
 Also improved Lance benchmark robustness:
 - `vectordb/src/bin/bench_lancedb.rs` now deduplicates duplicate IDs inside each update batch before merge-insert, preventing ambiguous merge failures with `--update-batch > 1`.
 
+## C) Off-heap SPFresh runtime mode (memory fix for very large datasets)
+
+To align closer with SPFresh-style disk-first scaling, `SpFreshLayerDbIndex` now supports:
+
+- `SpFreshMemoryMode::Resident` (existing behavior): full vectors kept in RAM.
+- `SpFreshMemoryMode::OffHeap` (new): in-memory state keeps postings + id->posting mapping,
+  while vector payloads stay in LayerDB and are fetched on demand with cache.
+
+Implementation:
+- New off-heap core: `vectordb/src/index/spfresh_offheap.rs`
+- LayerDB runtime enum + checkpoint support for resident/offheap:
+  `vectordb/src/index/spfresh_layerdb/mod.rs`
+- Rebuilder support in offheap mode:
+  `vectordb/src/index/spfresh_layerdb/rebuilder.rs`
+- New tests:
+  - `offheap_persists_and_recovers_vectors`
+  - `offheap_randomized_restarts_preserve_model_state`
+
+This addresses the primary memory blocker for 100B+ planning on small machines:
+resident RAM no longer needs to scale with full vector payload.
+
 ## Benchmarks vs LanceDB
 
 All runs used the same exported datasets and `k=10`.
@@ -162,6 +183,12 @@ SPFresh-sharded (`shards=4, nprobe=8`, non-durable mode):
 - build_ms: 525.31
 - update_qps: 6451.03
 - search_qps: 1395.50
+- recall@k: 1.0000
+
+SPFresh-sharded offheap (`shards=4, nprobe=8`, non-durable mode):
+- build_ms: 620.38
+- update_qps: 3574.66
+- search_qps: 660.61
 - recall@k: 1.0000
 
 ### Small dataset
@@ -190,6 +217,8 @@ Interpretation:
 - Current SPFresh-sharded implementation strongly improves search throughput and recall on these workloads.
 - LanceDB remains stronger on batched update throughput in benchmark mode.
 - Durable SPFresh mode trades update throughput for stronger write durability, as expected.
+- Offheap SPFresh substantially reduces memory residency pressure while preserving recall;
+  throughput drops versus resident mode due to on-demand vector loads.
 
 ## Production Readiness Checks Performed
 
@@ -225,6 +254,17 @@ cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
   --k 10 --shards 4 --initial-postings 96 --nprobe 8 \
   --split-limit 256 --merge-limit 64 --reassign-range 16 \
   --rebuild-pending-ops 1000 --rebuild-interval-ms 250
+```
+
+SPFresh-sharded offheap:
+
+```bash
+cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
+  --dataset output/bench/vdb_dataset_medium.json \
+  --k 10 --shards 4 --initial-postings 96 --nprobe 8 \
+  --split-limit 256 --merge-limit 64 --reassign-range 16 \
+  --rebuild-pending-ops 1000 --rebuild-interval-ms 250 \
+  --offheap
 ```
 
 Durable SPFresh-sharded:

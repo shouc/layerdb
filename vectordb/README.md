@@ -22,6 +22,8 @@ cargo run -p vectordb --bin vectordb-cli -- bench \
   --saq-total-bits 256 --saq-ivf-clusters 128
 ```
 
+Use `--spfresh-offheap` to run LayerDB-backed SPFresh variants in off-heap mode.
+
 For higher recall operating points in SPFresh, raise `--nprobe` (for example `--nprobe 32`).
 
 Export a reproducible benchmark dataset:
@@ -49,6 +51,14 @@ cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
   --initial-postings 64 --nprobe 8 --split-limit 256 --merge-limit 64 --reassign-range 16
 ```
 
+Run sharded SPFresh in off-heap mode (vectors on LayerDB, metadata in RAM):
+```bash
+cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
+  --dataset /tmp/vectordb_dataset.json --k 10 --shards 4 \
+  --initial-postings 64 --nprobe 8 --split-limit 256 --merge-limit 64 --reassign-range 16 \
+  --offheap
+```
+
 Check SPFresh LayerDB index health:
 ```bash
 cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
@@ -60,6 +70,10 @@ cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
 - `SpFreshLayerDbConfig::default()` is durability-first:
   - `db_options.fsync_writes=true`
   - `write_sync=true`
+- Memory modes:
+  - `SpFreshMemoryMode::Resident` (default): keeps full SPFresh vectors in RAM.
+  - `SpFreshMemoryMode::OffHeap`: keeps SPFresh posting metadata in RAM and loads vector
+    payloads from LayerDB on demand (with cache via `offheap_cache_capacity`).
 - prefer fallible APIs in services:
   - `try_upsert`, `try_delete`, `try_bulk_load`
   - `open_existing` to recover config from persisted metadata

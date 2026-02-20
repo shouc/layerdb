@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::Context;
 use bytes::Bytes;
 use layerdb::{Db, Range, ReadOptions, WriteOptions};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::types::VectorRecord;
@@ -329,8 +330,7 @@ pub(crate) fn load_posting_assignment(
     };
     let posting_u64: u64 = bincode::deserialize(raw.as_ref())
         .with_context(|| format!("decode posting assignment id={id} generation={generation}"))?;
-    let posting =
-        usize::try_from(posting_u64).context("posting assignment does not fit usize")?;
+    let posting = usize::try_from(posting_u64).context("posting assignment does not fit usize")?;
     Ok(Some(posting))
 }
 
@@ -349,15 +349,31 @@ pub(crate) fn posting_member_key(generation: u64, posting_id: usize, id: u64) ->
     format!("{}{id:020}", posting_members_prefix(generation, posting_id))
 }
 
-pub(crate) fn posting_member_value(id: u64) -> anyhow::Result<Vec<u8>> {
-    bincode::serialize(&id).context("encode posting member id")
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PostingMemberValue {
+    id: u64,
+    values: Vec<f32>,
 }
 
-pub(crate) fn load_posting_member_ids(
+#[derive(Clone, Debug)]
+pub(crate) struct PostingMember {
+    pub id: u64,
+    pub values: Option<Vec<f32>>,
+}
+
+pub(crate) fn posting_member_value(id: u64, values: &[f32]) -> anyhow::Result<Vec<u8>> {
+    let payload = PostingMemberValue {
+        id,
+        values: values.to_vec(),
+    };
+    bincode::serialize(&payload).context("encode posting member value")
+}
+
+pub(crate) fn load_posting_members(
     db: &Db,
     generation: u64,
     posting_id: usize,
-) -> anyhow::Result<Vec<u64>> {
+) -> anyhow::Result<Vec<PostingMember>> {
     let mut out = Vec::new();
     let prefix = posting_members_prefix(generation, posting_id);
     let prefix_bytes = prefix.as_bytes().to_vec();
@@ -378,9 +394,22 @@ pub(crate) fn load_posting_member_ids(
         let Some(value) = value else {
             continue;
         };
-        let id: u64 = bincode::deserialize(value.as_ref())
-            .with_context(|| format!("decode posting member key={}", String::from_utf8_lossy(&key)))?;
-        out.push(id);
+        let decoded = bincode::deserialize::<PostingMemberValue>(value.as_ref())
+            .map(|payload| PostingMember {
+                id: payload.id,
+                values: Some(payload.values),
+            })
+            .or_else(|_| {
+                bincode::deserialize::<u64>(value.as_ref())
+                    .map(|id| PostingMember { id, values: None })
+            })
+            .with_context(|| {
+                format!(
+                    "decode posting member key={}",
+                    String::from_utf8_lossy(&key)
+                )
+            })?;
+        out.push(decoded);
     }
     Ok(out)
 }

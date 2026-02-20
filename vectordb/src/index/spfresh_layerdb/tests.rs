@@ -1,5 +1,5 @@
-use std::fs;
 use std::collections::HashMap;
+use std::fs;
 
 use layerdb::{Db, DbOptions, Op, WriteOptions};
 use rand::rngs::StdRng;
@@ -298,11 +298,15 @@ fn posting_metadata_helpers_round_trip() -> anyhow::Result<()> {
             ),
             Op::put(
                 super::storage::posting_member_key(generation, 7, 11),
-                super::storage::posting_member_value(11)?,
+                super::storage::posting_member_value(11, &vec![0.11; cfg.spfresh.dim])?,
             ),
             Op::put(
                 super::storage::posting_member_key(generation, 7, 12),
-                super::storage::posting_member_value(12)?,
+                super::storage::posting_member_value(12, &vec![0.12; cfg.spfresh.dim])?,
+            ),
+            Op::put(
+                super::storage::posting_member_key(generation, 7, 13),
+                bincode::serialize(&13u64)?,
             ),
         ],
         WriteOptions { sync: true },
@@ -317,9 +321,23 @@ fn posting_metadata_helpers_round_trip() -> anyhow::Result<()> {
         None
     );
 
-    let mut members = super::storage::load_posting_member_ids(&db, generation, 7)?;
-    members.sort_unstable();
-    assert_eq!(members, vec![11, 12]);
+    let mut posting_members = super::storage::load_posting_members(&db, generation, 7)?;
+    posting_members.sort_by_key(|entry| entry.id);
+    assert_eq!(posting_members.len(), 3);
+    let members: Vec<u64> = posting_members.iter().map(|entry| entry.id).collect();
+    assert_eq!(members, vec![11, 12, 13]);
+    assert_eq!(posting_members[0].id, 11);
+    assert_eq!(
+        posting_members[0].values.as_ref().map(Vec::len),
+        Some(cfg.spfresh.dim)
+    );
+    assert_eq!(posting_members[1].id, 12);
+    assert_eq!(
+        posting_members[1].values.as_ref().map(Vec::len),
+        Some(cfg.spfresh.dim)
+    );
+    assert_eq!(posting_members[2].id, 13);
+    assert!(posting_members[2].values.is_none());
 
     let map_prefix = super::storage::posting_map_prefix(generation).into_bytes();
     let map_end = super::storage::prefix_exclusive_end(&map_prefix)?;
@@ -448,7 +466,10 @@ fn offheap_diskmeta_persists_and_recovers_vectors() -> anyhow::Result<()> {
     assert_eq!(got[0].id, 2);
 
     let idx_existing = SpFreshLayerDbIndex::open_existing(dir.path(), cfg.db_options.clone())?;
-    assert_eq!(idx_existing.memory_mode(), SpFreshMemoryMode::OffHeapDiskMeta);
+    assert_eq!(
+        idx_existing.memory_mode(),
+        SpFreshMemoryMode::OffHeapDiskMeta
+    );
     let got_existing = idx_existing.search(&vec![1.0; cfg.spfresh.dim], 1);
     assert_eq!(got_existing[0].id, 2);
     Ok(())
@@ -482,7 +503,11 @@ fn offheap_diskmeta_bulk_load_populates_metadata() -> anyhow::Result<()> {
     let generation = super::storage::ensure_active_generation(&db)?;
     for row in rows {
         let posting = super::storage::load_posting_assignment(&db, generation, row.id)?;
-        assert!(posting.is_some(), "missing posting assignment for id={}", row.id);
+        assert!(
+            posting.is_some(),
+            "missing posting assignment for id={}",
+            row.id
+        );
     }
     Ok(())
 }
@@ -503,7 +528,10 @@ fn s3_sync_and_thaw_round_trip() -> anyhow::Result<()> {
     assert_eq!(got_frozen[0].id, 9);
 
     let thawed = idx.thaw_from_s3(None)?;
-    assert!(thawed >= 1, "expected at least one file thawed from s3 tier");
+    assert!(
+        thawed >= 1,
+        "expected at least one file thawed from s3 tier"
+    );
 
     let got_thawed = idx.search(&vec![0.9; cfg.spfresh.dim], 1);
     assert_eq!(got_thawed[0].id, 9);
@@ -519,7 +547,11 @@ fn s3_gc_removes_local_emulation_orphans() -> anyhow::Result<()> {
     let moved = idx.sync_to_s3(None)?;
     assert!(moved >= 1);
 
-    let orphan_root = dir.path().join("sst_s3").join("L1").join("L1-deadbeef00000001");
+    let orphan_root = dir
+        .path()
+        .join("sst_s3")
+        .join("L1")
+        .join("L1-deadbeef00000001");
     fs::create_dir_all(&orphan_root)?;
     let orphan_meta = orphan_root.join("meta.bin");
     let orphan_sb = orphan_root.join("sb_00000000.bin");

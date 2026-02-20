@@ -26,13 +26,13 @@ use super::{SpFreshConfig, SpFreshIndex};
 use rebuilder::{rebuild_once, spawn_rebuilder, RebuilderRuntime};
 use stats::SpFreshLayerDbStatsInner;
 use storage::{
-    ensure_active_generation, ensure_metadata, ensure_wal_exists, ensure_wal_next_seq, load_metadata,
-    load_index_checkpoint_bytes, load_posting_assignment, load_posting_assignments,
-    load_posting_member_ids, load_row, load_rows, load_wal_touched_ids_since,
-    posting_assignment_value, posting_map_key, posting_map_prefix, posting_member_key,
-    posting_member_value, posting_members_generation_prefix,
-    persist_index_checkpoint_bytes, prefix_exclusive_end, prune_wal_before, refresh_read_snapshot,
-    set_active_generation, validate_config, wal_key, vector_key, vector_prefix,
+    ensure_active_generation, ensure_metadata, ensure_wal_exists, ensure_wal_next_seq,
+    load_index_checkpoint_bytes, load_metadata, load_posting_assignment, load_posting_assignments,
+    load_posting_members, load_row, load_rows, load_wal_touched_ids_since,
+    persist_index_checkpoint_bytes, posting_assignment_value, posting_map_key, posting_map_prefix,
+    posting_member_key, posting_member_value, posting_members_generation_prefix,
+    prefix_exclusive_end, prune_wal_before, refresh_read_snapshot, set_active_generation,
+    validate_config, vector_key, vector_prefix, wal_key,
 };
 use sync_utils::{lock_mutex, lock_read, lock_write};
 
@@ -228,14 +228,21 @@ impl SpFreshLayerDbIndex {
             if matches!(index_state, RuntimeSpFreshIndex::OffHeapDiskMeta(_)) {
                 let rows = load_rows(&db, generation)?;
                 let assignments = load_posting_assignments(&db, generation)?;
-                let (rebuilt, _assigned_now) = SpFreshDiskMetaIndex::build_from_rows_with_assignments(
-                    cfg.spfresh.clone(),
-                    &rows,
-                    Some(&assignments),
-                );
+                let (rebuilt, _assigned_now) =
+                    SpFreshDiskMetaIndex::build_from_rows_with_assignments(
+                        cfg.spfresh.clone(),
+                        &rows,
+                        Some(&assignments),
+                    );
                 index_state = RuntimeSpFreshIndex::OffHeapDiskMeta(rebuilt);
             } else {
-                Self::replay_wal_tail(&db, &vector_cache, generation, &mut index_state, replay_from)?;
+                Self::replay_wal_tail(
+                    &db,
+                    &vector_cache,
+                    generation,
+                    &mut index_state,
+                    replay_from,
+                )?;
             }
         }
         let index = Arc::new(RwLock::new(index_state));
@@ -293,14 +300,17 @@ impl SpFreshLayerDbIndex {
         if let Some(raw) = load_index_checkpoint_bytes(db)? {
             match bincode::deserialize::<PersistedIndexCheckpoint>(raw.as_ref()) {
                 Ok(checkpoint)
-                    if checkpoint.schema_version == config::META_INDEX_CHECKPOINT_SCHEMA_VERSION
+                    if checkpoint.schema_version
+                        == config::META_INDEX_CHECKPOINT_SCHEMA_VERSION
                         && checkpoint.generation == generation =>
                 {
                     return Ok((checkpoint.index, checkpoint.applied_wal_seq));
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    eprintln!("spfresh-layerdb checkpoint decode failed, rebuilding index: {err:#}");
+                    eprintln!(
+                        "spfresh-layerdb checkpoint decode failed, rebuilding index: {err:#}"
+                    );
                 }
             }
         }
@@ -348,14 +358,16 @@ impl SpFreshLayerDbIndex {
                 Some(row) => match index {
                     RuntimeSpFreshIndex::Resident(index) => index.upsert(row.id, row.values),
                     RuntimeSpFreshIndex::OffHeap(index) => {
-                        let mut loader =
-                            Self::loader_for(db, vector_cache, generation, Some((row.id, row.values.clone())));
+                        let mut loader = Self::loader_for(
+                            db,
+                            vector_cache,
+                            generation,
+                            Some((row.id, row.values.clone())),
+                        );
                         index.upsert_with(row.id, row.values, &mut loader)?;
                     }
                     RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
-                        let posting = index
-                            .choose_posting(&row.values)
-                            .unwrap_or_default();
+                        let posting = index.choose_posting(&row.values).unwrap_or_default();
                         index.apply_upsert(None, posting, row.values);
                     }
                 },
@@ -450,7 +462,18 @@ impl SpFreshLayerDbIndex {
         if let Some(ids) = lock_mutex(&self.posting_members_cache).get(generation, posting_id) {
             return Ok(ids);
         }
-        let ids = Arc::new(load_posting_member_ids(&self.db, generation, posting_id)?);
+        let members = load_posting_members(&self.db, generation, posting_id)?;
+        let mut ids = Vec::with_capacity(members.len());
+        {
+            let mut vector_cache = lock_mutex(&self.vector_cache);
+            for member in members {
+                ids.push(member.id);
+                if let Some(values) = member.values {
+                    vector_cache.put(member.id, values);
+                }
+            }
+        }
+        let ids = Arc::new(ids);
         lock_mutex(&self.posting_members_cache).put_arc(generation, posting_id, ids.clone());
         Ok(ids)
     }
@@ -497,7 +520,7 @@ impl SpFreshLayerDbIndex {
                     ));
                     ops.push(layerdb::Op::put(
                         posting_member_key(new_generation, posting, row.id),
-                        posting_member_value(row.id)?,
+                        posting_member_value(row.id, &row.values)?,
                     ));
                 }
             }
@@ -511,7 +534,8 @@ impl SpFreshLayerDbIndex {
                 .context("persist spfresh bulk rows")?;
         }
         set_active_generation(&self.db, new_generation, self.cfg.write_sync)?;
-        self.active_generation.store(new_generation, Ordering::Relaxed);
+        self.active_generation
+            .store(new_generation, Ordering::Relaxed);
 
         // best-effort cleanup of the old generation after pointer switch.
         for prefix in [
@@ -521,13 +545,10 @@ impl SpFreshLayerDbIndex {
         ] {
             let prefix_bytes = prefix.as_bytes().to_vec();
             let end = prefix_exclusive_end(&prefix_bytes)?;
-            if let Err(err) = self.db.delete_range(
-                prefix_bytes,
-                end,
-                WriteOptions {
-                    sync: false,
-                },
-            ) {
+            if let Err(err) = self
+                .db
+                .delete_range(prefix_bytes, end, WriteOptions { sync: false })
+            {
                 eprintln!("spfresh-layerdb bulk-load cleanup failed for prefix={prefix}: {err:#}");
             }
         }
@@ -572,7 +593,10 @@ impl SpFreshLayerDbIndex {
         let wal_id = bincode::serialize(&id).context("encode spfresh wal id")?;
         let wal_next = bincode::serialize(&next_seq).context("encode spfresh wal next seq")?;
         ops.push(layerdb::Op::put(wal_key(seq), wal_id));
-        ops.push(layerdb::Op::put(config::META_INDEX_WAL_NEXT_SEQ_KEY, wal_next));
+        ops.push(layerdb::Op::put(
+            config::META_INDEX_WAL_NEXT_SEQ_KEY,
+            wal_next,
+        ));
         self.db
             .write_batch(
                 ops,
@@ -613,10 +637,13 @@ impl SpFreshLayerDbIndex {
         let value = bincode::serialize(&row).context("serialize vector row")?;
         let mut ops = vec![
             layerdb::Op::put(vector_key(generation, id), value),
-            layerdb::Op::put(posting_map_key(generation, id), posting_assignment_value(new_posting)?),
+            layerdb::Op::put(
+                posting_map_key(generation, id),
+                posting_assignment_value(new_posting)?,
+            ),
             layerdb::Op::put(
                 posting_member_key(generation, new_posting, id),
-                posting_member_value(id)?,
+                posting_member_value(id, vector)?,
             ),
         ];
         if let Some(old_posting) = old_posting {
@@ -642,7 +669,11 @@ impl SpFreshLayerDbIndex {
             layerdb::Op::delete(posting_map_key(generation, id)),
         ];
         if let Some(old_posting) = old_posting {
-            ops.push(layerdb::Op::delete(posting_member_key(generation, old_posting, id)));
+            ops.push(layerdb::Op::delete(posting_member_key(
+                generation,
+                old_posting,
+                id,
+            )));
         }
         self.persist_with_wal_ops(id, ops)
     }
@@ -702,8 +733,12 @@ impl SpFreshLayerDbIndex {
             match &mut *index {
                 RuntimeSpFreshIndex::Resident(index) => index.upsert(id, vector.clone()),
                 RuntimeSpFreshIndex::OffHeap(index) => {
-                    let mut loader =
-                        Self::loader_for(&self.db, &self.vector_cache, generation, Some((id, vector.clone())));
+                    let mut loader = Self::loader_for(
+                        &self.db,
+                        &self.vector_cache,
+                        generation,
+                        Some((id, vector.clone())),
+                    );
                     index
                         .upsert_with(id, vector, &mut loader)
                         .with_context(|| format!("offheap upsert id={id}"))?;
@@ -774,7 +809,8 @@ impl SpFreshLayerDbIndex {
             match &mut *index {
                 RuntimeSpFreshIndex::Resident(index) => index.delete(id),
                 RuntimeSpFreshIndex::OffHeap(index) => {
-                    let mut loader = Self::loader_for(&self.db, &self.vector_cache, generation, None);
+                    let mut loader =
+                        Self::loader_for(&self.db, &self.vector_cache, generation, None);
                     index
                         .delete_with(id, &mut loader)
                         .with_context(|| format!("offheap delete id={id}"))?
@@ -855,7 +891,9 @@ impl SpFreshLayerDbIndex {
 
     /// Garbage collect orphaned S3 objects that are no longer referenced.
     pub fn gc_orphaned_s3(&self) -> anyhow::Result<usize> {
-        self.db.gc_orphaned_s3_files().context("gc orphaned s3 files")
+        self.db
+            .gc_orphaned_s3_files()
+            .context("gc orphaned s3 files")
     }
 
     pub fn frozen_objects(&self) -> Vec<layerdb::version::FrozenObjectMeta> {
@@ -902,15 +940,15 @@ impl VectorIndex for SpFreshLayerDbIndex {
                 for posting_id in postings {
                     let member_ids = self
                         .load_posting_members_for(generation, posting_id)
-                        .unwrap_or_else(|err| panic!("offheap-diskmeta load members failed: {err:#}"));
+                        .unwrap_or_else(|err| {
+                            panic!("offheap-diskmeta load members failed: {err:#}")
+                        });
                     for id in member_ids.iter().copied() {
-                        let values = Self::load_vector_for_id(
-                            &self.db,
-                            &self.vector_cache,
-                            generation,
-                            id,
-                        )
-                        .unwrap_or_else(|err| panic!("offheap-diskmeta load vector failed: {err:#}"));
+                        let values =
+                            Self::load_vector_for_id(&self.db, &self.vector_cache, generation, id)
+                                .unwrap_or_else(|err| {
+                                    panic!("offheap-diskmeta load vector failed: {err:#}")
+                                });
                         let Some(values) = values else {
                             continue;
                         };
@@ -920,14 +958,16 @@ impl VectorIndex for SpFreshLayerDbIndex {
                         });
                     }
                 }
-                out.sort_by(|a, b| {
+                let cmp = |a: &Neighbor, b: &Neighbor| {
                     a.distance
                         .total_cmp(&b.distance)
                         .then_with(|| a.id.cmp(&b.id))
-                });
+                };
                 if out.len() > k {
+                    out.select_nth_unstable_by(k - 1, cmp);
                     out.truncate(k);
                 }
+                out.sort_by(cmp);
                 out
             }
         };

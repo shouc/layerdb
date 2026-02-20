@@ -6,6 +6,7 @@ use crate::linalg::squared_l2;
 use crate::types::VectorRecord;
 
 use super::kmeans::l2_kmeans;
+use super::spfresh_offheap::SpFreshOffHeapIndex;
 use super::SpFreshConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,6 +45,26 @@ impl SpFreshDiskMetaIndex {
         };
         if rows.is_empty() {
             return (out, HashMap::new());
+        }
+
+        if known_assignments.is_none() {
+            let built = SpFreshOffHeapIndex::build(out.cfg.clone(), rows);
+            let snapshot = built.export_metadata();
+            let mut postings = HashMap::with_capacity(snapshot.postings.len());
+            for posting in snapshot.postings {
+                postings.insert(
+                    posting.id,
+                    DiskPosting {
+                        id: posting.id,
+                        centroid: posting.centroid,
+                        size: posting.size,
+                    },
+                );
+            }
+            out.postings = postings;
+            out.next_posting_id = snapshot.next_posting_id;
+            out.total_rows = snapshot.vector_posting.len() as u64;
+            return (out, snapshot.vector_posting);
         }
 
         let vectors: Vec<Vec<f32>> = rows.iter().map(|r| r.values.clone()).collect();
@@ -139,7 +160,9 @@ impl SpFreshDiskMetaIndex {
     }
 
     pub(crate) fn choose_posting(&self, vector: &[f32]) -> Option<usize> {
-        self.nearest_postings(vector, 1).first().map(|(pid, _)| *pid)
+        self.nearest_postings(vector, 1)
+            .first()
+            .map(|(pid, _)| *pid)
     }
 
     pub(crate) fn choose_probe_postings(&self, query: &[f32], k: usize) -> Vec<usize> {
@@ -149,9 +172,8 @@ impl SpFreshDiskMetaIndex {
         let probe_count = self
             .cfg
             .nprobe
-            .max(k)
-            .saturating_mul(8)
             .max(1)
+            .saturating_mul(8)
             .min(self.postings.len().max(1));
         self.nearest_postings(query, probe_count)
             .into_iter()

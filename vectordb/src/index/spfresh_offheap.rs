@@ -17,6 +17,20 @@ struct Posting {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct OffHeapPostingMeta {
+    pub id: usize,
+    pub centroid: Vec<f32>,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct OffHeapMetaSnapshot {
+    pub postings: Vec<OffHeapPostingMeta>,
+    pub vector_posting: HashMap<u64, usize>,
+    pub next_posting_id: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SpFreshOffHeapIndex {
     cfg: SpFreshConfig,
     postings: HashMap<usize, Posting>,
@@ -74,6 +88,23 @@ impl SpFreshOffHeapIndex {
 
     pub(crate) fn len(&self) -> usize {
         self.vector_posting.len()
+    }
+
+    pub(crate) fn export_metadata(&self) -> OffHeapMetaSnapshot {
+        let postings = self
+            .postings
+            .values()
+            .map(|posting| OffHeapPostingMeta {
+                id: posting.id,
+                centroid: posting.centroid.clone(),
+                size: posting.members.len() as u64,
+            })
+            .collect::<Vec<_>>();
+        OffHeapMetaSnapshot {
+            postings,
+            vector_posting: self.vector_posting.clone(),
+            next_posting_id: self.next_posting_id,
+        }
     }
 
     fn alloc_posting(&mut self, centroid: Vec<f32>) -> usize {
@@ -390,7 +421,12 @@ impl SpFreshOffHeapIndex {
         Ok(())
     }
 
-    pub(crate) fn upsert_with<F>(&mut self, id: u64, vector: Vec<f32>, load: &mut F) -> anyhow::Result<()>
+    pub(crate) fn upsert_with<F>(
+        &mut self,
+        id: u64,
+        vector: Vec<f32>,
+        load: &mut F,
+    ) -> anyhow::Result<()>
     where
         F: FnMut(u64) -> anyhow::Result<Option<Vec<f32>>>,
     {
@@ -454,7 +490,8 @@ impl SpFreshOffHeapIndex {
                 continue;
             };
             for id in &posting.members {
-                let Some(values) = load(*id).with_context(|| format!("load vector for search id={id}"))?
+                let Some(values) =
+                    load(*id).with_context(|| format!("load vector for search id={id}"))?
                 else {
                     continue;
                 };
@@ -464,12 +501,16 @@ impl SpFreshOffHeapIndex {
                 });
             }
         }
-        out.sort_by(|a, b| {
+        let cmp = |a: &Neighbor, b: &Neighbor| {
             a.distance
                 .total_cmp(&b.distance)
                 .then_with(|| a.id.cmp(&b.id))
-        });
-        out.truncate(k);
+        };
+        if out.len() > k {
+            out.select_nth_unstable_by(k - 1, cmp);
+            out.truncate(k);
+        }
+        out.sort_by(cmp);
         Ok(out)
     }
 }

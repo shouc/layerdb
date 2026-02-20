@@ -441,12 +441,16 @@ impl VectorIndex for SpFreshIndex {
             }
         }
 
-        out.sort_by(|a, b| {
+        let cmp = |a: &Neighbor, b: &Neighbor| {
             a.distance
                 .total_cmp(&b.distance)
                 .then_with(|| a.id.cmp(&b.id))
-        });
-        out.truncate(k);
+        };
+        if out.len() > k {
+            out.select_nth_unstable_by(k - 1, cmp);
+            out.truncate(k);
+        }
+        out.sort_by(cmp);
         out
     }
 

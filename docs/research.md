@@ -332,6 +332,63 @@ Interpretation:
 - SPFresh remains clearly stronger on search throughput at high recall in this workload.
 - LanceDB remains stronger on large-batch update throughput.
 
+## F) Implemented improvements from this cycle
+
+The following production features were added in code:
+
+1. Posting delta path (non-full-reload behavior):
+- Diskmeta update/delete now apply targeted posting-cache deltas (`id` add/remove/replace)
+  instead of invalidating and forcing full posting reload on next query.
+- Added deterministic, budgeted compaction for posting-cache delta state:
+  `posting_delta_compact_interval_ops`, `posting_delta_compact_budget_entries`.
+
+2. Startup replay parallelism:
+- Sharded startup/open is now parallelized, so shard-local WAL tail replay runs concurrently.
+
+3. SIMD distance kernels:
+- `l2` and `dot` now use runtime-dispatched SIMD (AVX2/FMA, NEON) with scalar fallback.
+
+4. Two-level partitioning (IVF^2-style):
+- Diskmeta index now builds/maintains coarse centroids over postings and probes coarse-first.
+- Coarse topology refresh is deterministic and budgeted by mutation interval.
+
+5. Residual-coded candidate rerank:
+- Posting member payload supports residual code + scale (`rk2`), with compatibility fallback.
+- Diskmeta search uses residual approximate scoring for candidate selection before exact rerank.
+
+6. macOS async backend path:
+- `IoBackend::Kqueue` async methods now execute via bounded blocking-executor path
+  (explicit backend behavior rather than implicit tokio-file path).
+
+7. Lock-free read path (diskmeta metadata):
+- Added `arc-swap` diskmeta snapshot publication; query path reads snapshot lock-free.
+
+8. Deterministic merge/compaction scheduler:
+- Posting-cache delta compaction is deterministic and bounded per interval (see #1).
+
+9. Columnar vector pages:
+- Added Arrow-backed `VectorColumnarPage` and wired diskmeta rerank scanning through it.
+
+10. Continuous benchmark gate:
+- Added `scripts/vectordb_bench_gate.sh` + `scripts/check_vectordb_gate.py`.
+- Added `benchmarks/vectordb_gate.json` thresholds for SPFresh-vs-LanceDB checks.
+
+### Latest gate profile (same dataset/config as `vectordb_gate.json`)
+
+SPFresh-sharded diskmeta (`shards=8`, `update_batch=1024`):
+- recall@k: `1.0000`
+- search_qps: `1348.10`
+- update_qps: `21780.26`
+
+LanceDB IVF-flat (`nlist=96`, `update_batch=1024`):
+- recall@k: `0.4855`
+- search_qps: `926.93`
+- update_qps: `130054.16`
+
+Ratios (SPFresh / LanceDB):
+- search_qps: `1.45x`
+- update_qps: `0.167x`
+
 ## Production Readiness Checks Performed
 
 - `cargo clippy -p vectordb --all-targets -- -D warnings`

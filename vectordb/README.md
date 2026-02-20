@@ -68,6 +68,11 @@ cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
   --diskmeta
 ```
 
+Run the cross-engine benchmark gate (SPFresh vs LanceDB thresholds):
+```bash
+./scripts/vectordb_bench_gate.sh
+```
+
 Check SPFresh LayerDB index health:
 ```bash
 cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
@@ -92,6 +97,11 @@ cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
     for legacy WAL entries).
   - diskmeta replays WAL delta payloads directly from checkpoint, avoiding full-row startup rebuild
     on normal WAL-tail recovery.
+- Diskmeta query path:
+  - hierarchical coarse probing over postings (IVF^2-style),
+  - residual-coded candidate rerank before exact distance,
+  - Arrow columnar page scan for exact candidate scoring,
+  - lock-free metadata snapshot reads in query path (`arc-swap`).
 - prefer fallible APIs in services:
   - `try_upsert`, `try_delete`, `try_bulk_load`
   - `try_upsert_batch`, `try_delete_batch` for strict batched WAL commit path

@@ -256,7 +256,49 @@ pub(crate) fn wal_key(seq: u64) -> String {
     format!("{INDEX_WAL_PREFIX}{seq:020}")
 }
 
-pub(crate) fn load_wal_touched_ids_since(db: &Db, start_seq: u64) -> anyhow::Result<Vec<u64>> {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) enum IndexWalEntry {
+    IdOnly {
+        id: u64,
+    },
+    DiskMetaUpsert {
+        id: u64,
+        old: Option<(usize, Vec<f32>)>,
+        new_posting: usize,
+        new_vector: Vec<f32>,
+    },
+    DiskMetaDelete {
+        id: u64,
+        old: Option<(usize, Vec<f32>)>,
+    },
+}
+
+impl IndexWalEntry {
+    pub(crate) fn id(&self) -> u64 {
+        match self {
+            Self::IdOnly { id } => *id,
+            Self::DiskMetaUpsert { id, .. } => *id,
+            Self::DiskMetaDelete { id, .. } => *id,
+        }
+    }
+}
+
+pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>> {
+    bincode::serialize(entry).context("encode wal entry")
+}
+
+pub(crate) fn decode_wal_entry(raw: &[u8]) -> anyhow::Result<IndexWalEntry> {
+    if let Ok(entry) = bincode::deserialize::<IndexWalEntry>(raw) {
+        return Ok(entry);
+    }
+    let id = bincode::deserialize::<u64>(raw).context("decode legacy wal id")?;
+    Ok(IndexWalEntry::IdOnly { id })
+}
+
+pub(crate) fn load_wal_entries_since(
+    db: &Db,
+    start_seq: u64,
+) -> anyhow::Result<Vec<IndexWalEntry>> {
     let mut out = Vec::new();
     let prefix_bytes = INDEX_WAL_PREFIX.as_bytes().to_vec();
     let start = wal_key(start_seq).into_bytes();
@@ -277,11 +319,18 @@ pub(crate) fn load_wal_touched_ids_since(db: &Db, start_seq: u64) -> anyhow::Res
         let Some(value) = value else {
             continue;
         };
-        let id: u64 = bincode::deserialize(value.as_ref())
-            .with_context(|| format!("decode wal id key={}", String::from_utf8_lossy(&key)))?;
-        out.push(id);
+        let entry = decode_wal_entry(value.as_ref())
+            .with_context(|| format!("decode wal entry key={}", String::from_utf8_lossy(&key)))?;
+        out.push(entry);
     }
     Ok(out)
+}
+
+pub(crate) fn load_wal_touched_ids_since(db: &Db, start_seq: u64) -> anyhow::Result<Vec<u64>> {
+    Ok(load_wal_entries_since(db, start_seq)?
+        .into_iter()
+        .map(|entry| entry.id())
+        .collect())
 }
 
 pub(crate) fn prune_wal_before(db: &Db, seq_exclusive: u64, sync: bool) -> anyhow::Result<()> {

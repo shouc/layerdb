@@ -276,6 +276,45 @@ fn startup_replays_wal_tail_after_checkpoint() -> anyhow::Result<()> {
 }
 
 #[test]
+fn offheap_diskmeta_replays_wal_tail_without_row_rebuild() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig {
+        memory_mode: SpFreshMemoryMode::OffHeapDiskMeta,
+        spfresh: crate::index::SpFreshConfig {
+            dim: 16,
+            initial_postings: 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(1, vec![0.1; cfg.spfresh.dim])?;
+        idx.close()?;
+    }
+
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(2, vec![0.2; cfg.spfresh.dim])?;
+    }
+
+    let db = Db::open(dir.path(), cfg.db_options.clone())?;
+    let generation = super::storage::ensure_active_generation(&db)?;
+    let prefix = super::storage::vector_prefix(generation);
+    let prefix_bytes = prefix.into_bytes();
+    let end = super::storage::prefix_exclusive_end(&prefix_bytes)?;
+    db.delete_range(prefix_bytes, end, WriteOptions { sync: true })?;
+
+    let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
+    assert_eq!(idx.memory_mode(), SpFreshMemoryMode::OffHeapDiskMeta);
+    assert_eq!(idx.len(), 2);
+    let got = idx.search(&vec![0.2; 16], 2);
+    assert!(got.iter().any(|n| n.id == 1));
+    assert!(got.iter().any(|n| n.id == 2));
+    Ok(())
+}
+
+#[test]
 fn posting_metadata_helpers_round_trip() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let cfg = SpFreshLayerDbConfig::default();

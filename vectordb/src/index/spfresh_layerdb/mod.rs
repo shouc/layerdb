@@ -27,13 +27,14 @@ use super::{SpFreshConfig, SpFreshIndex};
 use rebuilder::{rebuild_once, spawn_rebuilder, RebuilderRuntime};
 use stats::SpFreshLayerDbStatsInner;
 use storage::{
-    ensure_active_generation, ensure_metadata, ensure_wal_exists, ensure_wal_next_seq,
-    load_index_checkpoint_bytes, load_metadata, load_posting_assignment, load_posting_assignments,
-    load_posting_members, load_row, load_rows, load_wal_touched_ids_since,
-    persist_index_checkpoint_bytes, posting_assignment_value, posting_map_key, posting_map_prefix,
-    posting_member_key, posting_member_value, posting_members_generation_prefix,
-    prefix_exclusive_end, prune_wal_before, refresh_read_snapshot, set_active_generation,
-    validate_config, vector_key, vector_prefix, wal_key,
+    encode_wal_entry, ensure_active_generation, ensure_metadata, ensure_wal_exists,
+    ensure_wal_next_seq, load_index_checkpoint_bytes, load_metadata, load_posting_assignment,
+    load_posting_assignments, load_posting_members, load_row, load_rows, load_wal_entries_since,
+    load_wal_touched_ids_since, persist_index_checkpoint_bytes, posting_assignment_value,
+    posting_map_key, posting_map_prefix, posting_member_key, posting_member_value,
+    posting_members_generation_prefix, prefix_exclusive_end, prune_wal_before,
+    refresh_read_snapshot, set_active_generation, validate_config, vector_key, vector_prefix,
+    wal_key, IndexWalEntry,
 };
 use sync_utils::{lock_mutex, lock_read, lock_write};
 
@@ -227,15 +228,21 @@ impl SpFreshLayerDbIndex {
         let replay_from = applied_wal_seq.map_or(0, |seq| seq.saturating_add(1));
         if replay_from < wal_next_seq {
             if matches!(index_state, RuntimeSpFreshIndex::OffHeapDiskMeta(_)) {
-                let rows = load_rows(&db, generation)?;
-                let assignments = load_posting_assignments(&db, generation)?;
-                let (rebuilt, _assigned_now) =
-                    SpFreshDiskMetaIndex::build_from_rows_with_assignments(
-                        cfg.spfresh.clone(),
-                        &rows,
-                        Some(&assignments),
+                if let Err(err) = Self::replay_wal_tail_diskmeta(&db, &mut index_state, replay_from)
+                {
+                    eprintln!(
+                        "spfresh-layerdb diskmeta wal replay failed, rebuilding from rows: {err:#}"
                     );
-                index_state = RuntimeSpFreshIndex::OffHeapDiskMeta(rebuilt);
+                    let rows = load_rows(&db, generation)?;
+                    let assignments = load_posting_assignments(&db, generation)?;
+                    let (rebuilt, _assigned_now) =
+                        SpFreshDiskMetaIndex::build_from_rows_with_assignments(
+                            cfg.spfresh.clone(),
+                            &rows,
+                            Some(&assignments),
+                        );
+                    index_state = RuntimeSpFreshIndex::OffHeapDiskMeta(rebuilt);
+                }
             } else {
                 Self::replay_wal_tail(
                     &db,
@@ -384,6 +391,34 @@ impl SpFreshLayerDbIndex {
                         let _ = index.apply_delete(None);
                     }
                 },
+            }
+        }
+        Ok(())
+    }
+
+    fn replay_wal_tail_diskmeta(
+        db: &Db,
+        index: &mut RuntimeSpFreshIndex,
+        from_seq: u64,
+    ) -> anyhow::Result<()> {
+        let RuntimeSpFreshIndex::OffHeapDiskMeta(index) = index else {
+            anyhow::bail!("diskmeta wal replay called for non-diskmeta index");
+        };
+        let entries = load_wal_entries_since(db, from_seq)?;
+        for entry in entries {
+            match entry {
+                IndexWalEntry::IdOnly { .. } => {
+                    anyhow::bail!("legacy id-only wal entry cannot be replayed for diskmeta")
+                }
+                IndexWalEntry::DiskMetaUpsert {
+                    old,
+                    new_posting,
+                    new_vector,
+                    ..
+                } => index.apply_upsert(old, new_posting, new_vector),
+                IndexWalEntry::DiskMetaDelete { old, .. } => {
+                    let _ = index.apply_delete(old);
+                }
             }
         }
         Ok(())
@@ -662,14 +697,18 @@ impl SpFreshLayerDbIndex {
         rebuild_once(&runtime)
     }
 
-    fn persist_with_wal_ops(&self, id: u64, mut ops: Vec<layerdb::Op>) -> anyhow::Result<()> {
+    fn persist_with_wal_ops(
+        &self,
+        wal_entry: IndexWalEntry,
+        mut ops: Vec<layerdb::Op>,
+    ) -> anyhow::Result<()> {
         let seq = self.wal_next_seq.load(Ordering::Relaxed);
         let next_seq = seq
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("spfresh wal sequence overflow"))?;
-        let wal_id = bincode::serialize(&id).context("encode spfresh wal id")?;
+        let wal_value = encode_wal_entry(&wal_entry)?;
         let wal_next = bincode::serialize(&next_seq).context("encode spfresh wal next seq")?;
-        ops.push(layerdb::Op::put(wal_key(seq), wal_id));
+        ops.push(layerdb::Op::put(wal_key(seq), wal_value));
         ops.push(layerdb::Op::put(
             config::META_INDEX_WAL_NEXT_SEQ_KEY,
             wal_next,
@@ -681,13 +720,13 @@ impl SpFreshLayerDbIndex {
                     sync: self.cfg.write_sync,
                 },
             )
-            .with_context(|| format!("persist vector+wal id={id} seq={seq}"))?;
+            .with_context(|| format!("persist vector+wal id={} seq={seq}", wal_entry.id()))?;
         self.wal_next_seq.store(next_seq, Ordering::Relaxed);
         Ok(())
     }
 
     fn persist_with_wal(&self, id: u64, vector_op: layerdb::Op) -> anyhow::Result<()> {
-        self.persist_with_wal_ops(id, vec![vector_op])
+        self.persist_with_wal_ops(IndexWalEntry::IdOnly { id }, vec![vector_op])
     }
 
     fn persist_upsert(&self, id: u64, vector: &[f32]) -> anyhow::Result<()> {
@@ -707,7 +746,7 @@ impl SpFreshLayerDbIndex {
         generation: u64,
         id: u64,
         vector: &[f32],
-        old_posting: Option<usize>,
+        old: Option<(usize, Vec<f32>)>,
         new_posting: usize,
     ) -> anyhow::Result<()> {
         let row = VectorRecord::new(id, vector.to_vec());
@@ -723,36 +762,44 @@ impl SpFreshLayerDbIndex {
                 posting_member_value(id, vector)?,
             ),
         ];
-        if let Some(old_posting) = old_posting {
-            if old_posting != new_posting {
+        if let Some((old_posting, _)) = &old {
+            if *old_posting != new_posting {
                 ops.push(layerdb::Op::delete(posting_member_key(
                     generation,
-                    old_posting,
+                    *old_posting,
                     id,
                 )));
             }
         }
-        self.persist_with_wal_ops(id, ops)
+        self.persist_with_wal_ops(
+            IndexWalEntry::DiskMetaUpsert {
+                id,
+                old,
+                new_posting,
+                new_vector: vector.to_vec(),
+            },
+            ops,
+        )
     }
 
     fn persist_diskmeta_delete(
         &self,
         generation: u64,
         id: u64,
-        old_posting: Option<usize>,
+        old: Option<(usize, Vec<f32>)>,
     ) -> anyhow::Result<()> {
         let mut ops = vec![
             layerdb::Op::delete(vector_key(generation, id)),
             layerdb::Op::delete(posting_map_key(generation, id)),
         ];
-        if let Some(old_posting) = old_posting {
+        if let Some((old_posting, _)) = &old {
             ops.push(layerdb::Op::delete(posting_member_key(
                 generation,
-                old_posting,
+                *old_posting,
                 id,
             )));
         }
-        self.persist_with_wal_ops(id, ops)
+        self.persist_with_wal_ops(IndexWalEntry::DiskMetaDelete { id, old }, ops)
     }
 
     pub fn try_upsert(&mut self, id: u64, vector: Vec<f32>) -> anyhow::Result<()> {
@@ -790,7 +837,7 @@ impl SpFreshLayerDbIndex {
                 generation,
                 id,
                 &vector,
-                disk_old.as_ref().map(|(posting, _)| *posting),
+                disk_old.clone(),
                 disk_new_posting.unwrap_or(0),
             )
         } else {
@@ -865,11 +912,7 @@ impl SpFreshLayerDbIndex {
 
         let persist_started = Instant::now();
         let persist = if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
-            self.persist_diskmeta_delete(
-                generation,
-                id,
-                disk_old.as_ref().map(|(posting, _)| *posting),
-            )
+            self.persist_diskmeta_delete(generation, id, disk_old.clone())
         } else {
             self.persist_delete(id)
         };

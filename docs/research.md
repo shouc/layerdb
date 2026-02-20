@@ -216,6 +216,32 @@ Validation added:
 - `offheap_diskmeta_batch_upsert_delete_round_trip`
 - `sharded_batch_upsert_delete_round_trip`
 
+## E) macOS equivalent to io_uring: research + implementation
+
+Primary-source findings:
+
+- Apple File System Programming Guide describes asynchronous custom-file I/O via
+  Grand Central Dispatch APIs (`dispatch_io_*`, `dispatch_read`, `dispatch_write`):
+  https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/FileSystemProgrammingGuide/TechniquesforReadingandWritingCustomFiles/TechniquesforReadingandWritingCustomFiles.html
+- `kqueue` man page documents that `EVFILT_AIO` is currently unsupported:
+  https://www.manpagez.com/man/2/kqueue/
+- Apple DTS discussion confirms there is no direct `io_uring`-style non-blocking file API on macOS;
+  practical async file I/O is dispatch/thread-pool based:
+  https://forums.swift.org/t/task-safe-way-to-write-a-file-asynchronously/54639
+
+Implementation in LayerDB:
+
+- Added `IoBackend::Kqueue` in `src/io/mod.rs`.
+- Platform-aware backend default:
+  - macOS: `IoBackend::Kqueue`
+  - non-macOS: `IoBackend::Uring` preference (existing fallback behavior retained).
+- Added capability API `UringExecutor::supports_kqueue()`.
+- Updated backend docs/defaults in `src/db/options.rs`.
+
+Design note:
+- In this codebase, `Kqueue` is represented as the macOS async-runtime backend choice,
+  while Linux keeps native `io_uring` acceleration where available.
+
 ## Benchmarks vs LanceDB
 
 All runs used the same exported datasets and `k=10`.
@@ -293,6 +319,9 @@ SPFresh-sharded offheap:
 SPFresh-sharded diskmeta:
 - `update_batch=1`: update_qps `5929.34`
 - `update_batch=1024`: update_qps `8913.02` (+50.3%)
+
+After shard-parallel batch fanout:
+- SPFresh-sharded diskmeta, `update_batch=1024`: update_qps `26503.20`
 
 LanceDB IVF-flat:
 - `update_batch=1`: update_qps `13.17`, search_qps `15.12`, recall@k `0.5475`

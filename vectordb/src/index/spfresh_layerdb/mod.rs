@@ -148,14 +148,20 @@ struct PostingMembersCache {
     capacity: usize,
     map: HashMap<(u64, usize), Arc<Vec<PostingMemberSketch>>>,
     order: VecDeque<(u64, usize)>,
+    mutation_ops: usize,
+    compact_interval_ops: usize,
+    compact_budget_entries: usize,
 }
 
 impl PostingMembersCache {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, compact_interval_ops: usize, compact_budget_entries: usize) -> Self {
         Self {
             capacity: capacity.max(1),
             map: HashMap::new(),
             order: VecDeque::new(),
+            mutation_ops: 0,
+            compact_interval_ops: compact_interval_ops.max(1),
+            compact_budget_entries: compact_budget_entries.max(1),
         }
     }
 
@@ -206,6 +212,7 @@ impl PostingMembersCache {
             next.push(member);
         }
         self.map.insert(key, Arc::new(next));
+        self.maybe_compact();
     }
 
     fn apply_delete_delta(&mut self, generation: u64, posting_id: usize, id: u64) {
@@ -220,6 +227,33 @@ impl PostingMembersCache {
             .collect();
         next.shrink_to_fit();
         self.map.insert(key, Arc::new(next));
+        self.maybe_compact();
+    }
+
+    fn maybe_compact(&mut self) {
+        self.mutation_ops = self.mutation_ops.saturating_add(1);
+        if !self.mutation_ops.is_multiple_of(self.compact_interval_ops) {
+            return;
+        }
+
+        let mut compacted = 0usize;
+        let mut cursor = 0usize;
+        while compacted < self.compact_budget_entries && cursor < self.order.len() {
+            let key = self.order[cursor];
+            cursor += 1;
+            let Some(current) = self.map.get(&key).cloned() else {
+                continue;
+            };
+            if current.len() < 2 {
+                continue;
+            }
+            let mut next = current.as_ref().clone();
+            next.sort_by_key(|m| m.id);
+            next.dedup_by_key(|m| m.id);
+            next.shrink_to_fit();
+            self.map.insert(key, Arc::new(next));
+            compacted += 1;
+        }
     }
 
     fn clear(&mut self) {
@@ -301,6 +335,8 @@ impl SpFreshLayerDbIndex {
         let vector_cache = Arc::new(Mutex::new(VectorCache::new(cfg.offheap_cache_capacity)));
         let posting_members_cache = Arc::new(Mutex::new(PostingMembersCache::new(
             cfg.offheap_posting_cache_entries,
+            cfg.posting_delta_compact_interval_ops,
+            cfg.posting_delta_compact_budget_entries,
         )));
         let replay_from = applied_wal_seq.map_or(0, |seq| seq.saturating_add(1));
         if replay_from < wal_next_seq {

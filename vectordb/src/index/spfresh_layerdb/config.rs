@@ -45,6 +45,8 @@ pub struct SpFreshLayerDbConfig {
     pub memory_mode: SpFreshMemoryMode,
     pub offheap_cache_capacity: usize,
     pub offheap_posting_cache_entries: usize,
+    pub posting_delta_compact_interval_ops: usize,
+    pub posting_delta_compact_budget_entries: usize,
 }
 
 impl Default for SpFreshLayerDbConfig {
@@ -61,6 +63,8 @@ impl Default for SpFreshLayerDbConfig {
             memory_mode: SpFreshMemoryMode::Resident,
             offheap_cache_capacity: 131_072,
             offheap_posting_cache_entries: 2_048,
+            posting_delta_compact_interval_ops: 4_096,
+            posting_delta_compact_budget_entries: 4,
         }
     }
 }

@@ -9,6 +9,22 @@ use super::kmeans::l2_kmeans;
 use super::spfresh_offheap::SpFreshOffHeapIndex;
 use super::SpFreshConfig;
 
+fn default_coarse_refresh_interval() -> u64 {
+    2_048
+}
+
+fn default_zero_u64() -> u64 {
+    0
+}
+
+fn default_empty_posting_to_coarse() -> HashMap<usize, usize> {
+    HashMap::new()
+}
+
+fn default_empty_coarse_to_postings() -> HashMap<usize, Vec<usize>> {
+    HashMap::new()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct DiskPosting {
     pub id: usize,
@@ -22,6 +38,16 @@ pub(crate) struct SpFreshDiskMetaIndex {
     postings: HashMap<usize, DiskPosting>,
     next_posting_id: usize,
     total_rows: u64,
+    #[serde(default)]
+    coarse_centroids: Vec<Vec<f32>>,
+    #[serde(default = "default_empty_posting_to_coarse")]
+    posting_to_coarse: HashMap<usize, usize>,
+    #[serde(default = "default_empty_coarse_to_postings")]
+    coarse_to_postings: HashMap<usize, Vec<usize>>,
+    #[serde(default = "default_zero_u64")]
+    mutations_since_coarse_refresh: u64,
+    #[serde(default = "default_coarse_refresh_interval")]
+    coarse_refresh_interval: u64,
 }
 
 impl SpFreshDiskMetaIndex {
@@ -42,6 +68,11 @@ impl SpFreshDiskMetaIndex {
             postings: HashMap::new(),
             next_posting_id: 0,
             total_rows: 0,
+            coarse_centroids: Vec::new(),
+            posting_to_coarse: HashMap::new(),
+            coarse_to_postings: HashMap::new(),
+            mutations_since_coarse_refresh: 0,
+            coarse_refresh_interval: default_coarse_refresh_interval(),
         };
         if rows.is_empty() {
             return (out, HashMap::new());
@@ -64,6 +95,7 @@ impl SpFreshDiskMetaIndex {
             out.postings = postings;
             out.next_posting_id = snapshot.next_posting_id;
             out.total_rows = snapshot.vector_posting.len() as u64;
+            out.rebuild_coarse_index();
             return (out, snapshot.vector_posting);
         }
 
@@ -131,6 +163,7 @@ impl SpFreshDiskMetaIndex {
         }
 
         out.postings.retain(|_, posting| posting.size > 0);
+        out.rebuild_coarse_index();
         (out, assigns)
     }
 
@@ -148,12 +181,115 @@ impl SpFreshDiskMetaIndex {
         id
     }
 
-    fn nearest_postings(&self, query: &[f32], n: usize) -> Vec<(usize, f32)> {
-        let mut all: Vec<(usize, f32)> = self
-            .postings
-            .values()
-            .map(|p| (p.id, squared_l2(query, &p.centroid)))
+    fn rebuild_coarse_index(&mut self) {
+        self.coarse_centroids.clear();
+        self.posting_to_coarse.clear();
+        self.coarse_to_postings.clear();
+
+        if self.postings.is_empty() {
+            self.mutations_since_coarse_refresh = 0;
+            return;
+        }
+
+        let posting_ids: Vec<usize> = self.postings.keys().copied().collect();
+        let posting_vectors: Vec<Vec<f32>> = posting_ids
+            .iter()
+            .filter_map(|pid| self.postings.get(pid).map(|p| p.centroid.clone()))
             .collect();
+        if posting_vectors.is_empty() {
+            self.mutations_since_coarse_refresh = 0;
+            return;
+        }
+
+        let coarse_k = ((posting_vectors.len() as f64).sqrt() as usize)
+            .max(1)
+            .min(posting_vectors.len());
+        let coarse_centroids = l2_kmeans(&posting_vectors, coarse_k, self.cfg.kmeans_iters.max(1));
+        self.coarse_centroids = coarse_centroids;
+
+        for pid in posting_ids {
+            let Some(posting) = self.postings.get(&pid) else {
+                continue;
+            };
+            let mut best_cid = 0usize;
+            let mut best_dist = f32::INFINITY;
+            for (cid, centroid) in self.coarse_centroids.iter().enumerate() {
+                let d = squared_l2(&posting.centroid, centroid);
+                if d < best_dist {
+                    best_dist = d;
+                    best_cid = cid;
+                }
+            }
+            self.posting_to_coarse.insert(pid, best_cid);
+            self.coarse_to_postings.entry(best_cid).or_default().push(pid);
+        }
+        self.mutations_since_coarse_refresh = 0;
+    }
+
+    fn maybe_refresh_coarse_index(&mut self) {
+        self.mutations_since_coarse_refresh = self.mutations_since_coarse_refresh.saturating_add(1);
+        if self.mutations_since_coarse_refresh >= self.coarse_refresh_interval.max(1) {
+            self.rebuild_coarse_index();
+        }
+    }
+
+    fn nearest_coarse_centroids(&self, query: &[f32], n: usize) -> Vec<usize> {
+        if self.coarse_centroids.is_empty() || n == 0 {
+            return Vec::new();
+        }
+        let mut all: Vec<(usize, f32)> = self
+            .coarse_centroids
+            .iter()
+            .enumerate()
+            .map(|(cid, centroid)| (cid, squared_l2(query, centroid)))
+            .collect();
+        all.sort_by(|a, b| a.1.total_cmp(&b.1));
+        all.truncate(n.min(all.len()));
+        all.into_iter().map(|(cid, _)| cid).collect()
+    }
+
+    fn candidate_postings_for_query(&self, query: &[f32]) -> Vec<usize> {
+        if self.postings.len() <= self.cfg.initial_postings.max(1) {
+            return self.postings.keys().copied().collect();
+        }
+        if self.coarse_centroids.is_empty() || self.coarse_to_postings.is_empty() {
+            return self.postings.keys().copied().collect();
+        }
+
+        let coarse_probe = self
+            .cfg
+            .nprobe
+            .max(1)
+            .min(self.coarse_centroids.len().max(1));
+        let coarse_ids = self.nearest_coarse_centroids(query, coarse_probe);
+        let mut out = Vec::new();
+        for cid in coarse_ids {
+            if let Some(postings) = self.coarse_to_postings.get(&cid) {
+                out.extend(postings.iter().copied());
+            }
+        }
+        if out.is_empty() {
+            self.postings.keys().copied().collect()
+        } else {
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+    }
+
+    fn nearest_postings(&self, query: &[f32], n: usize) -> Vec<(usize, f32)> {
+        let candidates = self.candidate_postings_for_query(query);
+        let mut all: Vec<(usize, f32)> = candidates
+            .iter()
+            .filter_map(|pid| self.postings.get(pid).map(|p| (p.id, squared_l2(query, &p.centroid))))
+            .collect();
+        if all.is_empty() {
+            all = self
+                .postings
+                .values()
+                .map(|p| (p.id, squared_l2(query, &p.centroid)))
+                .collect();
+        }
         all.sort_by(|a, b| a.1.total_cmp(&b.1));
         all.truncate(n);
         all
@@ -163,6 +299,10 @@ impl SpFreshDiskMetaIndex {
         self.nearest_postings(vector, 1)
             .first()
             .map(|(pid, _)| *pid)
+    }
+
+    pub(crate) fn posting_centroid(&self, posting_id: usize) -> Option<&[f32]> {
+        self.postings.get(&posting_id).map(|p| p.centroid.as_slice())
     }
 
     pub(crate) fn choose_probe_postings(&self, query: &[f32], k: usize) -> Vec<usize> {
@@ -279,6 +419,7 @@ impl SpFreshDiskMetaIndex {
             }
         }
         self.postings.retain(|_, posting| posting.size > 0);
+        self.maybe_refresh_coarse_index();
     }
 
     pub(crate) fn apply_delete(&mut self, old: Option<(usize, Vec<f32>)>) -> bool {
@@ -288,10 +429,67 @@ impl SpFreshDiskMetaIndex {
         self.remove_from_posting(old_posting, &old_vector);
         self.total_rows = self.total_rows.saturating_sub(1);
         self.postings.retain(|_, posting| posting.size > 0);
+        self.maybe_refresh_coarse_index();
         true
     }
 
     pub(crate) fn len(&self) -> usize {
         self.total_rows as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SpFreshDiskMetaIndex;
+    use crate::index::SpFreshConfig;
+    use crate::types::VectorRecord;
+
+    fn synthetic_rows(dim: usize, count: usize) -> Vec<VectorRecord> {
+        let mut rows = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut v = vec![0.0f32; dim];
+            v[0] = (i as f32 * 0.37).sin();
+            v[1] = (i as f32 * 0.23).cos();
+            v[2] = (i % 17) as f32 / 17.0;
+            rows.push(VectorRecord::new(i as u64, v));
+        }
+        rows
+    }
+
+    #[test]
+    fn coarse_routing_returns_probe_postings() {
+        let cfg = SpFreshConfig {
+            dim: 16,
+            initial_postings: 32,
+            nprobe: 4,
+            ..Default::default()
+        };
+        let rows = synthetic_rows(cfg.dim, 2_000);
+        let (index, _assignments) = SpFreshDiskMetaIndex::build_with_assignments(cfg, &rows);
+        let probes = index.choose_probe_postings(&rows[17].values, 10);
+        assert!(!probes.is_empty());
+        assert!(probes.len() <= index.postings.len());
+    }
+
+    #[test]
+    fn coarse_index_refreshes_under_mutation() {
+        let cfg = SpFreshConfig {
+            dim: 16,
+            initial_postings: 16,
+            nprobe: 4,
+            ..Default::default()
+        };
+        let rows = synthetic_rows(cfg.dim, 512);
+        let (mut index, _assignments) = SpFreshDiskMetaIndex::build_with_assignments(cfg, &rows);
+        let before = index.coarse_centroids.len();
+        for i in 0..3_000usize {
+            let id = rows[i % rows.len()].id;
+            let vec = rows[i % rows.len()].values.clone();
+            let posting = index.choose_posting(&vec).unwrap_or_default();
+            index.apply_upsert(Some((posting, vec.clone())), posting, vec);
+            let _ = id;
+        }
+        assert!(!index.coarse_centroids.is_empty());
+        assert!(index.coarse_centroids.len() == before || before == 0);
     }
 }

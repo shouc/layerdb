@@ -434,12 +434,22 @@ pub(crate) fn posting_member_key(generation: u64, posting_id: usize, id: u64) ->
 }
 
 const POSTING_MEMBER_RKYV_TAG: &[u8] = b"rk1";
+const POSTING_MEMBER_RKYV_V2_TAG: &[u8] = b"rk2";
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug)]
 #[archive(check_bytes)]
 struct PostingMemberValueRkyv {
     id: u64,
     values: Vec<f32>,
+}
+
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug)]
+#[archive(check_bytes)]
+struct PostingMemberValueRkyvV2 {
+    id: u64,
+    values: Option<Vec<f32>>,
+    residual_scale: f32,
+    residual_code: Vec<i8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -452,8 +462,11 @@ struct PostingMemberValueLegacy {
 pub(crate) struct PostingMember {
     pub id: u64,
     pub values: Option<Vec<f32>>,
+    pub residual_scale: Option<f32>,
+    pub residual_code: Option<Vec<i8>>,
 }
 
+#[cfg(test)]
 pub(crate) fn posting_member_value(id: u64, values: &[f32]) -> anyhow::Result<Vec<u8>> {
     let payload = PostingMemberValueRkyv {
         id,
@@ -463,6 +476,47 @@ pub(crate) fn posting_member_value(id: u64, values: &[f32]) -> anyhow::Result<Ve
         rkyv::to_bytes::<_, 1_024>(&payload).context("encode posting member value with rkyv")?;
     let mut out = Vec::with_capacity(POSTING_MEMBER_RKYV_TAG.len() + archived.len());
     out.extend_from_slice(POSTING_MEMBER_RKYV_TAG);
+    out.extend_from_slice(archived.as_ref());
+    Ok(out)
+}
+
+fn quantize_residual(values: &[f32], centroid: &[f32]) -> (f32, Vec<i8>) {
+    debug_assert_eq!(values.len(), centroid.len());
+    if values.is_empty() {
+        return (1.0, Vec::new());
+    }
+    let mut max_abs = 0.0f32;
+    for (v, c) in values.iter().zip(centroid.iter()) {
+        let a = (*v - *c).abs();
+        if a > max_abs {
+            max_abs = a;
+        }
+    }
+    let scale = if max_abs <= 1e-9 { 1e-9 } else { max_abs / 127.0 };
+    let mut code = Vec::with_capacity(values.len());
+    for (v, c) in values.iter().zip(centroid.iter()) {
+        let q = ((*v - *c) / scale).round().clamp(-127.0, 127.0) as i8;
+        code.push(q);
+    }
+    (scale, code)
+}
+
+pub(crate) fn posting_member_value_with_residual(
+    id: u64,
+    values: &[f32],
+    centroid: &[f32],
+) -> anyhow::Result<Vec<u8>> {
+    let (residual_scale, residual_code) = quantize_residual(values, centroid);
+    let payload = PostingMemberValueRkyvV2 {
+        id,
+        values: Some(values.to_vec()),
+        residual_scale,
+        residual_code,
+    };
+    let archived = rkyv::to_bytes::<_, 1_024>(&payload)
+        .context("encode posting member value (residual) with rkyv")?;
+    let mut out = Vec::with_capacity(POSTING_MEMBER_RKYV_V2_TAG.len() + archived.len());
+    out.extend_from_slice(POSTING_MEMBER_RKYV_V2_TAG);
     out.extend_from_slice(archived.as_ref());
     Ok(out)
 }
@@ -494,6 +548,23 @@ pub(crate) fn load_posting_members(
         };
         let raw = value.as_ref();
         let decoded = (|| -> anyhow::Result<PostingMember> {
+            if raw.starts_with(POSTING_MEMBER_RKYV_V2_TAG) {
+                let mut aligned = rkyv::AlignedVec::with_capacity(
+                    raw.len().saturating_sub(POSTING_MEMBER_RKYV_V2_TAG.len()),
+                );
+                aligned.extend_from_slice(&raw[POSTING_MEMBER_RKYV_V2_TAG.len()..]);
+                let archived = rkyv::check_archived_root::<PostingMemberValueRkyvV2>(&aligned)
+                    .map_err(|err| anyhow::anyhow!("decode rkyv posting member v2: {err}"))?;
+                return Ok(PostingMember {
+                    id: archived.id,
+                    values: archived
+                        .values
+                        .as_ref()
+                        .map(|vals| vals.iter().copied().collect()),
+                    residual_scale: Some(archived.residual_scale),
+                    residual_code: Some(archived.residual_code.iter().copied().collect()),
+                });
+            }
             if raw.starts_with(POSTING_MEMBER_RKYV_TAG) {
                 let mut aligned = rkyv::AlignedVec::with_capacity(
                     raw.len().saturating_sub(POSTING_MEMBER_RKYV_TAG.len()),
@@ -504,16 +575,25 @@ pub(crate) fn load_posting_members(
                 return Ok(PostingMember {
                     id: archived.id,
                     values: Some(archived.values.iter().copied().collect()),
+                    residual_scale: None,
+                    residual_code: None,
                 });
             }
             if let Ok(payload) = bincode::deserialize::<PostingMemberValueLegacy>(raw) {
                 return Ok(PostingMember {
                     id: payload.id,
                     values: Some(payload.values),
+                    residual_scale: None,
+                    residual_code: None,
                 });
             }
             let id = bincode::deserialize::<u64>(raw)?;
-            Ok(PostingMember { id, values: None })
+            Ok(PostingMember {
+                id,
+                values: None,
+                residual_scale: None,
+                residual_code: None,
+            })
         })()
         .with_context(|| {
             format!(

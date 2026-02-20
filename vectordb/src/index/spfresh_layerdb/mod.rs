@@ -31,10 +31,10 @@ use storage::{
     ensure_metadata, ensure_wal_exists, ensure_wal_next_seq, load_index_checkpoint_bytes,
     load_metadata, load_posting_assignments, load_posting_members, load_row, load_rows,
     load_wal_entries_since, persist_index_checkpoint_bytes, posting_assignment_value,
-    posting_map_key, posting_map_prefix, posting_member_key, posting_member_value,
+    posting_map_key, posting_map_prefix, posting_member_key, posting_member_value_with_residual,
     posting_members_generation_prefix, prefix_exclusive_end, prune_wal_before,
     refresh_read_snapshot, set_active_generation, validate_config, vector_key, vector_prefix,
-    wal_key, IndexWalEntry,
+    wal_key, IndexWalEntry, PostingMember,
 };
 use sync_utils::{lock_mutex, lock_read, lock_write};
 
@@ -64,6 +64,7 @@ pub struct VectorMutationBatchResult {
 
 type DiskMetaRowState = Option<(usize, Vec<f32>)>;
 type DiskMetaStateMap = HashMap<u64, DiskMetaRowState>;
+const DISKMETA_RERANK_FACTOR: usize = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum RuntimeSpFreshIndex {
@@ -124,10 +125,27 @@ impl VectorCache {
     }
 }
 
+#[derive(Clone, Debug)]
+struct PostingMemberSketch {
+    id: u64,
+    residual_scale: Option<f32>,
+    residual_code: Option<Vec<i8>>,
+}
+
+impl PostingMemberSketch {
+    fn from_loaded(member: &PostingMember) -> Self {
+        Self {
+            id: member.id,
+            residual_scale: member.residual_scale,
+            residual_code: member.residual_code.clone(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PostingMembersCache {
     capacity: usize,
-    map: HashMap<(u64, usize), Arc<Vec<u64>>>,
+    map: HashMap<(u64, usize), Arc<Vec<PostingMemberSketch>>>,
     order: VecDeque<(u64, usize)>,
 }
 
@@ -140,11 +158,16 @@ impl PostingMembersCache {
         }
     }
 
-    fn get(&self, generation: u64, posting_id: usize) -> Option<Arc<Vec<u64>>> {
+    fn get(&self, generation: u64, posting_id: usize) -> Option<Arc<Vec<PostingMemberSketch>>> {
         self.map.get(&(generation, posting_id)).cloned()
     }
 
-    fn put_arc(&mut self, generation: u64, posting_id: usize, members: Arc<Vec<u64>>) {
+    fn put_arc(
+        &mut self,
+        generation: u64,
+        posting_id: usize,
+        members: Arc<Vec<PostingMemberSketch>>,
+    ) {
         if self.capacity == 0 {
             return;
         }
@@ -165,8 +188,37 @@ impl PostingMembersCache {
         self.map.insert((generation, posting_id), members);
     }
 
-    fn remove(&mut self, generation: u64, posting_id: usize) {
-        self.map.remove(&(generation, posting_id));
+    fn apply_upsert_delta(
+        &mut self,
+        generation: u64,
+        posting_id: usize,
+        member: PostingMemberSketch,
+    ) {
+        let key = (generation, posting_id);
+        let Some(current) = self.map.get(&key).cloned() else {
+            return;
+        };
+        let mut next: Vec<PostingMemberSketch> = current.as_ref().clone();
+        if let Some(existing) = next.iter_mut().find(|m| m.id == member.id) {
+            *existing = member;
+        } else {
+            next.push(member);
+        }
+        self.map.insert(key, Arc::new(next));
+    }
+
+    fn apply_delete_delta(&mut self, generation: u64, posting_id: usize, id: u64) {
+        let key = (generation, posting_id);
+        let Some(current) = self.map.get(&key).cloned() else {
+            return;
+        };
+        let mut next: Vec<PostingMemberSketch> = current
+            .iter()
+            .filter(|m| m.id != id)
+            .cloned()
+            .collect();
+        next.shrink_to_fit();
+        self.map.insert(key, Arc::new(next));
     }
 
     fn clear(&mut self) {
@@ -622,24 +674,24 @@ impl SpFreshLayerDbIndex {
         &self,
         generation: u64,
         posting_id: usize,
-    ) -> anyhow::Result<Arc<Vec<u64>>> {
+    ) -> anyhow::Result<Arc<Vec<PostingMemberSketch>>> {
         if let Some(ids) = lock_mutex(&self.posting_members_cache).get(generation, posting_id) {
             return Ok(ids);
         }
         let members = load_posting_members(&self.db, generation, posting_id)?;
-        let mut ids = Vec::with_capacity(members.len());
+        let mut sketches = Vec::with_capacity(members.len());
         {
             let mut vector_cache = lock_mutex(&self.vector_cache);
             for member in members {
-                ids.push(member.id);
+                sketches.push(PostingMemberSketch::from_loaded(&member));
                 if let Some(values) = member.values {
                     vector_cache.put(member.id, values);
                 }
             }
         }
-        let ids = Arc::new(ids);
-        lock_mutex(&self.posting_members_cache).put_arc(generation, posting_id, ids.clone());
-        Ok(ids)
+        let sketches = Arc::new(sketches);
+        lock_mutex(&self.posting_members_cache).put_arc(generation, posting_id, sketches.clone());
+        Ok(sketches)
     }
 
     fn neighbor_cmp(a: &Neighbor, b: &Neighbor) -> std::cmp::Ordering {
@@ -664,6 +716,85 @@ impl SpFreshLayerDbIndex {
         }
         if Self::neighbor_cmp(&candidate, &top[worst_idx]).is_lt() {
             top[worst_idx] = candidate;
+        }
+    }
+
+    fn approx_distance_from_residual(
+        query: &[f32],
+        centroid: &[f32],
+        member: &PostingMemberSketch,
+    ) -> Option<f32> {
+        let scale = member.residual_scale?;
+        let code = member.residual_code.as_ref()?;
+        if centroid.len() != query.len() || code.len() != query.len() {
+            return None;
+        }
+        let mut sum = 0.0f32;
+        for i in 0..query.len() {
+            let approx = centroid[i] + scale * code[i] as f32;
+            let d = query[i] - approx;
+            sum += d * d;
+        }
+        Some(sum)
+    }
+
+    fn select_diskmeta_candidates(
+        query: &[f32],
+        centroid: &[f32],
+        members: &[PostingMemberSketch],
+        k: usize,
+    ) -> Vec<u64> {
+        if k == 0 || members.is_empty() {
+            return Vec::new();
+        }
+        if members
+            .iter()
+            .any(|m| m.residual_scale.is_none() || m.residual_code.is_none())
+        {
+            return members.iter().map(|m| m.id).collect();
+        }
+        let rerank = k
+            .saturating_mul(DISKMETA_RERANK_FACTOR)
+            .max(k)
+            .min(members.len());
+        let mut scored: Vec<(u64, f32)> = members
+            .iter()
+            .map(|member| {
+                let approx = Self::approx_distance_from_residual(query, centroid, member)
+                    .unwrap_or(f32::INFINITY);
+                (member.id, approx)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        scored.truncate(rerank.max(1));
+        scored.into_iter().map(|(id, _)| id).collect()
+    }
+
+    fn residual_sketch_for_member(id: u64, values: &[f32], centroid: &[f32]) -> PostingMemberSketch {
+        if values.len() != centroid.len() || values.is_empty() {
+            return PostingMemberSketch {
+                id,
+                residual_scale: None,
+                residual_code: None,
+            };
+        }
+        let mut max_abs = 0.0f32;
+        for (v, c) in values.iter().zip(centroid.iter()) {
+            let a = (*v - *c).abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        let scale = if max_abs <= 1e-9 { 1e-9 } else { max_abs / 127.0 };
+        let mut code = Vec::with_capacity(values.len());
+        for (v, c) in values.iter().zip(centroid.iter()) {
+            let q = ((*v - *c) / scale).round().clamp(-127.0, 127.0) as i8;
+            code.push(q);
+        }
+        PostingMemberSketch {
+            id,
+            residual_scale: Some(scale),
+            residual_code: Some(code),
         }
     }
 
@@ -703,13 +834,22 @@ impl SpFreshLayerDbIndex {
                     let posting = assignments.get(&row.id).copied().ok_or_else(|| {
                         anyhow::anyhow!("missing diskmeta assignment for id={}", row.id)
                     })?;
+                    let centroid = disk_index
+                        .as_ref()
+                        .and_then(|idx| idx.posting_centroid(posting))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "missing centroid for posting {} during diskmeta bulk-load",
+                                posting
+                            )
+                        })?;
                     ops.push(layerdb::Op::put(
                         posting_map_key(new_generation, row.id),
                         posting_assignment_value(posting)?,
                     ));
                     ops.push(layerdb::Op::put(
                         posting_member_key(new_generation, posting, row.id),
-                        posting_member_value(row.id, &row.values)?,
+                        posting_member_value_with_residual(row.id, &row.values, centroid)?,
                     ));
                 }
             }
@@ -942,9 +1082,14 @@ impl SpFreshLayerDbIndex {
 
             let mut persist_entries = Vec::with_capacity(mutations.len());
             let mut apply_entries = Vec::with_capacity(mutations.len());
+            let mut cache_deltas = Vec::with_capacity(mutations.len());
             for (id, vector) in &mutations {
                 let old = states.get(id).cloned().unwrap_or(None);
                 let new_posting = shadow.choose_posting(vector).unwrap_or(0);
+                let centroid = shadow
+                    .posting_centroid(new_posting)
+                    .unwrap_or(vector.as_slice());
+                let sketch = Self::residual_sketch_for_member(*id, vector, centroid);
                 let row = VectorRecord::new(*id, vector.clone());
                 let value = encode_vector_row_value(&row).context("serialize vector row")?;
                 let mut ops = vec![
@@ -955,7 +1100,7 @@ impl SpFreshLayerDbIndex {
                     ),
                     layerdb::Op::put(
                         posting_member_key(generation, new_posting, *id),
-                        posting_member_value(*id, vector)?,
+                        posting_member_value_with_residual(*id, vector, centroid)?,
                     ),
                 ];
                 if let Some((old_posting, _)) = &old {
@@ -977,6 +1122,7 @@ impl SpFreshLayerDbIndex {
                     ops,
                 ));
                 apply_entries.push((*id, old.clone(), new_posting, vector.clone()));
+                cache_deltas.push((*id, old.as_ref().map(|(posting, _)| *posting), new_posting, sketch));
                 shadow.apply_upsert(old, new_posting, vector.clone());
                 states.insert(*id, Some((new_posting, vector.clone())));
             }
@@ -990,17 +1136,12 @@ impl SpFreshLayerDbIndex {
             self.stats
                 .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
 
-            let mut touched_postings = HashSet::new();
             {
                 let mut index = lock_write(&self.index);
                 let RuntimeSpFreshIndex::OffHeapDiskMeta(index) = &mut *index else {
                     anyhow::bail!("diskmeta upsert batch called for non-diskmeta runtime");
                 };
                 for (_id, old, new_posting, vector) in apply_entries {
-                    if let Some((old_posting, _)) = &old {
-                        touched_postings.insert(*old_posting);
-                    }
-                    touched_postings.insert(new_posting);
                     index.apply_upsert(old, new_posting, vector);
                 }
             }
@@ -1010,10 +1151,15 @@ impl SpFreshLayerDbIndex {
                     cache.put(*id, vector.clone());
                 }
             }
-            if !touched_postings.is_empty() {
+            {
                 let mut members_cache = lock_mutex(&self.posting_members_cache);
-                for posting in touched_postings {
-                    members_cache.remove(generation, posting);
+                for (id, old_posting, new_posting, sketch) in cache_deltas {
+                    if let Some(old_posting) = old_posting {
+                        if old_posting != new_posting {
+                            members_cache.apply_delete_delta(generation, old_posting, id);
+                        }
+                    }
+                    members_cache.apply_upsert_delta(generation, new_posting, sketch);
                 }
             }
             for _ in 0..mutations.len() {
@@ -1133,16 +1279,12 @@ impl SpFreshLayerDbIndex {
                 .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
 
             let mut deleted = 0usize;
-            let mut touched_postings = HashSet::new();
             {
                 let mut index = lock_write(&self.index);
                 let RuntimeSpFreshIndex::OffHeapDiskMeta(index) = &mut *index else {
                     anyhow::bail!("diskmeta delete batch called for non-diskmeta runtime");
                 };
                 for (_id, old) in apply_entries {
-                    if let Some((old_posting, _)) = &old {
-                        touched_postings.insert(*old_posting);
-                    }
                     if index.apply_delete(old) {
                         deleted += 1;
                     }
@@ -1154,10 +1296,12 @@ impl SpFreshLayerDbIndex {
                     cache.remove(*id);
                 }
             }
-            if !touched_postings.is_empty() {
+            {
                 let mut members_cache = lock_mutex(&self.posting_members_cache);
-                for posting in touched_postings {
-                    members_cache.remove(generation, posting);
+                for id in &mutations {
+                    if let Some(Some((old_posting, _))) = states.get(id) {
+                        members_cache.apply_delete_delta(generation, *old_posting, *id);
+                    }
                 }
             }
             for _ in 0..deleted {
@@ -1356,16 +1500,24 @@ impl VectorIndex for SpFreshLayerDbIndex {
                 let mut top = Vec::with_capacity(k);
                 let postings = index.choose_probe_postings(query, k);
                 for posting_id in postings {
-                    let member_ids = self
+                    let Some(centroid) = index.posting_centroid(posting_id) else {
+                        continue;
+                    };
+                    let members = self
                         .load_posting_members_for(generation, posting_id)
                         .unwrap_or_else(|err| {
                             panic!("offheap-diskmeta load members failed: {err:#}")
                         });
+                    let candidate_ids =
+                        Self::select_diskmeta_candidates(query, centroid, members.as_ref(), k);
+                    if candidate_ids.is_empty() {
+                        continue;
+                    }
                     let vectors = Self::load_vectors_for_ids(
                         &self.db,
                         &self.vector_cache,
                         generation,
-                        member_ids.as_ref(),
+                        &candidate_ids,
                     )
                     .unwrap_or_else(|err| panic!("offheap-diskmeta load vectors failed: {err:#}"));
                     for (id, values) in vectors {

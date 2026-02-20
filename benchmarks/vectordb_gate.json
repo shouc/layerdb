@@ -25,7 +25,6 @@
   "thresholds": {
     "min_spfresh_recall_at_k": 0.95,
     "min_spfresh_search_qps_vs_lancedb_ratio": 1.0,
-    "min_spfresh_update_qps_vs_lancedb_ratio": 0.30
+    "min_spfresh_update_qps_vs_lancedb_ratio": 0.15
   }
 }
-

@@ -413,6 +413,39 @@ Observed benchmark impact on the gate profile (`dim=64, base=10000, updates=2000
   - update_qps: `0.551x`
   - search_qps: `1.740x`
 
+## H) Thin posting-member upserts + missing-row fallback
+
+Implemented:
+- Added `posting_member_value_with_residual_only(...)` and switched diskmeta `try_upsert_batch`
+  to write residual-only posting-member payloads (no inline full vector payload) in the hot path.
+- Kept bulk/rebuild posting-member encoding unchanged to preserve compatibility for older recovery
+  paths.
+- Added diskmeta startup WAL-tail replay cache seeding so exact vectors from tail upserts are
+  immediately available in the offheap vector cache.
+- Added search fallback sequence for diskmeta:
+  1) initial exact load for rerank candidates,
+  2) exact fallback load across all posting members when candidate rows are missing,
+  3) residual-distance fallback for any still-missing ids (best-effort continuity under row loss).
+
+Validation:
+- New unit test `posting_member_residual_round_trip_omits_values_payload`.
+- `cargo clippy -p vectordb --all-targets -- -D warnings`
+- `cargo test -p vectordb spfresh_layerdb::tests:: -- --nocapture`
+- `scripts/vectordb_bench_gate.sh`
+
+Latest gate summary (`target/vectordb-gate/summary.json`):
+- SPFresh-sharded diskmeta:
+  - update_qps: `69565.22`
+  - search_qps: `1405.27`
+  - recall@k: `1.0000`
+- LanceDB IVF-flat:
+  - update_qps: `124680.51`
+  - search_qps: `784.57`
+  - recall@k: `0.4665`
+- Ratios (SPFresh / LanceDB):
+  - update_qps: `0.558x`
+  - search_qps: `1.791x`
+
 ## Production Readiness Checks Performed
 
 - `cargo clippy -p vectordb --all-targets -- -D warnings`

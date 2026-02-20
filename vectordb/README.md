@@ -95,6 +95,7 @@ cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
 - prefer fallible APIs in services:
   - `try_upsert`, `try_delete`, `try_bulk_load`
   - `try_upsert_batch`, `try_delete_batch` for strict batched WAL commit path
+  - `try_apply_batch(&[VectorMutation])` for mixed upsert/delete ingestion
   - `open_existing` to recover config from persisted metadata
   - `close` for graceful worker shutdown + final rebuild
   - `health_check` and `stats` for operational monitoring

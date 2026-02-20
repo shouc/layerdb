@@ -577,8 +577,14 @@ impl SpFreshLayerDbIndex {
 
         let mut touched = HashSet::with_capacity(entries.len());
         for entry in entries {
-            let IndexWalEntry::Touch { id } = entry;
-            touched.insert(id);
+            match entry {
+                IndexWalEntry::Touch { id } => {
+                    touched.insert(id);
+                }
+                IndexWalEntry::TouchBatch { ids } => {
+                    touched.extend(ids);
+                }
+            }
         }
 
         for id in touched {
@@ -1467,7 +1473,8 @@ impl SpFreshLayerDbIndex {
             let mut posting_event_next_seq =
                 self.posting_event_next_seq.load(Ordering::Relaxed);
 
-            let mut persist_entries = Vec::with_capacity(mutations.len());
+            let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(3));
+            let mut touched_ids = Vec::with_capacity(mutations.len());
             let mut new_postings = HashMap::with_capacity(mutations.len());
             let mut cache_deltas = Vec::with_capacity(mutations.len());
             for (id, vector) in &mutations {
@@ -1500,10 +1507,8 @@ impl SpFreshLayerDbIndex {
                         ), posting_member_event_tombstone_value(*id)?));
                     }
                 }
-                persist_entries.push((
-                    IndexWalEntry::Touch { id: *id },
-                    ops,
-                ));
+                batch_ops.extend(ops);
+                touched_ids.push(*id);
                 let old_posting = old.map(|(posting, _)| *posting);
                 cache_deltas.push((*id, old_posting, new_posting, sketch));
                 shadow.apply_upsert_ref(
@@ -1520,6 +1525,10 @@ impl SpFreshLayerDbIndex {
                 posting_event_next,
             )];
 
+            let persist_entries = vec![(
+                IndexWalEntry::TouchBatch { ids: touched_ids },
+                batch_ops,
+            )];
             if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, trailer_ops) {
                 self.stats
                     .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
@@ -1581,15 +1590,18 @@ impl SpFreshLayerDbIndex {
             return Ok(mutations.len());
         }
 
-        let mut persist_entries = Vec::with_capacity(mutations.len());
+        let mut batch_ops = Vec::with_capacity(mutations.len());
+        let mut touched_ids = Vec::with_capacity(mutations.len());
         for (id, vector) in &mutations {
             let value = encode_vector_row_fields(*id, 0, false, vector.as_slice(), None)
                 .context("serialize vector row")?;
-            persist_entries.push((
-                IndexWalEntry::Touch { id: *id },
-                vec![layerdb::Op::put(vector_key(generation, *id), value)],
-            ));
+            batch_ops.push(layerdb::Op::put(vector_key(generation, *id), value));
+            touched_ids.push(*id);
         }
+        let persist_entries = vec![(
+            IndexWalEntry::TouchBatch { ids: touched_ids },
+            batch_ops,
+        )];
         if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, Vec::new()) {
             self.stats
                 .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
@@ -1663,7 +1675,8 @@ impl SpFreshLayerDbIndex {
 
         if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
             let states = self.load_diskmeta_states_for_ids(generation, &mutations)?;
-            let mut persist_entries = Vec::with_capacity(mutations.len());
+            let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(2));
+            let mut touched_ids = Vec::with_capacity(mutations.len());
             let mut apply_entries = Vec::with_capacity(mutations.len());
             let mut posting_event_next_seq =
                 self.posting_event_next_seq.load(Ordering::Relaxed);
@@ -1678,10 +1691,8 @@ impl SpFreshLayerDbIndex {
                         posting_member_event_tombstone_value(*id)?,
                     ));
                 }
-                persist_entries.push((
-                    IndexWalEntry::Touch { id: *id },
-                    ops,
-                ));
+                batch_ops.extend(ops);
+                touched_ids.push(*id);
                 apply_entries.push((*id, old));
             }
             let posting_event_next = bincode::serialize(&posting_event_next_seq)
@@ -1689,6 +1700,10 @@ impl SpFreshLayerDbIndex {
             let trailer_ops = vec![layerdb::Op::put(
                 config::META_POSTING_EVENT_NEXT_SEQ_KEY,
                 posting_event_next,
+            )];
+            let persist_entries = vec![(
+                IndexWalEntry::TouchBatch { ids: touched_ids },
+                batch_ops,
             )];
             if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, trailer_ops) {
                 self.stats
@@ -1741,13 +1756,16 @@ impl SpFreshLayerDbIndex {
             return Ok(deleted);
         }
 
-        let mut persist_entries = Vec::with_capacity(mutations.len());
+        let mut batch_ops = Vec::with_capacity(mutations.len());
+        let mut touched_ids = Vec::with_capacity(mutations.len());
         for id in &mutations {
-            persist_entries.push((
-                IndexWalEntry::Touch { id: *id },
-                vec![layerdb::Op::delete(vector_key(generation, *id))],
-            ));
+            batch_ops.push(layerdb::Op::delete(vector_key(generation, *id)));
+            touched_ids.push(*id);
         }
+        let persist_entries = vec![(
+            IndexWalEntry::TouchBatch { ids: touched_ids },
+            batch_ops,
+        )];
         if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, Vec::new()) {
             self.stats
                 .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);

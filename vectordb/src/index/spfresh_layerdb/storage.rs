@@ -473,10 +473,14 @@ pub(crate) enum IndexWalEntry {
     Touch {
         id: u64,
     },
+    TouchBatch {
+        ids: Vec<u64>,
+    },
 }
 
 const WAL_BIN_TAG: &[u8] = b"wl2";
 const WAL_KIND_TOUCH: u8 = 1;
+const WAL_KIND_TOUCH_BATCH: u8 = 2;
 
 pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(WAL_BIN_TAG.len() + 1 + 8);
@@ -485,6 +489,14 @@ pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>>
         IndexWalEntry::Touch { id } => {
             out.push(WAL_KIND_TOUCH);
             out.extend_from_slice(&id.to_le_bytes());
+        }
+        IndexWalEntry::TouchBatch { ids } => {
+            out.push(WAL_KIND_TOUCH_BATCH);
+            let len = u32::try_from(ids.len()).context("wal touch-batch len does not fit u32")?;
+            out.extend_from_slice(&len.to_le_bytes());
+            for id in ids {
+                out.extend_from_slice(&id.to_le_bytes());
+            }
         }
     }
     Ok(out)
@@ -500,6 +512,15 @@ pub(crate) fn decode_wal_entry(raw: &[u8]) -> anyhow::Result<IndexWalEntry> {
         WAL_KIND_TOUCH => {
             let id = read_u64(raw, &mut cursor)?;
             IndexWalEntry::Touch { id }
+        }
+        WAL_KIND_TOUCH_BATCH => {
+            let len =
+                usize::try_from(read_u32(raw, &mut cursor)?).context("wal touch-batch len overflow")?;
+            let mut ids = Vec::with_capacity(len);
+            for _ in 0..len {
+                ids.push(read_u64(raw, &mut cursor)?);
+            }
+            IndexWalEntry::TouchBatch { ids }
         }
         _ => anyhow::bail!("unsupported wal kind {}", kind),
     };

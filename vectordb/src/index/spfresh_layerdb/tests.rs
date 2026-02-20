@@ -8,7 +8,7 @@ use tempfile::TempDir;
 
 use crate::types::{VectorIndex, VectorRecord};
 
-use super::{SpFreshLayerDbConfig, SpFreshLayerDbIndex};
+use super::{SpFreshLayerDbConfig, SpFreshLayerDbIndex, SpFreshMemoryMode};
 
 fn minio_enabled() -> bool {
     matches!(
@@ -55,6 +55,41 @@ fn persists_and_recovers_vectors() -> anyhow::Result<()> {
     assert_eq!(idx.len(), 1);
     let got = idx.search(&vec![1.0; 64], 1);
     assert_eq!(got[0].id, 2);
+    Ok(())
+}
+
+#[test]
+fn offheap_persists_and_recovers_vectors() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig {
+        memory_mode: SpFreshMemoryMode::OffHeap,
+        spfresh: crate::index::SpFreshConfig {
+            dim: 16,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        assert_eq!(idx.memory_mode(), SpFreshMemoryMode::OffHeap);
+        idx.try_upsert(1, vec![0.0; cfg.spfresh.dim])?;
+        idx.try_upsert(2, vec![1.0; cfg.spfresh.dim])?;
+        assert!(idx.try_delete(1)?);
+        idx.force_rebuild()?;
+        idx.close()?;
+    }
+
+    let idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+    assert_eq!(idx.memory_mode(), SpFreshMemoryMode::OffHeap);
+    assert_eq!(idx.len(), 1);
+    let got = idx.search(&vec![1.0; cfg.spfresh.dim], 1);
+    assert_eq!(got[0].id, 2);
+
+    let idx_existing = SpFreshLayerDbIndex::open_existing(dir.path(), cfg.db_options.clone())?;
+    assert_eq!(idx_existing.memory_mode(), SpFreshMemoryMode::OffHeap);
+    let got_existing = idx_existing.search(&vec![1.0; cfg.spfresh.dim], 1);
+    assert_eq!(got_existing[0].id, 2);
     Ok(())
 }
 
@@ -278,6 +313,52 @@ fn randomized_restarts_preserve_model_state() -> anyhow::Result<()> {
 
     idx.close()?;
     let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
+    assert_index_matches_model(&idx, &expected)?;
+    Ok(())
+}
+
+#[test]
+fn offheap_randomized_restarts_preserve_model_state() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig {
+        memory_mode: SpFreshMemoryMode::OffHeap,
+        spfresh: crate::index::SpFreshConfig {
+            dim: 16,
+            initial_postings: 8,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut rng = StdRng::seed_from_u64(0x000A_11CE_BEEF);
+    let mut expected: HashMap<u64, Vec<f32>> = HashMap::new();
+    let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+
+    let total_ops = 1_000usize;
+    let restart_every = 80usize;
+    for step in 1..=total_ops {
+        let id = rng.gen_range(0..400) as u64;
+        if rng.gen_bool(0.25) {
+            let model_deleted = expected.remove(&id).is_some();
+            let deleted = idx.try_delete(id)?;
+            assert_eq!(deleted, model_deleted);
+        } else {
+            let vector: Vec<f32> = (0..cfg.spfresh.dim).map(|_| rng.gen::<f32>()).collect();
+            idx.try_upsert(id, vector.clone())?;
+            expected.insert(id, vector);
+        }
+
+        if step % restart_every == 0 {
+            idx.close()?;
+            idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+            assert_eq!(idx.memory_mode(), SpFreshMemoryMode::OffHeap);
+            assert_index_matches_model(&idx, &expected)?;
+        }
+    }
+
+    idx.close()?;
+    let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
+    assert_eq!(idx.memory_mode(), SpFreshMemoryMode::OffHeap);
     assert_index_matches_model(&idx, &expected)?;
     Ok(())
 }

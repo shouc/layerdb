@@ -2,24 +2,27 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
+use anyhow::Context;
 use layerdb::Db;
 
-use crate::index::SpFreshIndex;
 use crate::types::VectorIndex;
 
+use super::RuntimeSpFreshIndex;
 use super::stats::SpFreshLayerDbStatsInner;
 use super::storage::load_row;
 use super::sync_utils::lock_write;
+use super::VectorCache;
 
 pub(crate) struct RebuilderRuntime {
     pub db: Db,
     pub rebuild_pending_ops: usize,
     pub rebuild_interval: std::time::Duration,
     pub active_generation: Arc<AtomicU64>,
-    pub index: Arc<RwLock<SpFreshIndex>>,
+    pub index: Arc<RwLock<RuntimeSpFreshIndex>>,
     pub update_gate: Arc<RwLock<()>>,
     pub dirty_ids: Arc<Mutex<std::collections::HashSet<u64>>>,
     pub pending_ops: Arc<AtomicUsize>,
+    pub vector_cache: Arc<Mutex<VectorCache>>,
     pub stats: Arc<SpFreshLayerDbStatsInner>,
     pub stop_worker: Arc<AtomicBool>,
 }
@@ -87,13 +90,39 @@ pub(crate) fn rebuild_once(runtime: &RebuilderRuntime) -> anyhow::Result<()> {
     let mut index = lock_write(&runtime.index);
     for id in &dirty_ids {
         match load_row(&runtime.db, generation, *id)? {
-            Some(row) => index.upsert(row.id, row.values),
-            None => {
-                let _ = index.delete(*id);
-            }
+            Some(row) => match &mut *index {
+                RuntimeSpFreshIndex::Resident(index) => index.upsert(row.id, row.values),
+                RuntimeSpFreshIndex::OffHeap(index) => {
+                    let override_row = (row.id, row.values.clone());
+                    let mut loader = |lookup_id: u64| {
+                        if lookup_id == override_row.0 {
+                            return Ok(Some(override_row.1.clone()));
+                        }
+                        load_vector_for_id(runtime, generation, lookup_id)
+                    };
+                    index
+                        .upsert_with(row.id, row.values, &mut loader)
+                        .with_context(|| format!("offheap rebuilder upsert id={id}"))?;
+                }
+            },
+            None => match &mut *index {
+                RuntimeSpFreshIndex::Resident(index) => {
+                    let _ = index.delete(*id);
+                }
+                RuntimeSpFreshIndex::OffHeap(index) => {
+                    let mut loader =
+                        |lookup_id: u64| load_vector_for_id(runtime, generation, lookup_id);
+                    let _ = index
+                        .delete_with(*id, &mut loader)
+                        .with_context(|| format!("offheap rebuilder delete id={id}"))?;
+                }
+            },
         }
     }
-    let live_rows = index.len();
+    let live_rows = match &*index {
+        RuntimeSpFreshIndex::Resident(index) => index.len(),
+        RuntimeSpFreshIndex::OffHeap(index) => index.len(),
+    };
     drop(index);
 
     let mut guard = match runtime.dirty_ids.lock() {
@@ -113,4 +142,27 @@ pub(crate) fn rebuild_once(runtime: &RebuilderRuntime) -> anyhow::Result<()> {
         .set_last_rebuild_duration_ms(started.elapsed().as_millis() as u64);
     runtime.stats.set_last_rebuild_rows(live_rows);
     Ok(())
+}
+
+fn load_vector_for_id(
+    runtime: &RebuilderRuntime,
+    generation: u64,
+    id: u64,
+) -> anyhow::Result<Option<Vec<f32>>> {
+    let cached = match runtime.vector_cache.lock() {
+        Ok(guard) => guard.get(id),
+        Err(poisoned) => poisoned.into_inner().get(id),
+    };
+    if cached.is_some() {
+        return Ok(cached);
+    }
+    let Some(row) = load_row(&runtime.db, generation, id)? else {
+        return Ok(None);
+    };
+    let values = row.values;
+    match runtime.vector_cache.lock() {
+        Ok(mut guard) => guard.put(id, values.clone()),
+        Err(poisoned) => poisoned.into_inner().put(id, values.clone()),
+    }
+    Ok(Some(values))
 }

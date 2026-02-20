@@ -7,7 +7,7 @@ mod sync_utils;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{Neighbor, VectorIndex, VectorRecord};
 
+use super::spfresh_offheap::SpFreshOffHeapIndex;
 use super::{SpFreshConfig, SpFreshIndex};
 use rebuilder::{rebuild_once, spawn_rebuilder, RebuilderRuntime};
 use stats::SpFreshLayerDbStatsInner;
@@ -31,15 +32,65 @@ use storage::{
 };
 use sync_utils::{lock_mutex, lock_read, lock_write};
 
-pub use config::SpFreshLayerDbConfig;
+pub use config::{SpFreshLayerDbConfig, SpFreshMemoryMode};
 pub use stats::SpFreshLayerDbStats;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum RuntimeSpFreshIndex {
+    Resident(SpFreshIndex),
+    OffHeap(SpFreshOffHeapIndex),
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedIndexCheckpoint {
     schema_version: u32,
     generation: u64,
     applied_wal_seq: Option<u64>,
-    index: SpFreshIndex,
+    index: RuntimeSpFreshIndex,
+}
+
+#[derive(Debug)]
+struct VectorCache {
+    capacity: usize,
+    map: HashMap<u64, Vec<f32>>,
+    order: VecDeque<u64>,
+}
+
+impl VectorCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<Vec<f32>> {
+        self.map.get(&id).cloned()
+    }
+
+    fn put(&mut self, id: u64, values: Vec<f32>) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let std::collections::hash_map::Entry::Occupied(mut existing) = self.map.entry(id) {
+            existing.insert(values);
+            return;
+        }
+        if self.map.len() >= self.capacity {
+            while let Some(oldest) = self.order.pop_front() {
+                if self.map.remove(&oldest).is_some() {
+                    break;
+                }
+            }
+        }
+        self.order.push_back(id);
+        self.map.insert(id, values);
+    }
+
+    fn remove(&mut self, id: u64) {
+        self.map.remove(&id);
+    }
 }
 
 pub struct SpFreshLayerDbIndex {
@@ -47,10 +98,11 @@ pub struct SpFreshLayerDbIndex {
     db_path: PathBuf,
     db: Db,
     active_generation: Arc<AtomicU64>,
-    index: Arc<RwLock<SpFreshIndex>>,
+    index: Arc<RwLock<RuntimeSpFreshIndex>>,
     update_gate: Arc<RwLock<()>>,
     dirty_ids: Arc<Mutex<HashSet<u64>>>,
     pending_ops: Arc<AtomicUsize>,
+    vector_cache: Arc<Mutex<VectorCache>>,
     wal_next_seq: Arc<AtomicU64>,
     rebuild_tx: mpsc::Sender<()>,
     stop_worker: Arc<AtomicBool>,
@@ -100,14 +152,19 @@ impl SpFreshLayerDbIndex {
         Self::open_with_db(db_path, db, cfg)
     }
 
-    fn open_with_db(db_path: &Path, db: Db, cfg: SpFreshLayerDbConfig) -> anyhow::Result<Self> {
+    fn open_with_db(db_path: &Path, db: Db, mut cfg: SpFreshLayerDbConfig) -> anyhow::Result<Self> {
         let generation = ensure_active_generation(&db)?;
         let wal_next_seq = ensure_wal_next_seq(&db)?;
         let (mut index_state, applied_wal_seq) =
             Self::load_or_rebuild_index(&db, &cfg, generation, wal_next_seq)?;
+        cfg.memory_mode = match &index_state {
+            RuntimeSpFreshIndex::Resident(_) => SpFreshMemoryMode::Resident,
+            RuntimeSpFreshIndex::OffHeap(_) => SpFreshMemoryMode::OffHeap,
+        };
+        let vector_cache = Arc::new(Mutex::new(VectorCache::new(cfg.offheap_cache_capacity)));
         let replay_from = applied_wal_seq.map_or(0, |seq| seq.saturating_add(1));
         if replay_from < wal_next_seq {
-            Self::replay_wal_tail(&db, generation, &mut index_state, replay_from)?;
+            Self::replay_wal_tail(&db, &vector_cache, generation, &mut index_state, replay_from)?;
         }
         let index = Arc::new(RwLock::new(index_state));
         let active_generation = Arc::new(AtomicU64::new(generation));
@@ -129,6 +186,7 @@ impl SpFreshLayerDbIndex {
                 update_gate: update_gate.clone(),
                 dirty_ids: dirty_ids.clone(),
                 pending_ops: pending_ops.clone(),
+                vector_cache: vector_cache.clone(),
                 stats: stats.clone(),
                 stop_worker: stop_worker.clone(),
             },
@@ -144,6 +202,7 @@ impl SpFreshLayerDbIndex {
             update_gate,
             dirty_ids,
             pending_ops,
+            vector_cache,
             wal_next_seq,
             rebuild_tx,
             stop_worker,
@@ -157,7 +216,7 @@ impl SpFreshLayerDbIndex {
         cfg: &SpFreshLayerDbConfig,
         generation: u64,
         wal_next_seq: u64,
-    ) -> anyhow::Result<(SpFreshIndex, Option<u64>)> {
+    ) -> anyhow::Result<(RuntimeSpFreshIndex, Option<u64>)> {
         if let Some(raw) = load_index_checkpoint_bytes(db)? {
             match bincode::deserialize::<PersistedIndexCheckpoint>(raw.as_ref()) {
                 Ok(checkpoint)
@@ -175,16 +234,22 @@ impl SpFreshLayerDbIndex {
 
         let rows = load_rows(db, generation)?;
         let applied_wal_seq = wal_next_seq.checked_sub(1);
-        Ok((
-            SpFreshIndex::build(cfg.spfresh.clone(), &rows),
-            applied_wal_seq,
-        ))
+        let index = match cfg.memory_mode {
+            SpFreshMemoryMode::Resident => {
+                RuntimeSpFreshIndex::Resident(SpFreshIndex::build(cfg.spfresh.clone(), &rows))
+            }
+            SpFreshMemoryMode::OffHeap => {
+                RuntimeSpFreshIndex::OffHeap(SpFreshOffHeapIndex::build(cfg.spfresh.clone(), &rows))
+            }
+        };
+        Ok((index, applied_wal_seq))
     }
 
     fn replay_wal_tail(
         db: &Db,
+        vector_cache: &Arc<Mutex<VectorCache>>,
         generation: u64,
-        index: &mut SpFreshIndex,
+        index: &mut RuntimeSpFreshIndex,
         from_seq: u64,
     ) -> anyhow::Result<()> {
         let touched_ids = load_wal_touched_ids_since(db, from_seq)?;
@@ -198,10 +263,23 @@ impl SpFreshLayerDbIndex {
         }
         for id in unique {
             match load_row(db, generation, id)? {
-                Some(row) => index.upsert(row.id, row.values),
-                None => {
-                    let _ = index.delete(id);
-                }
+                Some(row) => match index {
+                    RuntimeSpFreshIndex::Resident(index) => index.upsert(row.id, row.values),
+                    RuntimeSpFreshIndex::OffHeap(index) => {
+                        let mut loader =
+                            Self::loader_for(db, vector_cache, generation, Some((row.id, row.values.clone())));
+                        index.upsert_with(row.id, row.values, &mut loader)?;
+                    }
+                },
+                None => match index {
+                    RuntimeSpFreshIndex::Resident(index) => {
+                        let _ = index.delete(id);
+                    }
+                    RuntimeSpFreshIndex::OffHeap(index) => {
+                        let mut loader = Self::loader_for(db, vector_cache, generation, None);
+                        let _ = index.delete_with(id, &mut loader)?;
+                    }
+                },
             }
         }
         Ok(())
@@ -234,8 +312,42 @@ impl SpFreshLayerDbIndex {
             update_gate: self.update_gate.clone(),
             dirty_ids: self.dirty_ids.clone(),
             pending_ops: self.pending_ops.clone(),
+            vector_cache: self.vector_cache.clone(),
             stats: self.stats.clone(),
             stop_worker: self.stop_worker.clone(),
+        }
+    }
+
+    fn load_vector_for_id(
+        db: &Db,
+        vector_cache: &Arc<Mutex<VectorCache>>,
+        generation: u64,
+        id: u64,
+    ) -> anyhow::Result<Option<Vec<f32>>> {
+        if let Some(values) = lock_mutex(vector_cache).get(id) {
+            return Ok(Some(values));
+        }
+        let Some(row) = load_row(db, generation, id)? else {
+            return Ok(None);
+        };
+        let values = row.values;
+        lock_mutex(vector_cache).put(id, values.clone());
+        Ok(Some(values))
+    }
+
+    fn loader_for<'a>(
+        db: &'a Db,
+        vector_cache: &'a Arc<Mutex<VectorCache>>,
+        generation: u64,
+        override_row: Option<(u64, Vec<f32>)>,
+    ) -> impl FnMut(u64) -> anyhow::Result<Option<Vec<f32>>> + 'a {
+        move |id| {
+            if let Some((override_id, values)) = &override_row {
+                if *override_id == id {
+                    return Ok(Some(values.clone()));
+                }
+            }
+            Self::load_vector_for_id(db, vector_cache, generation, id)
         }
     }
 
@@ -292,7 +404,20 @@ impl SpFreshLayerDbIndex {
             );
         }
 
-        *lock_write(&self.index) = SpFreshIndex::build(self.cfg.spfresh.clone(), rows);
+        *lock_write(&self.index) = match self.cfg.memory_mode {
+            SpFreshMemoryMode::Resident => {
+                RuntimeSpFreshIndex::Resident(SpFreshIndex::build(self.cfg.spfresh.clone(), rows))
+            }
+            SpFreshMemoryMode::OffHeap => RuntimeSpFreshIndex::OffHeap(SpFreshOffHeapIndex::build(
+                self.cfg.spfresh.clone(),
+                rows,
+            )),
+        };
+        {
+            let mut cache = lock_mutex(&self.vector_cache);
+            cache.map.clear();
+            cache.order.clear();
+        }
         lock_mutex(&self.dirty_ids).clear();
         self.pending_ops.store(0, Ordering::Relaxed);
         self.stats.set_last_rebuild_rows(rows.len());
@@ -359,7 +484,22 @@ impl SpFreshLayerDbIndex {
         }
         self.stats
             .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
-        lock_write(&self.index).upsert(id, vector);
+        let cache_vector = vector.clone();
+        {
+            let mut index = lock_write(&self.index);
+            match &mut *index {
+                RuntimeSpFreshIndex::Resident(index) => index.upsert(id, vector.clone()),
+                RuntimeSpFreshIndex::OffHeap(index) => {
+                    let generation = self.active_generation.load(Ordering::Relaxed);
+                    let mut loader =
+                        Self::loader_for(&self.db, &self.vector_cache, generation, Some((id, vector.clone())));
+                    index
+                        .upsert_with(id, vector, &mut loader)
+                        .with_context(|| format!("offheap upsert id={id}"))?;
+                }
+            }
+        }
+        lock_mutex(&self.vector_cache).put(id, cache_vector);
         self.mark_dirty(id);
         self.stats.inc_upserts();
         let pending = self.pending_ops.load(Ordering::Relaxed);
@@ -380,7 +520,20 @@ impl SpFreshLayerDbIndex {
         }
         self.stats
             .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
-        let deleted = lock_write(&self.index).delete(id);
+        let deleted = {
+            let mut index = lock_write(&self.index);
+            match &mut *index {
+                RuntimeSpFreshIndex::Resident(index) => index.delete(id),
+                RuntimeSpFreshIndex::OffHeap(index) => {
+                    let generation = self.active_generation.load(Ordering::Relaxed);
+                    let mut loader = Self::loader_for(&self.db, &self.vector_cache, generation, None);
+                    index
+                        .delete_with(id, &mut loader)
+                        .with_context(|| format!("offheap delete id={id}"))?
+                }
+            }
+        };
+        lock_mutex(&self.vector_cache).remove(id);
         if deleted {
             self.mark_dirty(id);
             self.stats.inc_deletes();
@@ -408,6 +561,10 @@ impl SpFreshLayerDbIndex {
     pub fn stats(&self) -> SpFreshLayerDbStats {
         self.stats
             .snapshot(self.pending_ops.load(Ordering::Relaxed) as u64)
+    }
+
+    pub fn memory_mode(&self) -> SpFreshMemoryMode {
+        self.cfg.memory_mode
     }
 
     pub fn health_check(&self) -> anyhow::Result<SpFreshLayerDbStats> {
@@ -471,13 +628,26 @@ impl VectorIndex for SpFreshLayerDbIndex {
 
     fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
         let started = Instant::now();
-        let out = lock_read(&self.index).search(query, k);
+        let generation = self.active_generation.load(Ordering::Relaxed);
+        let out = match &*lock_read(&self.index) {
+            RuntimeSpFreshIndex::Resident(index) => index.search(query, k),
+            RuntimeSpFreshIndex::OffHeap(index) => {
+                let mut loader = Self::loader_for(&self.db, &self.vector_cache, generation, None);
+                match index.search_with(query, k, &mut loader) {
+                    Ok(out) => out,
+                    Err(err) => panic!("spfresh-layerdb offheap search failed: {err:#}"),
+                }
+            }
+        };
         self.stats
             .record_search(started.elapsed().as_micros() as u64);
         out
     }
 
     fn len(&self) -> usize {
-        lock_read(&self.index).len()
+        match &*lock_read(&self.index) {
+            RuntimeSpFreshIndex::Resident(index) => index.len(),
+            RuntimeSpFreshIndex::OffHeap(index) => index.len(),
+        }
     }
 }

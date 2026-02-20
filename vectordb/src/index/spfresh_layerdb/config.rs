@@ -26,6 +26,12 @@ pub(crate) struct SpFreshPersistedMeta {
     pub kmeans_iters: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpFreshMemoryMode {
+    Resident,
+    OffHeap,
+}
+
 #[derive(Clone, Debug)]
 pub struct SpFreshLayerDbConfig {
     pub spfresh: SpFreshConfig,
@@ -33,6 +39,8 @@ pub struct SpFreshLayerDbConfig {
     pub write_sync: bool,
     pub rebuild_pending_ops: usize,
     pub rebuild_interval: Duration,
+    pub memory_mode: SpFreshMemoryMode,
+    pub offheap_cache_capacity: usize,
 }
 
 impl Default for SpFreshLayerDbConfig {
@@ -46,6 +54,8 @@ impl Default for SpFreshLayerDbConfig {
             write_sync: true,
             rebuild_pending_ops: 2_000,
             rebuild_interval: Duration::from_millis(500),
+            memory_mode: SpFreshMemoryMode::Resident,
+            offheap_cache_capacity: 131_072,
         }
     }
 }

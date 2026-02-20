@@ -98,6 +98,57 @@ impl VectorCache {
     }
 }
 
+#[derive(Debug)]
+struct PostingMembersCache {
+    capacity: usize,
+    map: HashMap<(u64, usize), Arc<Vec<u64>>>,
+    order: VecDeque<(u64, usize)>,
+}
+
+impl PostingMembersCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, generation: u64, posting_id: usize) -> Option<Arc<Vec<u64>>> {
+        self.map.get(&(generation, posting_id)).cloned()
+    }
+
+    fn put_arc(&mut self, generation: u64, posting_id: usize, members: Arc<Vec<u64>>) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let std::collections::hash_map::Entry::Occupied(mut existing) =
+            self.map.entry((generation, posting_id))
+        {
+            existing.insert(members);
+            return;
+        }
+        if self.map.len() >= self.capacity {
+            while let Some(oldest) = self.order.pop_front() {
+                if self.map.remove(&oldest).is_some() {
+                    break;
+                }
+            }
+        }
+        self.order.push_back((generation, posting_id));
+        self.map.insert((generation, posting_id), members);
+    }
+
+    fn remove(&mut self, generation: u64, posting_id: usize) {
+        self.map.remove(&(generation, posting_id));
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
 pub struct SpFreshLayerDbIndex {
     cfg: SpFreshLayerDbConfig,
     db_path: PathBuf,
@@ -108,6 +159,7 @@ pub struct SpFreshLayerDbIndex {
     dirty_ids: Arc<Mutex<HashSet<u64>>>,
     pending_ops: Arc<AtomicUsize>,
     vector_cache: Arc<Mutex<VectorCache>>,
+    posting_members_cache: Arc<Mutex<PostingMembersCache>>,
     wal_next_seq: Arc<AtomicU64>,
     rebuild_tx: mpsc::Sender<()>,
     stop_worker: Arc<AtomicBool>,
@@ -168,6 +220,9 @@ impl SpFreshLayerDbIndex {
             RuntimeSpFreshIndex::OffHeapDiskMeta(_) => SpFreshMemoryMode::OffHeapDiskMeta,
         };
         let vector_cache = Arc::new(Mutex::new(VectorCache::new(cfg.offheap_cache_capacity)));
+        let posting_members_cache = Arc::new(Mutex::new(PostingMembersCache::new(
+            cfg.offheap_posting_cache_entries,
+        )));
         let replay_from = applied_wal_seq.map_or(0, |seq| seq.saturating_add(1));
         if replay_from < wal_next_seq {
             if matches!(index_state, RuntimeSpFreshIndex::OffHeapDiskMeta(_)) {
@@ -220,6 +275,7 @@ impl SpFreshLayerDbIndex {
             dirty_ids,
             pending_ops,
             vector_cache,
+            posting_members_cache,
             wal_next_seq,
             rebuild_tx,
             stop_worker,
@@ -386,6 +442,19 @@ impl SpFreshLayerDbIndex {
         }
     }
 
+    fn load_posting_members_for(
+        &self,
+        generation: u64,
+        posting_id: usize,
+    ) -> anyhow::Result<Arc<Vec<u64>>> {
+        if let Some(ids) = lock_mutex(&self.posting_members_cache).get(generation, posting_id) {
+            return Ok(ids);
+        }
+        let ids = Arc::new(load_posting_member_ids(&self.db, generation, posting_id)?);
+        lock_mutex(&self.posting_members_cache).put_arc(generation, posting_id, ids.clone());
+        Ok(ids)
+    }
+
     fn mark_dirty(&self, id: u64) {
         let mut dirty = lock_mutex(&self.dirty_ids);
         dirty.insert(id);
@@ -482,6 +551,7 @@ impl SpFreshLayerDbIndex {
             cache.map.clear();
             cache.order.clear();
         }
+        lock_mutex(&self.posting_members_cache).clear();
         lock_mutex(&self.dirty_ids).clear();
         self.pending_ops.store(0, Ordering::Relaxed);
         self.stats.set_last_rebuild_rows(rows.len());
@@ -604,6 +674,7 @@ impl SpFreshLayerDbIndex {
             };
             disk_new_posting = Some(chosen.unwrap_or(0));
         }
+        let disk_old_posting = disk_old.as_ref().map(|(posting, _)| *posting);
 
         let persist_started = Instant::now();
         let persist = if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
@@ -643,6 +714,15 @@ impl SpFreshLayerDbIndex {
             }
         }
         lock_mutex(&self.vector_cache).put(id, cache_vector);
+        if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
+            if let Some(new_posting) = disk_new_posting {
+                let mut members_cache = lock_mutex(&self.posting_members_cache);
+                members_cache.remove(generation, new_posting);
+                if let Some(old_posting) = disk_old_posting {
+                    members_cache.remove(generation, old_posting);
+                }
+            }
+        }
         if self.cfg.memory_mode != SpFreshMemoryMode::OffHeapDiskMeta {
             self.mark_dirty(id);
         }
@@ -669,6 +749,7 @@ impl SpFreshLayerDbIndex {
                 }
             }
         }
+        let disk_old_posting = disk_old.as_ref().map(|(posting, _)| *posting);
 
         let persist_started = Instant::now();
         let persist = if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
@@ -702,6 +783,11 @@ impl SpFreshLayerDbIndex {
             }
         };
         lock_mutex(&self.vector_cache).remove(id);
+        if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
+            if let Some(old_posting) = disk_old_posting {
+                lock_mutex(&self.posting_members_cache).remove(generation, old_posting);
+            }
+        }
         if deleted {
             if self.cfg.memory_mode != SpFreshMemoryMode::OffHeapDiskMeta {
                 self.mark_dirty(id);
@@ -814,9 +900,10 @@ impl VectorIndex for SpFreshLayerDbIndex {
                 let mut out = Vec::new();
                 let postings = index.choose_probe_postings(query, k);
                 for posting_id in postings {
-                    let member_ids = load_posting_member_ids(&self.db, generation, posting_id)
+                    let member_ids = self
+                        .load_posting_members_for(generation, posting_id)
                         .unwrap_or_else(|err| panic!("offheap-diskmeta load members failed: {err:#}"));
-                    for id in member_ids {
+                    for id in member_ids.iter().copied() {
                         let values = Self::load_vector_for_id(
                             &self.db,
                             &self.vector_cache,

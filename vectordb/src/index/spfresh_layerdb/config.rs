@@ -44,6 +44,7 @@ pub struct SpFreshLayerDbConfig {
     pub rebuild_interval: Duration,
     pub memory_mode: SpFreshMemoryMode,
     pub offheap_cache_capacity: usize,
+    pub offheap_posting_cache_entries: usize,
 }
 
 impl Default for SpFreshLayerDbConfig {
@@ -59,6 +60,7 @@ impl Default for SpFreshLayerDbConfig {
             rebuild_interval: Duration::from_millis(500),
             memory_mode: SpFreshMemoryMode::Resident,
             offheap_cache_capacity: 131_072,
+            offheap_posting_cache_entries: 2_048,
         }
     }
 }

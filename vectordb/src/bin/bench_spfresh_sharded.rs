@@ -45,6 +45,8 @@ struct Args {
     durable: bool,
     #[arg(long, default_value_t = false)]
     offheap: bool,
+    #[arg(long, default_value_t = false)]
+    diskmeta: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +72,9 @@ fn main() -> Result<()> {
     }
     if args.nprobe == 0 {
         anyhow::bail!("--nprobe must be > 0");
+    }
+    if args.offheap && args.diskmeta {
+        anyhow::bail!("--offheap and --diskmeta are mutually exclusive");
     }
 
     let dataset: Dataset = serde_json::from_slice(
@@ -122,13 +127,18 @@ fn main() -> Result<()> {
         rebuild_interval: Duration::from_millis(args.rebuild_interval_ms.max(1)),
         ..Default::default()
     };
-    if args.offheap {
-        shard_cfg.memory_mode = SpFreshMemoryMode::OffHeap;
-    }
+    shard_cfg.memory_mode = if args.diskmeta {
+        SpFreshMemoryMode::OffHeapDiskMeta
+    } else if args.offheap {
+        SpFreshMemoryMode::OffHeap
+    } else {
+        SpFreshMemoryMode::Resident
+    };
     if !args.durable {
         shard_cfg.write_sync = false;
         shard_cfg.db_options.fsync_writes = false;
     }
+    let memory_mode = shard_cfg.memory_mode;
     let cfg = SpFreshLayerDbShardedConfig {
         shard_count: args.shards,
         shard: shard_cfg,
@@ -183,6 +193,8 @@ fn main() -> Result<()> {
         "reassign_range": args.reassign_range,
         "durable": args.durable,
         "offheap": args.offheap,
+        "diskmeta": args.diskmeta,
+        "memory_mode": format!("{:?}", memory_mode),
         "build_ms": build_ms,
         "update_qps": update_qps,
         "search_qps": search_qps,

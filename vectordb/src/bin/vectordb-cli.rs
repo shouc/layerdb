@@ -67,6 +67,8 @@ struct BenchArgs {
     spfresh_shards: usize,
     #[arg(long, default_value_t = false)]
     spfresh_offheap: bool,
+    #[arg(long, default_value_t = false)]
+    spfresh_diskmeta: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -151,6 +153,9 @@ struct EngineStats {
 fn run_bench(args: &BenchArgs) -> Result<()> {
     if args.k == 0 {
         anyhow::bail!("--k must be > 0");
+    }
+    if args.spfresh_offheap && args.spfresh_diskmeta {
+        anyhow::bail!("--spfresh-offheap and --spfresh-diskmeta are mutually exclusive");
     }
     let data = generate_synthetic(&SyntheticConfig {
         seed: args.seed,
@@ -457,9 +462,13 @@ fn bench_spfresh_layerdb(
         ..Default::default()
     };
     let mut cfg = cfg;
-    if args.spfresh_offheap {
-        cfg.memory_mode = SpFreshMemoryMode::OffHeap;
-    }
+    cfg.memory_mode = if args.spfresh_diskmeta {
+        SpFreshMemoryMode::OffHeapDiskMeta
+    } else if args.spfresh_offheap {
+        SpFreshMemoryMode::OffHeap
+    } else {
+        SpFreshMemoryMode::Resident
+    };
 
     let db_dir = tempfile::TempDir::new()?;
 
@@ -519,9 +528,13 @@ fn bench_spfresh_layerdb_sharded(
         },
     };
     let mut cfg = cfg;
-    if args.spfresh_offheap {
-        cfg.shard.memory_mode = SpFreshMemoryMode::OffHeap;
-    }
+    cfg.shard.memory_mode = if args.spfresh_diskmeta {
+        SpFreshMemoryMode::OffHeapDiskMeta
+    } else if args.spfresh_offheap {
+        SpFreshMemoryMode::OffHeap
+    } else {
+        SpFreshMemoryMode::Resident
+    };
 
     let db_dir = tempfile::TempDir::new()?;
 

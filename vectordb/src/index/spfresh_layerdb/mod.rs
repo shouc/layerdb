@@ -28,8 +28,8 @@ use rebuilder::{rebuild_once, spawn_rebuilder, RebuilderRuntime};
 use stats::SpFreshLayerDbStatsInner;
 use storage::{
     encode_wal_entry, ensure_active_generation, ensure_metadata, ensure_wal_exists,
-    ensure_wal_next_seq, load_index_checkpoint_bytes, load_metadata, load_posting_assignment,
-    load_posting_assignments, load_posting_members, load_row, load_rows, load_wal_entries_since,
+    ensure_wal_next_seq, load_index_checkpoint_bytes, load_metadata, load_posting_assignments,
+    load_posting_members, load_row, load_rows, load_wal_entries_since,
     persist_index_checkpoint_bytes, posting_assignment_value, posting_map_key, posting_map_prefix,
     posting_member_key, posting_member_value, posting_members_generation_prefix,
     prefix_exclusive_end, prune_wal_before, refresh_read_snapshot, set_active_generation,
@@ -749,14 +749,6 @@ impl SpFreshLayerDbIndex {
         rebuild_once(&runtime)
     }
 
-    fn persist_with_wal_ops(
-        &self,
-        wal_entry: IndexWalEntry,
-        ops: Vec<layerdb::Op>,
-    ) -> anyhow::Result<()> {
-        self.persist_with_wal_batch_ops(vec![(wal_entry, ops)])
-    }
-
     fn persist_with_wal_batch_ops(
         &self,
         entries: Vec<(IndexWalEntry, Vec<layerdb::Op>)>,
@@ -797,88 +789,6 @@ impl SpFreshLayerDbIndex {
             })?;
         self.wal_next_seq.store(next_seq, Ordering::Relaxed);
         Ok(())
-    }
-
-    fn persist_upsert(&self, id: u64, vector: &[f32]) -> anyhow::Result<()> {
-        let generation = self.active_generation.load(Ordering::Relaxed);
-        let row = VectorRecord::new(id, vector.to_vec());
-        let value = bincode::serialize(&row).context("serialize vector row")?;
-        self.persist_with_wal_ops(
-            IndexWalEntry::Upsert {
-                id,
-                vector: vector.to_vec(),
-            },
-            vec![layerdb::Op::put(vector_key(generation, id), value)],
-        )
-    }
-
-    fn persist_delete(&self, id: u64) -> anyhow::Result<()> {
-        let generation = self.active_generation.load(Ordering::Relaxed);
-        self.persist_with_wal_ops(
-            IndexWalEntry::Delete { id },
-            vec![layerdb::Op::delete(vector_key(generation, id))],
-        )
-    }
-
-    fn persist_diskmeta_upsert(
-        &self,
-        generation: u64,
-        id: u64,
-        vector: &[f32],
-        old: Option<(usize, Vec<f32>)>,
-        new_posting: usize,
-    ) -> anyhow::Result<()> {
-        let row = VectorRecord::new(id, vector.to_vec());
-        let value = bincode::serialize(&row).context("serialize vector row")?;
-        let mut ops = vec![
-            layerdb::Op::put(vector_key(generation, id), value),
-            layerdb::Op::put(
-                posting_map_key(generation, id),
-                posting_assignment_value(new_posting)?,
-            ),
-            layerdb::Op::put(
-                posting_member_key(generation, new_posting, id),
-                posting_member_value(id, vector)?,
-            ),
-        ];
-        if let Some((old_posting, _)) = &old {
-            if *old_posting != new_posting {
-                ops.push(layerdb::Op::delete(posting_member_key(
-                    generation,
-                    *old_posting,
-                    id,
-                )));
-            }
-        }
-        self.persist_with_wal_ops(
-            IndexWalEntry::DiskMetaUpsert {
-                id,
-                old,
-                new_posting,
-                new_vector: vector.to_vec(),
-            },
-            ops,
-        )
-    }
-
-    fn persist_diskmeta_delete(
-        &self,
-        generation: u64,
-        id: u64,
-        old: Option<(usize, Vec<f32>)>,
-    ) -> anyhow::Result<()> {
-        let mut ops = vec![
-            layerdb::Op::delete(vector_key(generation, id)),
-            layerdb::Op::delete(posting_map_key(generation, id)),
-        ];
-        if let Some((old_posting, _)) = &old {
-            ops.push(layerdb::Op::delete(posting_member_key(
-                generation,
-                *old_posting,
-                id,
-            )));
-        }
-        self.persist_with_wal_ops(IndexWalEntry::DiskMetaDelete { id, old }, ops)
     }
 
     fn dedup_last_upserts(rows: &[VectorRecord]) -> Vec<(u64, Vec<f32>)> {
@@ -1279,160 +1189,13 @@ impl SpFreshLayerDbIndex {
     }
 
     pub fn try_upsert(&mut self, id: u64, vector: Vec<f32>) -> anyhow::Result<()> {
-        if vector.len() != self.cfg.spfresh.dim {
-            anyhow::bail!(
-                "invalid vector dim for id={id}: got {}, expected {}",
-                vector.len(),
-                self.cfg.spfresh.dim
-            );
-        }
-
-        let _update_guard = lock_read(&self.update_gate);
-        let generation = self.active_generation.load(Ordering::Relaxed);
-        let mut disk_old: Option<(usize, Vec<f32>)> = None;
-        let mut disk_new_posting: Option<usize> = None;
-        if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
-            let old_posting = load_posting_assignment(&self.db, generation, id)?;
-            let old_row = load_row(&self.db, generation, id)?;
-            if let Some(old_posting) = old_posting {
-                if let Some(old_row) = old_row {
-                    disk_old = Some((old_posting, old_row.values));
-                }
-            }
-            let chosen = match &*lock_read(&self.index) {
-                RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.choose_posting(&vector),
-                _ => None,
-            };
-            disk_new_posting = Some(chosen.unwrap_or(0));
-        }
-        let disk_old_posting = disk_old.as_ref().map(|(posting, _)| *posting);
-
-        let persist_started = Instant::now();
-        let persist = if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
-            self.persist_diskmeta_upsert(
-                generation,
-                id,
-                &vector,
-                disk_old.clone(),
-                disk_new_posting.unwrap_or(0),
-            )
-        } else {
-            self.persist_upsert(id, &vector)
-        };
-        if let Err(err) = persist {
-            self.stats
-                .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
-            self.stats.inc_persist_errors();
-            return Err(err);
-        }
-        self.stats
-            .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
-        let cache_vector = vector.clone();
-        {
-            let mut index = lock_write(&self.index);
-            match &mut *index {
-                RuntimeSpFreshIndex::Resident(index) => index.upsert(id, vector.clone()),
-                RuntimeSpFreshIndex::OffHeap(index) => {
-                    let mut loader = Self::loader_for(
-                        &self.db,
-                        &self.vector_cache,
-                        generation,
-                        Some((id, vector.clone())),
-                    );
-                    index
-                        .upsert_with(id, vector, &mut loader)
-                        .with_context(|| format!("offheap upsert id={id}"))?;
-                }
-                RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
-                    index.apply_upsert(disk_old, disk_new_posting.unwrap_or(0), vector);
-                }
-            }
-        }
-        lock_mutex(&self.vector_cache).put(id, cache_vector);
-        if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
-            if let Some(new_posting) = disk_new_posting {
-                let mut members_cache = lock_mutex(&self.posting_members_cache);
-                members_cache.remove(generation, new_posting);
-                if let Some(old_posting) = disk_old_posting {
-                    members_cache.remove(generation, old_posting);
-                }
-            }
-        }
-        if self.cfg.memory_mode != SpFreshMemoryMode::OffHeapDiskMeta {
-            self.mark_dirty(id);
-        }
-        self.stats.inc_upserts();
-        if self.cfg.memory_mode != SpFreshMemoryMode::OffHeapDiskMeta {
-            let pending = self.pending_ops.load(Ordering::Relaxed);
-            if pending == self.cfg.rebuild_pending_ops.max(1) {
-                let _ = self.rebuild_tx.send(());
-            }
-        }
+        let row = VectorRecord::new(id, vector);
+        let _ = self.try_upsert_batch(&[row])?;
         Ok(())
     }
 
     pub fn try_delete(&mut self, id: u64) -> anyhow::Result<bool> {
-        let _update_guard = lock_read(&self.update_gate);
-        let generation = self.active_generation.load(Ordering::Relaxed);
-        let mut disk_old: Option<(usize, Vec<f32>)> = None;
-        if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
-            let old_posting = load_posting_assignment(&self.db, generation, id)?;
-            let old_row = load_row(&self.db, generation, id)?;
-            if let Some(old_posting) = old_posting {
-                if let Some(old_row) = old_row {
-                    disk_old = Some((old_posting, old_row.values));
-                }
-            }
-        }
-        let disk_old_posting = disk_old.as_ref().map(|(posting, _)| *posting);
-
-        let persist_started = Instant::now();
-        let persist = if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
-            self.persist_diskmeta_delete(generation, id, disk_old.clone())
-        } else {
-            self.persist_delete(id)
-        };
-        if let Err(err) = persist {
-            self.stats
-                .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
-            self.stats.inc_persist_errors();
-            return Err(err);
-        }
-        self.stats
-            .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
-        let deleted = {
-            let mut index = lock_write(&self.index);
-            match &mut *index {
-                RuntimeSpFreshIndex::Resident(index) => index.delete(id),
-                RuntimeSpFreshIndex::OffHeap(index) => {
-                    let mut loader =
-                        Self::loader_for(&self.db, &self.vector_cache, generation, None);
-                    index
-                        .delete_with(id, &mut loader)
-                        .with_context(|| format!("offheap delete id={id}"))?
-                }
-                RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.apply_delete(disk_old),
-            }
-        };
-        lock_mutex(&self.vector_cache).remove(id);
-        if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
-            if let Some(old_posting) = disk_old_posting {
-                lock_mutex(&self.posting_members_cache).remove(generation, old_posting);
-            }
-        }
-        if deleted {
-            if self.cfg.memory_mode != SpFreshMemoryMode::OffHeapDiskMeta {
-                self.mark_dirty(id);
-            }
-            self.stats.inc_deletes();
-            if self.cfg.memory_mode != SpFreshMemoryMode::OffHeapDiskMeta {
-                let pending = self.pending_ops.load(Ordering::Relaxed);
-                if pending == self.cfg.rebuild_pending_ops.max(1) {
-                    let _ = self.rebuild_tx.send(());
-                }
-            }
-        }
-        Ok(deleted)
+        Ok(self.try_delete_batch(&[id])? > 0)
     }
 
     pub fn close(mut self) -> anyhow::Result<()> {

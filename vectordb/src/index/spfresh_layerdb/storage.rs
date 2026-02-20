@@ -356,6 +356,7 @@ pub(crate) fn posting_assignment_value(posting_id: usize) -> anyhow::Result<Vec<
     bincode::serialize(&pid).context("encode posting assignment value")
 }
 
+#[allow(dead_code)]
 pub(crate) fn load_posting_assignment(
     db: &Db,
     generation: u64,

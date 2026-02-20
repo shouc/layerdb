@@ -389,6 +389,30 @@ Ratios (SPFresh / LanceDB):
 - search_qps: `1.45x`
 - update_qps: `0.167x`
 
+## G) Diskmeta row-v2 layout for update throughput
+
+Implemented:
+- Added vector-row v2 payload (`vr2`) with embedded optional `posting_id`.
+- Diskmeta upserts now persist row+posting assignment in one row write and no longer require
+  separate posting-assignment writes.
+- Diskmeta state lookup now reads row payload first and only falls back to legacy posting-map keys
+  when v2 assignment is absent.
+- Rebuild path can recover assignments from row payload (plus legacy fallback), so startup does not
+  depend on posting-map keys for new data.
+
+Observed benchmark impact on the gate profile (`dim=64, base=10000, updates=2000, queries=200`):
+- SPFresh-sharded diskmeta:
+  - update_qps: `69340.41`
+  - search_qps: `1486.97`
+  - recall@k: `1.0000`
+- LanceDB IVF-flat:
+  - update_qps: `125796.05`
+  - search_qps: `854.65`
+  - recall@k: `0.4450`
+- Ratios (SPFresh / LanceDB):
+  - update_qps: `0.551x`
+  - search_qps: `1.740x`
+
 ## Production Readiness Checks Performed
 
 - `cargo clippy -p vectordb --all-targets -- -D warnings`

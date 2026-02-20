@@ -84,8 +84,9 @@ cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
   - `SpFreshMemoryMode::OffHeap`: keeps SPFresh posting metadata in RAM and loads vector
     payloads from LayerDB on demand (with cache via `offheap_cache_capacity`).
   - `SpFreshMemoryMode::OffHeapDiskMeta`: keeps centroids/statistics in RAM while storing
-    vector payload, `id -> posting`, and `posting -> member ids` in LayerDB. Hot posting
-    lists are cached in memory (`offheap_posting_cache_entries`).
+    vector payload, `id -> posting`, and `posting -> member` metadata in LayerDB. Hot posting
+    lists are cached in memory (`offheap_posting_cache_entries`), and posting scans can prefill
+    vector cache from persisted member payloads.
 - prefer fallible APIs in services:
   - `try_upsert`, `try_delete`, `try_bulk_load`
   - `open_existing` to recover config from persisted metadata

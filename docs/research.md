@@ -160,6 +160,15 @@ Implementation:
 - New disk-metadata core: `vectordb/src/index/spfresh_diskmeta.rs`
 - LayerDB runtime enum + checkpoint support for resident/offheap/diskmeta:
   `vectordb/src/index/spfresh_layerdb/mod.rs`
+- Diskmeta build now reuses offheap split/merge topology at build time and exports
+  centroid/size + id->posting metadata from offheap:
+  `vectordb/src/index/spfresh_offheap.rs`, `vectordb/src/index/spfresh_diskmeta.rs`
+- Diskmeta posting-member values now persist vector payloads (with legacy id-only decode fallback),
+  allowing posting scans to prefill vector cache and reduce random point lookups:
+  `vectordb/src/index/spfresh_layerdb/storage.rs`, `vectordb/src/index/spfresh_layerdb/mod.rs`
+- Search ranking now uses partial top-k selection (`select_nth_unstable_by`) instead of full candidate sort:
+  `vectordb/src/index/spfresh.rs`, `vectordb/src/index/spfresh_offheap.rs`,
+  `vectordb/src/index/spfresh_layerdb/mod.rs`
 - Rebuilder support in offheap mode:
   `vectordb/src/index/spfresh_layerdb/rebuilder.rs`
 - New tests:
@@ -180,28 +189,28 @@ All runs used the same exported datasets and `k=10`.
 Dataset: `dim=64, base=10000, updates=2000, queries=200`
 
 LanceDB (`nlist=96, nprobe=8, update-batch=128`):
-- build_ms: 164.93
-- update_qps: 8751.23
-- search_qps: 419.59
-- recall@k: 0.4640
+- build_ms: 113.96
+- update_qps: 21181.33
+- search_qps: 512.50
+- recall@k: 0.4685
 
 SPFresh-sharded (`shards=4, nprobe=8`, non-durable mode):
-- build_ms: 525.31
-- update_qps: 6451.03
-- search_qps: 1395.50
+- build_ms: 534.00
+- update_qps: 9840.76
+- search_qps: 2471.31
 - recall@k: 1.0000
 
 SPFresh-sharded offheap (`shards=4, nprobe=8`, non-durable mode):
-- build_ms: 620.38
-- update_qps: 3574.66
-- search_qps: 660.61
+- build_ms: 548.03
+- update_qps: 3140.32
+- search_qps: 965.02
 - recall@k: 1.0000
 
 SPFresh-sharded diskmeta (`shards=4, nprobe=8`, non-durable mode):
-- build_ms: 555.86
-- update_qps: 2373.68
-- search_qps: 104.98
-- recall@k: 0.9955
+- build_ms: 538.54
+- update_qps: 3840.34
+- search_qps: 365.71
+- recall@k: 0.9810
 
 ### Small dataset
 
@@ -231,9 +240,10 @@ Interpretation:
 - Durable SPFresh mode trades update throughput for stronger write durability, as expected.
 - Offheap SPFresh substantially reduces memory residency pressure while preserving recall;
   throughput drops versus resident mode due to on-demand vector loads.
-- Diskmeta mode pushes memory usage lower by moving posting metadata to LayerDB; current
-  implementation is update-safe and restart-safe, but search throughput is significantly lower
-  than resident/offheap and remains below LanceDB in this benchmark.
+- Diskmeta mode pushes memory usage lower by moving posting metadata to LayerDB; after
+  topology reuse + posting-value cache-prefill optimizations, it is materially faster than the
+  prior implementation while staying restart-safe/update-safe. It remains below LanceDB on
+  pure search QPS in this profile, but with substantially higher recall.
 
 ## Production Readiness Checks Performed
 

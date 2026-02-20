@@ -752,15 +752,30 @@ impl SpFreshLayerDbIndex {
     fn persist_with_wal_ops(
         &self,
         wal_entry: IndexWalEntry,
-        mut ops: Vec<layerdb::Op>,
+        ops: Vec<layerdb::Op>,
     ) -> anyhow::Result<()> {
-        let seq = self.wal_next_seq.load(Ordering::Relaxed);
-        let next_seq = seq
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("spfresh wal sequence overflow"))?;
-        let wal_value = encode_wal_entry(&wal_entry)?;
+        self.persist_with_wal_batch_ops(vec![(wal_entry, ops)])
+    }
+
+    fn persist_with_wal_batch_ops(
+        &self,
+        entries: Vec<(IndexWalEntry, Vec<layerdb::Op>)>,
+    ) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let start_seq = self.wal_next_seq.load(Ordering::Relaxed);
+        let mut next_seq = start_seq;
+        let mut ops = Vec::new();
+        for (entry, mut row_ops) in entries {
+            let wal_value = encode_wal_entry(&entry)?;
+            row_ops.push(layerdb::Op::put(wal_key(next_seq), wal_value));
+            ops.extend(row_ops);
+            next_seq = next_seq
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("spfresh wal sequence overflow"))?;
+        }
         let wal_next = bincode::serialize(&next_seq).context("encode spfresh wal next seq")?;
-        ops.push(layerdb::Op::put(wal_key(seq), wal_value));
         ops.push(layerdb::Op::put(
             config::META_INDEX_WAL_NEXT_SEQ_KEY,
             wal_next,
@@ -772,7 +787,14 @@ impl SpFreshLayerDbIndex {
                     sync: self.cfg.write_sync,
                 },
             )
-            .with_context(|| format!("persist vector+wal id={} seq={seq}", wal_entry.id()))?;
+            .with_context(|| {
+                format!(
+                    "persist vector+wal batch count={} seq_start={} seq_end={}",
+                    next_seq.saturating_sub(start_seq),
+                    start_seq,
+                    next_seq.saturating_sub(1)
+                )
+            })?;
         self.wal_next_seq.store(next_seq, Ordering::Relaxed);
         Ok(())
     }
@@ -857,6 +879,403 @@ impl SpFreshLayerDbIndex {
             )));
         }
         self.persist_with_wal_ops(IndexWalEntry::DiskMetaDelete { id, old }, ops)
+    }
+
+    fn dedup_last_upserts(rows: &[VectorRecord]) -> Vec<(u64, Vec<f32>)> {
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut out_rev = Vec::with_capacity(rows.len());
+        for row in rows.iter().rev() {
+            if seen.insert(row.id) {
+                out_rev.push((row.id, row.values.clone()));
+            }
+        }
+        out_rev.reverse();
+        out_rev
+    }
+
+    fn dedup_ids(ids: &[u64]) -> Vec<u64> {
+        let mut seen = HashSet::with_capacity(ids.len());
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if seen.insert(*id) {
+                out.push(*id);
+            }
+        }
+        out
+    }
+
+    fn load_diskmeta_states_for_ids(
+        &self,
+        generation: u64,
+        ids: &[u64],
+    ) -> anyhow::Result<HashMap<u64, Option<(usize, Vec<f32>)>>> {
+        let mut out = HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return Ok(out);
+        }
+
+        let posting_keys: Vec<Bytes> = ids
+            .iter()
+            .map(|id| Bytes::from(posting_map_key(generation, *id)))
+            .collect();
+        let row_keys: Vec<Bytes> = ids
+            .iter()
+            .map(|id| Bytes::from(vector_key(generation, *id)))
+            .collect();
+        let posting_values = self
+            .db
+            .multi_get(&posting_keys, ReadOptions::default())
+            .context("diskmeta multi_get posting assignments")?;
+        let row_values = self
+            .db
+            .multi_get(&row_keys, ReadOptions::default())
+            .context("diskmeta multi_get vector rows")?;
+
+        for ((id, posting_raw), row_raw) in ids
+            .iter()
+            .copied()
+            .zip(posting_values.into_iter())
+            .zip(row_values.into_iter())
+        {
+            let posting = match posting_raw {
+                Some(raw) => {
+                    let pid_u64: u64 = bincode::deserialize(raw.as_ref())
+                        .with_context(|| format!("decode posting assignment id={id}"))?;
+                    Some(usize::try_from(pid_u64).context("posting id does not fit usize")?)
+                }
+                None => None,
+            };
+            let row = match row_raw {
+                Some(raw) => Some(
+                    bincode::deserialize::<VectorRecord>(raw.as_ref()).with_context(|| {
+                        format!("decode vector row id={id} generation={generation}")
+                    })?,
+                ),
+                None => None,
+            };
+            let state = match (posting, row) {
+                (Some(posting), Some(row)) if !row.deleted => Some((posting, row.values)),
+                _ => None,
+            };
+            out.insert(id, state);
+        }
+        Ok(out)
+    }
+
+    pub fn try_upsert_batch(&mut self, rows: &[VectorRecord]) -> anyhow::Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        for row in rows {
+            if row.values.len() != self.cfg.spfresh.dim {
+                anyhow::bail!(
+                    "invalid vector dim for id={}: got {}, expected {}",
+                    row.id,
+                    row.values.len(),
+                    self.cfg.spfresh.dim
+                );
+            }
+        }
+
+        // Last-write-wins dedup keeps persistence/apply work proportional to unique ids.
+        let mutations = Self::dedup_last_upserts(rows);
+        if mutations.is_empty() {
+            return Ok(0);
+        }
+
+        let _update_guard = lock_read(&self.update_gate);
+        let generation = self.active_generation.load(Ordering::Relaxed);
+        let persist_started = Instant::now();
+
+        if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
+            let ids: Vec<u64> = mutations.iter().map(|(id, _)| *id).collect();
+            let mut states = self.load_diskmeta_states_for_ids(generation, &ids)?;
+            let mut shadow = match &*lock_read(&self.index) {
+                RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.clone(),
+                _ => anyhow::bail!("diskmeta upsert batch called for non-diskmeta index"),
+            };
+
+            let mut persist_entries = Vec::with_capacity(mutations.len());
+            let mut apply_entries = Vec::with_capacity(mutations.len());
+            for (id, vector) in &mutations {
+                let old = states.get(id).cloned().unwrap_or(None);
+                let new_posting = shadow.choose_posting(vector).unwrap_or(0);
+                let row = VectorRecord::new(*id, vector.clone());
+                let value = bincode::serialize(&row).context("serialize vector row")?;
+                let mut ops = vec![
+                    layerdb::Op::put(vector_key(generation, *id), value),
+                    layerdb::Op::put(
+                        posting_map_key(generation, *id),
+                        posting_assignment_value(new_posting)?,
+                    ),
+                    layerdb::Op::put(
+                        posting_member_key(generation, new_posting, *id),
+                        posting_member_value(*id, vector)?,
+                    ),
+                ];
+                if let Some((old_posting, _)) = &old {
+                    if *old_posting != new_posting {
+                        ops.push(layerdb::Op::delete(posting_member_key(
+                            generation,
+                            *old_posting,
+                            *id,
+                        )));
+                    }
+                }
+                persist_entries.push((
+                    IndexWalEntry::DiskMetaUpsert {
+                        id: *id,
+                        old: old.clone(),
+                        new_posting,
+                        new_vector: vector.clone(),
+                    },
+                    ops,
+                ));
+                apply_entries.push((*id, old.clone(), new_posting, vector.clone()));
+                shadow.apply_upsert(old, new_posting, vector.clone());
+                states.insert(*id, Some((new_posting, vector.clone())));
+            }
+
+            if let Err(err) = self.persist_with_wal_batch_ops(persist_entries) {
+                self.stats
+                    .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
+                self.stats.inc_persist_errors();
+                return Err(err);
+            }
+            self.stats
+                .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
+
+            let mut touched_postings = HashSet::new();
+            {
+                let mut index = lock_write(&self.index);
+                let RuntimeSpFreshIndex::OffHeapDiskMeta(index) = &mut *index else {
+                    anyhow::bail!("diskmeta upsert batch called for non-diskmeta runtime");
+                };
+                for (_id, old, new_posting, vector) in apply_entries {
+                    if let Some((old_posting, _)) = &old {
+                        touched_postings.insert(*old_posting);
+                    }
+                    touched_postings.insert(new_posting);
+                    index.apply_upsert(old, new_posting, vector);
+                }
+            }
+            {
+                let mut cache = lock_mutex(&self.vector_cache);
+                for (id, vector) in &mutations {
+                    cache.put(*id, vector.clone());
+                }
+            }
+            if !touched_postings.is_empty() {
+                let mut members_cache = lock_mutex(&self.posting_members_cache);
+                for posting in touched_postings {
+                    members_cache.remove(generation, posting);
+                }
+            }
+            for _ in 0..mutations.len() {
+                self.stats.inc_upserts();
+            }
+            return Ok(mutations.len());
+        }
+
+        let mut persist_entries = Vec::with_capacity(mutations.len());
+        for (id, vector) in &mutations {
+            let row = VectorRecord::new(*id, vector.clone());
+            let value = bincode::serialize(&row).context("serialize vector row")?;
+            persist_entries.push((
+                IndexWalEntry::Upsert {
+                    id: *id,
+                    vector: vector.clone(),
+                },
+                vec![layerdb::Op::put(vector_key(generation, *id), value)],
+            ));
+        }
+        if let Err(err) = self.persist_with_wal_batch_ops(persist_entries) {
+            self.stats
+                .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
+            self.stats.inc_persist_errors();
+            return Err(err);
+        }
+        self.stats
+            .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
+
+        {
+            let mut index = lock_write(&self.index);
+            for (id, vector) in &mutations {
+                match &mut *index {
+                    RuntimeSpFreshIndex::Resident(index) => index.upsert(*id, vector.clone()),
+                    RuntimeSpFreshIndex::OffHeap(index) => {
+                        let mut loader = Self::loader_for(
+                            &self.db,
+                            &self.vector_cache,
+                            generation,
+                            Some((*id, vector.clone())),
+                        );
+                        index
+                            .upsert_with(*id, vector.clone(), &mut loader)
+                            .with_context(|| format!("offheap upsert id={id}"))?;
+                    }
+                    RuntimeSpFreshIndex::OffHeapDiskMeta(_) => {
+                        anyhow::bail!("non-diskmeta upsert batch called for diskmeta runtime");
+                    }
+                }
+            }
+        }
+        {
+            let mut cache = lock_mutex(&self.vector_cache);
+            for (id, vector) in &mutations {
+                cache.put(*id, vector.clone());
+            }
+        }
+        for (id, _) in &mutations {
+            self.mark_dirty(*id);
+        }
+        for _ in 0..mutations.len() {
+            self.stats.inc_upserts();
+        }
+        let pending = self.pending_ops.load(Ordering::Relaxed);
+        if pending >= self.cfg.rebuild_pending_ops.max(1) {
+            let _ = self.rebuild_tx.send(());
+        }
+        Ok(mutations.len())
+    }
+
+    pub fn try_delete_batch(&mut self, ids: &[u64]) -> anyhow::Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mutations = Self::dedup_ids(ids);
+        if mutations.is_empty() {
+            return Ok(0);
+        }
+
+        let _update_guard = lock_read(&self.update_gate);
+        let generation = self.active_generation.load(Ordering::Relaxed);
+        let persist_started = Instant::now();
+
+        if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
+            let states = self.load_diskmeta_states_for_ids(generation, &mutations)?;
+            let mut persist_entries = Vec::with_capacity(mutations.len());
+            let mut apply_entries = Vec::with_capacity(mutations.len());
+            for id in &mutations {
+                let old = states.get(id).cloned().unwrap_or(None);
+                let mut ops = vec![
+                    layerdb::Op::delete(vector_key(generation, *id)),
+                    layerdb::Op::delete(posting_map_key(generation, *id)),
+                ];
+                if let Some((old_posting, _)) = &old {
+                    ops.push(layerdb::Op::delete(posting_member_key(
+                        generation,
+                        *old_posting,
+                        *id,
+                    )));
+                }
+                persist_entries.push((
+                    IndexWalEntry::DiskMetaDelete {
+                        id: *id,
+                        old: old.clone(),
+                    },
+                    ops,
+                ));
+                apply_entries.push((*id, old));
+            }
+            if let Err(err) = self.persist_with_wal_batch_ops(persist_entries) {
+                self.stats
+                    .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
+                self.stats.inc_persist_errors();
+                return Err(err);
+            }
+            self.stats
+                .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
+
+            let mut deleted = 0usize;
+            let mut touched_postings = HashSet::new();
+            {
+                let mut index = lock_write(&self.index);
+                let RuntimeSpFreshIndex::OffHeapDiskMeta(index) = &mut *index else {
+                    anyhow::bail!("diskmeta delete batch called for non-diskmeta runtime");
+                };
+                for (_id, old) in apply_entries {
+                    if let Some((old_posting, _)) = &old {
+                        touched_postings.insert(*old_posting);
+                    }
+                    if index.apply_delete(old) {
+                        deleted += 1;
+                    }
+                }
+            }
+            {
+                let mut cache = lock_mutex(&self.vector_cache);
+                for id in &mutations {
+                    cache.remove(*id);
+                }
+            }
+            if !touched_postings.is_empty() {
+                let mut members_cache = lock_mutex(&self.posting_members_cache);
+                for posting in touched_postings {
+                    members_cache.remove(generation, posting);
+                }
+            }
+            for _ in 0..deleted {
+                self.stats.inc_deletes();
+            }
+            return Ok(deleted);
+        }
+
+        let mut persist_entries = Vec::with_capacity(mutations.len());
+        for id in &mutations {
+            persist_entries.push((
+                IndexWalEntry::Delete { id: *id },
+                vec![layerdb::Op::delete(vector_key(generation, *id))],
+            ));
+        }
+        if let Err(err) = self.persist_with_wal_batch_ops(persist_entries) {
+            self.stats
+                .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
+            self.stats.inc_persist_errors();
+            return Err(err);
+        }
+        self.stats
+            .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
+
+        let mut deleted = 0usize;
+        {
+            let mut index = lock_write(&self.index);
+            for id in &mutations {
+                let was_deleted = match &mut *index {
+                    RuntimeSpFreshIndex::Resident(index) => index.delete(*id),
+                    RuntimeSpFreshIndex::OffHeap(index) => {
+                        let mut loader =
+                            Self::loader_for(&self.db, &self.vector_cache, generation, None);
+                        index
+                            .delete_with(*id, &mut loader)
+                            .with_context(|| format!("offheap delete id={id}"))?
+                    }
+                    RuntimeSpFreshIndex::OffHeapDiskMeta(_) => {
+                        anyhow::bail!("non-diskmeta delete batch called for diskmeta runtime");
+                    }
+                };
+                if was_deleted {
+                    deleted += 1;
+                    self.mark_dirty(*id);
+                }
+            }
+        }
+        {
+            let mut cache = lock_mutex(&self.vector_cache);
+            for id in &mutations {
+                cache.remove(*id);
+            }
+        }
+        for _ in 0..deleted {
+            self.stats.inc_deletes();
+        }
+        if deleted > 0 {
+            let pending = self.pending_ops.load(Ordering::Relaxed);
+            if pending >= self.cfg.rebuild_pending_ops.max(1) {
+                let _ = self.rebuild_tx.send(());
+            }
+        }
+        Ok(deleted)
     }
 
     pub fn try_upsert(&mut self, id: u64, vector: Vec<f32>) -> anyhow::Result<()> {

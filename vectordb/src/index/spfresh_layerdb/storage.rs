@@ -280,18 +280,6 @@ pub(crate) enum IndexWalEntry {
     },
 }
 
-impl IndexWalEntry {
-    pub(crate) fn id(&self) -> u64 {
-        match self {
-            Self::Upsert { id, .. } => *id,
-            Self::Delete { id } => *id,
-            Self::IdOnly { id } => *id,
-            Self::DiskMetaUpsert { id, .. } => *id,
-            Self::DiskMetaDelete { id, .. } => *id,
-        }
-    }
-}
-
 pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>> {
     bincode::serialize(entry).context("encode wal entry")
 }

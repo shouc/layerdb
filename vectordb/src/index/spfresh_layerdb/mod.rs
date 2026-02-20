@@ -1488,18 +1488,16 @@ impl SpFreshLayerDbIndex {
                     .context("serialize vector row")?;
                 let upsert_event_seq = posting_event_next_seq;
                 posting_event_next_seq = posting_event_next_seq.saturating_add(1);
-                let mut ops = vec![
-                    layerdb::Op::put(vector_key(generation, *id), value),
-                    layerdb::Op::put(
-                        posting_member_event_key(generation, new_posting, upsert_event_seq, *id),
-                        posting_member_event_upsert_value_with_residual(*id, vector, centroid)?,
-                    ),
-                ];
+                batch_ops.push(layerdb::Op::put(vector_key(generation, *id), value));
+                batch_ops.push(layerdb::Op::put(
+                    posting_member_event_key(generation, new_posting, upsert_event_seq, *id),
+                    posting_member_event_upsert_value_with_residual(*id, vector, centroid)?,
+                ));
                 if let Some((old_posting, _)) = old {
                     if *old_posting != new_posting {
                         let tombstone_event_seq = posting_event_next_seq;
                         posting_event_next_seq = posting_event_next_seq.saturating_add(1);
-                        ops.push(layerdb::Op::put(posting_member_event_key(
+                        batch_ops.push(layerdb::Op::put(posting_member_event_key(
                             generation,
                             *old_posting,
                             tombstone_event_seq,
@@ -1507,7 +1505,6 @@ impl SpFreshLayerDbIndex {
                         ), posting_member_event_tombstone_value(*id)?));
                     }
                 }
-                batch_ops.extend(ops);
                 touched_ids.push(*id);
                 let old_posting = old.map(|(posting, _)| *posting);
                 cache_deltas.push((*id, old_posting, new_posting, sketch));
@@ -1682,16 +1679,15 @@ impl SpFreshLayerDbIndex {
                 self.posting_event_next_seq.load(Ordering::Relaxed);
             for id in &mutations {
                 let old = states.get(id).cloned().unwrap_or(None);
-                let mut ops = vec![layerdb::Op::delete(vector_key(generation, *id))];
+                batch_ops.push(layerdb::Op::delete(vector_key(generation, *id)));
                 if let Some((old_posting, _)) = &old {
                     let tombstone_event_seq = posting_event_next_seq;
                     posting_event_next_seq = posting_event_next_seq.saturating_add(1);
-                    ops.push(layerdb::Op::put(
+                    batch_ops.push(layerdb::Op::put(
                         posting_member_event_key(generation, *old_posting, tombstone_event_seq, *id),
                         posting_member_event_tombstone_value(*id)?,
                     ));
                 }
-                batch_ops.extend(ops);
                 touched_ids.push(*id);
                 apply_entries.push((*id, old));
             }

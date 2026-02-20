@@ -1,0 +1,31 @@
+{
+  "dataset": {
+    "seed": 404,
+    "dim": 64,
+    "base": 10000,
+    "updates": 2000,
+    "queries": 200,
+    "k": 10
+  },
+  "spfresh": {
+    "shards": 8,
+    "initial_postings": 64,
+    "nprobe": 8,
+    "split_limit": 256,
+    "merge_limit": 64,
+    "reassign_range": 16,
+    "update_batch": 1024,
+    "diskmeta": true
+  },
+  "lancedb": {
+    "nlist": 96,
+    "nprobe": 8,
+    "update_batch": 1024
+  },
+  "thresholds": {
+    "min_spfresh_recall_at_k": 0.95,
+    "min_spfresh_search_qps_vs_lancedb_ratio": 1.0,
+    "min_spfresh_update_qps_vs_lancedb_ratio": 0.30
+  }
+}
+

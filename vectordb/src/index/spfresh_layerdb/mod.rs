@@ -284,6 +284,15 @@ impl PostingMembersCache {
     }
 }
 
+enum CommitRequest {
+    Write {
+        ops: Vec<layerdb::Op>,
+        sync: bool,
+        resp: mpsc::Sender<anyhow::Result<()>>,
+    },
+    Shutdown,
+}
+
 pub struct SpFreshLayerDbIndex {
     cfg: SpFreshLayerDbConfig,
     db_path: PathBuf,
@@ -300,6 +309,8 @@ pub struct SpFreshLayerDbIndex {
     wal_next_seq: Arc<AtomicU64>,
     posting_event_next_seq: Arc<AtomicU64>,
     startup_epoch: Arc<AtomicU64>,
+    commit_tx: mpsc::Sender<CommitRequest>,
+    commit_worker: Option<JoinHandle<()>>,
     rebuild_tx: mpsc::Sender<()>,
     stop_worker: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -418,7 +429,23 @@ impl SpFreshLayerDbIndex {
         let startup_epoch = Arc::new(AtomicU64::new(manifest_epoch));
         let stop_worker = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(SpFreshLayerDbStatsInner::default());
+        let (commit_tx, commit_rx) = mpsc::channel::<CommitRequest>();
         let (rebuild_tx, rebuild_rx) = mpsc::channel::<()>();
+
+        let commit_db = db.clone();
+        let commit_worker = std::thread::spawn(move || {
+            while let Ok(req) = commit_rx.recv() {
+                match req {
+                    CommitRequest::Write { ops, sync, resp } => {
+                        let result = commit_db
+                            .write_batch(ops, WriteOptions { sync })
+                            .context("spfresh-layerdb commit worker write batch");
+                        let _ = resp.send(result);
+                    }
+                    CommitRequest::Shutdown => break,
+                }
+            }
+        });
 
         let worker = spawn_rebuilder(
             RebuilderRuntime {
@@ -454,6 +481,8 @@ impl SpFreshLayerDbIndex {
             wal_next_seq,
             posting_event_next_seq,
             startup_epoch,
+            commit_tx,
+            commit_worker: Some(commit_worker),
             rebuild_tx,
             stop_worker,
             worker: Some(worker),
@@ -850,11 +879,22 @@ impl SpFreshLayerDbIndex {
             config::META_POSTING_EVENT_NEXT_SEQ_KEY,
             posting_event_next,
         ));
-        self.db
-            .write_batch(ops, WriteOptions { sync: false })
+        self.submit_commit(ops, false)
             .context("compact posting-member append log")?;
         self.posting_event_next_seq.store(next_seq, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn submit_commit(&self, ops: Vec<layerdb::Op>, sync: bool) -> anyhow::Result<()> {
+        let (resp_tx, resp_rx) = mpsc::channel::<anyhow::Result<()>>();
+        self.commit_tx
+            .send(CommitRequest::Write {
+                ops,
+                sync,
+                resp: resp_tx,
+            })
+            .context("send commit request")?;
+        resp_rx.recv().context("receive commit result")?
     }
 
     fn neighbor_cmp(a: &Neighbor, b: &Neighbor) -> std::cmp::Ordering {
@@ -1023,13 +1063,7 @@ impl SpFreshLayerDbIndex {
                     ops.push(layerdb::Op::put(vector_key(new_generation, row.id), value));
                 }
             }
-            self.db
-                .write_batch(
-                    ops,
-                    WriteOptions {
-                        sync: self.cfg.write_sync,
-                    },
-                )
+            self.submit_commit(ops, self.cfg.write_sync)
                 .context("persist spfresh bulk rows")?;
         }
         set_active_generation(&self.db, new_generation, self.cfg.write_sync)?;
@@ -1133,13 +1167,7 @@ impl SpFreshLayerDbIndex {
             wal_next,
         ));
         ops.append(&mut trailer_ops);
-        self.db
-            .write_batch(
-                ops,
-                WriteOptions {
-                    sync: self.cfg.write_sync,
-                },
-            )
+        self.submit_commit(ops, self.cfg.write_sync)
             .with_context(|| {
                 format!(
                     "persist vector+wal batch count={} seq_start={} seq_end={}",
@@ -1682,6 +1710,12 @@ impl SpFreshLayerDbIndex {
         }
         self.force_rebuild()?;
         self.persist_index_checkpoint()?;
+        let _ = self.commit_tx.send(CommitRequest::Shutdown);
+        if let Some(worker) = self.commit_worker.take() {
+            if worker.join().is_err() {
+                anyhow::bail!("spfresh-layerdb commit worker panicked");
+            }
+        }
         Ok(())
     }
 
@@ -1739,6 +1773,10 @@ impl Drop for SpFreshLayerDbIndex {
         self.stop_worker.store(true, Ordering::Relaxed);
         let _ = self.rebuild_tx.send(());
         if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        let _ = self.commit_tx.send(CommitRequest::Shutdown);
+        if let Some(worker) = self.commit_worker.take() {
             let _ = worker.join();
         }
     }

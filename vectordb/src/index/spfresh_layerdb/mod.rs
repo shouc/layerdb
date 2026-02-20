@@ -1550,17 +1550,7 @@ impl SpFreshLayerDbIndex {
                 let RuntimeSpFreshIndex::OffHeapDiskMeta(index) = &mut *index else {
                     anyhow::bail!("diskmeta upsert batch called for non-diskmeta runtime");
                 };
-                for (id, vector) in &mutations {
-                    let Some(new_posting) = new_postings.get(id).copied() else {
-                        continue;
-                    };
-                    let old = states.get(id).and_then(|state| state.as_ref());
-                    index.apply_upsert_ref(
-                        old.map(|(posting, values)| (*posting, values.as_slice())),
-                        new_posting,
-                        vector.as_slice(),
-                    );
-                }
+                *index = shadow;
                 Some(Arc::new(index.clone()))
             };
             self.diskmeta_search_snapshot.store(snapshot);
@@ -1672,9 +1662,13 @@ impl SpFreshLayerDbIndex {
 
         if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
             let states = self.load_diskmeta_states_for_ids(generation, &mutations)?;
+            let mut shadow = match &*lock_read(&self.index) {
+                RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.clone(),
+                _ => anyhow::bail!("diskmeta delete batch called for non-diskmeta index"),
+            };
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(2));
             let mut touched_ids = Vec::with_capacity(mutations.len());
-            let mut apply_entries = Vec::with_capacity(mutations.len());
+            let mut deleted = 0usize;
             let mut posting_event_next_seq =
                 self.posting_event_next_seq.load(Ordering::Relaxed);
             for id in &mutations {
@@ -1689,7 +1683,9 @@ impl SpFreshLayerDbIndex {
                     ));
                 }
                 touched_ids.push(*id);
-                apply_entries.push((*id, old));
+                if shadow.apply_delete(old) {
+                    deleted = deleted.saturating_add(1);
+                }
             }
             let posting_event_next = bincode::serialize(&posting_event_next_seq)
                 .context("encode posting-event next seq")?;
@@ -1718,17 +1714,12 @@ impl SpFreshLayerDbIndex {
                 }
             }
 
-            let mut deleted = 0usize;
             let snapshot = {
                 let mut index = lock_write(&self.index);
                 let RuntimeSpFreshIndex::OffHeapDiskMeta(index) = &mut *index else {
                     anyhow::bail!("diskmeta delete batch called for non-diskmeta runtime");
                 };
-                for (_id, old) in apply_entries {
-                    if index.apply_delete(old) {
-                        deleted += 1;
-                    }
-                }
+                *index = shadow;
                 Some(Arc::new(index.clone()))
             };
             self.diskmeta_search_snapshot.store(snapshot);

@@ -16,6 +16,49 @@ use super::config::{
     POSTING_MAP_ROOT_PREFIX, POSTING_MEMBERS_ROOT_PREFIX, VECTOR_ROOT_PREFIX,
 };
 
+const VECTOR_ROW_RKYV_TAG: &[u8] = b"vr1";
+
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug)]
+#[archive(check_bytes)]
+struct VectorRowValueRkyv {
+    id: u64,
+    values: Vec<f32>,
+    version: u32,
+    deleted: bool,
+}
+
+pub(crate) fn encode_vector_row_value(row: &VectorRecord) -> anyhow::Result<Vec<u8>> {
+    let payload = VectorRowValueRkyv {
+        id: row.id,
+        values: row.values.clone(),
+        version: row.version,
+        deleted: row.deleted,
+    };
+    let archived =
+        rkyv::to_bytes::<_, 1_024>(&payload).context("encode vector row value with rkyv")?;
+    let mut out = Vec::with_capacity(VECTOR_ROW_RKYV_TAG.len() + archived.len());
+    out.extend_from_slice(VECTOR_ROW_RKYV_TAG);
+    out.extend_from_slice(archived.as_ref());
+    Ok(out)
+}
+
+pub(crate) fn decode_vector_row_value(raw: &[u8]) -> anyhow::Result<VectorRecord> {
+    if raw.starts_with(VECTOR_ROW_RKYV_TAG) {
+        let mut aligned = rkyv::AlignedVec::with_capacity(raw.len() - VECTOR_ROW_RKYV_TAG.len());
+        aligned.extend_from_slice(&raw[VECTOR_ROW_RKYV_TAG.len()..]);
+        let archived = rkyv::check_archived_root::<VectorRowValueRkyv>(&aligned)
+            .map_err(|err| anyhow::anyhow!("decode rkyv vector row: {err}"))?;
+        return Ok(VectorRecord {
+            id: archived.id,
+            values: archived.values.iter().copied().collect(),
+            version: archived.version,
+            deleted: archived.deleted,
+        });
+    }
+    // Backward compatibility with legacy bincode row payloads.
+    bincode::deserialize::<VectorRecord>(raw).context("decode legacy vector row payload")
+}
+
 pub(crate) fn validate_config(cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> {
     if cfg.spfresh.dim == 0 {
         anyhow::bail!("spfresh dim must be > 0");
@@ -75,7 +118,7 @@ pub(crate) fn load_rows(db: &Db, generation: u64) -> anyhow::Result<Vec<VectorRe
         let Some(value) = value else {
             continue;
         };
-        let row: VectorRecord = bincode::deserialize(value.as_ref())
+        let row = decode_vector_row_value(value.as_ref())
             .with_context(|| format!("decode vector row key={}", String::from_utf8_lossy(&key)))?;
         if !row.deleted {
             out.push(row);
@@ -92,7 +135,7 @@ pub(crate) fn load_row(db: &Db, generation: u64, id: u64) -> anyhow::Result<Opti
     let Some(raw) = raw else {
         return Ok(None);
     };
-    let row: VectorRecord = bincode::deserialize(raw.as_ref())
+    let row = decode_vector_row_value(raw.as_ref())
         .with_context(|| format!("decode vector row id={id} generation={generation}"))?;
     Ok((!row.deleted).then_some(row))
 }

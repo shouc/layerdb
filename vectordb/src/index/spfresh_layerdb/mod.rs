@@ -27,13 +27,14 @@ use super::{SpFreshConfig, SpFreshIndex};
 use rebuilder::{rebuild_once, spawn_rebuilder, RebuilderRuntime};
 use stats::SpFreshLayerDbStatsInner;
 use storage::{
-    encode_wal_entry, ensure_active_generation, ensure_metadata, ensure_wal_exists,
-    ensure_wal_next_seq, load_index_checkpoint_bytes, load_metadata, load_posting_assignments,
-    load_posting_members, load_row, load_rows, load_wal_entries_since,
-    persist_index_checkpoint_bytes, posting_assignment_value, posting_map_key, posting_map_prefix,
-    posting_member_key, posting_member_value, posting_members_generation_prefix,
-    prefix_exclusive_end, prune_wal_before, refresh_read_snapshot, set_active_generation,
-    validate_config, vector_key, vector_prefix, wal_key, IndexWalEntry,
+    decode_vector_row_value, encode_vector_row_value, encode_wal_entry, ensure_active_generation,
+    ensure_metadata, ensure_wal_exists, ensure_wal_next_seq, load_index_checkpoint_bytes,
+    load_metadata, load_posting_assignments, load_posting_members, load_row, load_rows,
+    load_wal_entries_since, persist_index_checkpoint_bytes, posting_assignment_value,
+    posting_map_key, posting_map_prefix, posting_member_key, posting_member_value,
+    posting_members_generation_prefix, prefix_exclusive_end, prune_wal_before,
+    refresh_read_snapshot, set_active_generation, validate_config, vector_key, vector_prefix,
+    wal_key, IndexWalEntry,
 };
 use sync_utils::{lock_mutex, lock_read, lock_write};
 
@@ -581,7 +582,7 @@ impl SpFreshLayerDbIndex {
             let Some(raw) = raw else {
                 continue;
             };
-            let row: VectorRecord = bincode::deserialize(raw.as_ref())
+            let row = decode_vector_row_value(raw.as_ref())
                 .with_context(|| format!("decode vector row id={id} generation={generation}"))?;
             if row.deleted {
                 continue;
@@ -692,7 +693,7 @@ impl SpFreshLayerDbIndex {
         for batch in rows.chunks(1_024) {
             let mut ops = Vec::with_capacity(batch.len().saturating_mul(3));
             for row in batch {
-                let value = bincode::serialize(row)
+                let value = encode_vector_row_value(row)
                     .with_context(|| format!("serialize vector row id={}", row.id))?;
                 ops.push(layerdb::Op::put(vector_key(new_generation, row.id), value));
                 if let Some(assignments) = &disk_assignments {
@@ -889,11 +890,9 @@ impl SpFreshLayerDbIndex {
                 None => None,
             };
             let row = match row_raw {
-                Some(raw) => Some(
-                    bincode::deserialize::<VectorRecord>(raw.as_ref()).with_context(|| {
-                        format!("decode vector row id={id} generation={generation}")
-                    })?,
-                ),
+                Some(raw) => Some(decode_vector_row_value(raw.as_ref()).with_context(|| {
+                    format!("decode vector row id={id} generation={generation}")
+                })?),
                 None => None,
             };
             let state = match (posting, row) {
@@ -944,7 +943,7 @@ impl SpFreshLayerDbIndex {
                 let old = states.get(id).cloned().unwrap_or(None);
                 let new_posting = shadow.choose_posting(vector).unwrap_or(0);
                 let row = VectorRecord::new(*id, vector.clone());
-                let value = bincode::serialize(&row).context("serialize vector row")?;
+                let value = encode_vector_row_value(&row).context("serialize vector row")?;
                 let mut ops = vec![
                     layerdb::Op::put(vector_key(generation, *id), value),
                     layerdb::Op::put(
@@ -1023,7 +1022,7 @@ impl SpFreshLayerDbIndex {
         let mut persist_entries = Vec::with_capacity(mutations.len());
         for (id, vector) in &mutations {
             let row = VectorRecord::new(*id, vector.clone());
-            let value = bincode::serialize(&row).context("serialize vector row")?;
+            let value = encode_vector_row_value(&row).context("serialize vector row")?;
             persist_entries.push((
                 IndexWalEntry::Upsert {
                     id: *id,

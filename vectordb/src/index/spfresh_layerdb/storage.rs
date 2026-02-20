@@ -4,7 +4,6 @@ use std::path::Path;
 use anyhow::Context;
 use bytes::Bytes;
 use layerdb::{Db, Range, ReadOptions, WriteOptions};
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -17,32 +16,49 @@ use super::config::{
     POSTING_MAP_ROOT_PREFIX, POSTING_MEMBERS_ROOT_PREFIX, VECTOR_ROOT_PREFIX,
 };
 
-const VECTOR_ROW_RKYV_TAG: &[u8] = b"vr1";
-const VECTOR_ROW_RKYV_V2_TAG: &[u8] = b"vr2";
-
-#[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug)]
-#[archive(check_bytes)]
-struct VectorRowValueRkyv {
-    id: u64,
-    values: Vec<f32>,
-    version: u32,
-    deleted: bool,
-}
-
-#[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug)]
-#[archive(check_bytes)]
-struct VectorRowValueRkyvV2 {
-    id: u64,
-    values: Vec<f32>,
-    version: u32,
-    deleted: bool,
-    posting_id: Option<u64>,
-}
+const VECTOR_ROW_BIN_TAG: &[u8] = b"vr3";
+const VECTOR_ROW_FLAG_DELETED: u8 = 1 << 0;
+const VECTOR_ROW_FLAG_HAS_POSTING: u8 = 1 << 1;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedVectorRow {
     pub row: VectorRecord,
     pub posting_id: Option<usize>,
+}
+
+fn read_u8(raw: &[u8], cursor: &mut usize) -> anyhow::Result<u8> {
+    let Some(b) = raw.get(*cursor).copied() else {
+        anyhow::bail!("decode buffer underflow for u8");
+    };
+    *cursor = cursor.saturating_add(1);
+    Ok(b)
+}
+
+fn read_u32(raw: &[u8], cursor: &mut usize) -> anyhow::Result<u32> {
+    let end = cursor.saturating_add(4);
+    let Some(bytes) = raw.get(*cursor..end) else {
+        anyhow::bail!("decode buffer underflow for u32");
+    };
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(bytes);
+    *cursor = end;
+    Ok(u32::from_le_bytes(arr))
+}
+
+fn read_u64(raw: &[u8], cursor: &mut usize) -> anyhow::Result<u64> {
+    let end = cursor.saturating_add(8);
+    let Some(bytes) = raw.get(*cursor..end) else {
+        anyhow::bail!("decode buffer underflow for u64");
+    };
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    *cursor = end;
+    Ok(u64::from_le_bytes(arr))
+}
+
+fn read_f32(raw: &[u8], cursor: &mut usize) -> anyhow::Result<f32> {
+    let bits = read_u32(raw, cursor)?;
+    Ok(f32::from_bits(bits))
 }
 
 pub(crate) fn encode_vector_row_value(row: &VectorRecord) -> anyhow::Result<Vec<u8>> {
@@ -53,34 +69,37 @@ pub(crate) fn encode_vector_row_value_with_posting(
     row: &VectorRecord,
     posting_id: Option<usize>,
 ) -> anyhow::Result<Vec<u8>> {
-    if let Some(posting_id) = posting_id {
-        let posting_id = u64::try_from(posting_id).context("posting id does not fit u64")?;
-        let payload = VectorRowValueRkyvV2 {
-            id: row.id,
-            values: row.values.clone(),
-            version: row.version,
-            deleted: row.deleted,
-            posting_id: Some(posting_id),
-        };
-        let archived = rkyv::to_bytes::<_, 1_024>(&payload)
-            .context("encode vector row value v2 with rkyv")?;
-        let mut out = Vec::with_capacity(VECTOR_ROW_RKYV_V2_TAG.len() + archived.len());
-        out.extend_from_slice(VECTOR_ROW_RKYV_V2_TAG);
-        out.extend_from_slice(archived.as_ref());
-        return Ok(out);
+    let posting_u64 = posting_id
+        .map(|v| u64::try_from(v).context("posting id does not fit u64"))
+        .transpose()?;
+    let mut flags = 0u8;
+    if row.deleted {
+        flags |= VECTOR_ROW_FLAG_DELETED;
     }
-
-    let payload = VectorRowValueRkyv {
-        id: row.id,
-        values: row.values.clone(),
-        version: row.version,
-        deleted: row.deleted,
-    };
-    let archived =
-        rkyv::to_bytes::<_, 1_024>(&payload).context("encode vector row value with rkyv")?;
-    let mut out = Vec::with_capacity(VECTOR_ROW_RKYV_TAG.len() + archived.len());
-    out.extend_from_slice(VECTOR_ROW_RKYV_TAG);
-    out.extend_from_slice(archived.as_ref());
+    if posting_u64.is_some() {
+        flags |= VECTOR_ROW_FLAG_HAS_POSTING;
+    }
+    let mut out = Vec::with_capacity(
+        VECTOR_ROW_BIN_TAG.len()
+            + 1
+            + 4
+            + 8
+            + 4
+            + row.values.len().saturating_mul(4)
+            + posting_u64.map_or(0, |_| 8),
+    );
+    out.extend_from_slice(VECTOR_ROW_BIN_TAG);
+    out.push(flags);
+    out.extend_from_slice(&row.version.to_le_bytes());
+    out.extend_from_slice(&row.id.to_le_bytes());
+    let dim = u32::try_from(row.values.len()).context("vector row dim does not fit u32")?;
+    out.extend_from_slice(&dim.to_le_bytes());
+    for value in &row.values {
+        out.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+    if let Some(posting) = posting_u64 {
+        out.extend_from_slice(&posting.to_le_bytes());
+    }
     Ok(out)
 }
 
@@ -89,49 +108,35 @@ pub(crate) fn decode_vector_row_value(raw: &[u8]) -> anyhow::Result<VectorRecord
 }
 
 pub(crate) fn decode_vector_row_with_posting(raw: &[u8]) -> anyhow::Result<DecodedVectorRow> {
-    if raw.starts_with(VECTOR_ROW_RKYV_V2_TAG) {
-        let mut aligned =
-            rkyv::AlignedVec::with_capacity(raw.len() - VECTOR_ROW_RKYV_V2_TAG.len());
-        aligned.extend_from_slice(&raw[VECTOR_ROW_RKYV_V2_TAG.len()..]);
-        let archived = rkyv::check_archived_root::<VectorRowValueRkyvV2>(&aligned)
-            .map_err(|err| anyhow::anyhow!("decode rkyv vector row v2: {err}"))?;
-        let posting_id = match archived.posting_id.as_ref() {
-            Some(v) => {
-                Some(usize::try_from(*v).context("posting id does not fit usize")?)
-            }
-            None => None,
-        };
-        return Ok(DecodedVectorRow {
-            row: VectorRecord {
-                id: archived.id,
-                values: archived.values.iter().copied().collect(),
-                version: archived.version,
-                deleted: archived.deleted,
-            },
-            posting_id,
-        });
+    if !raw.starts_with(VECTOR_ROW_BIN_TAG) {
+        anyhow::bail!("unsupported vector row tag");
     }
-    if raw.starts_with(VECTOR_ROW_RKYV_TAG) {
-        let mut aligned = rkyv::AlignedVec::with_capacity(raw.len() - VECTOR_ROW_RKYV_TAG.len());
-        aligned.extend_from_slice(&raw[VECTOR_ROW_RKYV_TAG.len()..]);
-        let archived = rkyv::check_archived_root::<VectorRowValueRkyv>(&aligned)
-            .map_err(|err| anyhow::anyhow!("decode rkyv vector row: {err}"))?;
-        return Ok(DecodedVectorRow {
-            row: VectorRecord {
-                id: archived.id,
-                values: archived.values.iter().copied().collect(),
-                version: archived.version,
-                deleted: archived.deleted,
-            },
-            posting_id: None,
-        });
+    let mut cursor = VECTOR_ROW_BIN_TAG.len();
+    let flags = read_u8(raw, &mut cursor)?;
+    let version = read_u32(raw, &mut cursor)?;
+    let id = read_u64(raw, &mut cursor)?;
+    let dim = usize::try_from(read_u32(raw, &mut cursor)?).context("vector row dim overflow")?;
+    let mut values = Vec::with_capacity(dim);
+    for _ in 0..dim {
+        values.push(read_f32(raw, &mut cursor)?);
     }
-    // Backward compatibility with legacy bincode row payloads.
-    let row = bincode::deserialize::<VectorRecord>(raw)
-        .context("decode legacy vector row payload")?;
+    let posting_id = if (flags & VECTOR_ROW_FLAG_HAS_POSTING) != 0 {
+        let posting_u64 = read_u64(raw, &mut cursor)?;
+        Some(usize::try_from(posting_u64).context("posting id does not fit usize")?)
+    } else {
+        None
+    };
+    if cursor != raw.len() {
+        anyhow::bail!("vector row trailing bytes");
+    }
     Ok(DecodedVectorRow {
-        row,
-        posting_id: None,
+        row: VectorRecord {
+            id,
+            values,
+            version,
+            deleted: (flags & VECTOR_ROW_FLAG_DELETED) != 0,
+        },
+        posting_id,
     })
 }
 
@@ -456,12 +461,102 @@ pub(crate) enum IndexWalEntry {
     },
 }
 
+const WAL_BIN_TAG: &[u8] = b"wl2";
+const WAL_KIND_UPSERT: u8 = 1;
+const WAL_KIND_DELETE: u8 = 2;
+const WAL_KIND_DISKMETA_UPSERT: u8 = 3;
+const WAL_KIND_DISKMETA_DELETE: u8 = 4;
+
 pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>> {
-    bincode::serialize(entry).context("encode wal entry")
+    let mut out = Vec::new();
+    out.extend_from_slice(WAL_BIN_TAG);
+    match entry {
+        IndexWalEntry::Upsert { id, vector } => {
+            out.push(WAL_KIND_UPSERT);
+            out.extend_from_slice(&id.to_le_bytes());
+            let dim = u32::try_from(vector.len()).context("wal vector dim does not fit u32")?;
+            out.extend_from_slice(&dim.to_le_bytes());
+            for value in vector {
+                out.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+        IndexWalEntry::Delete { id } => {
+            out.push(WAL_KIND_DELETE);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        IndexWalEntry::DiskMetaUpsert {
+            id,
+            new_posting,
+            new_vector,
+        } => {
+            out.push(WAL_KIND_DISKMETA_UPSERT);
+            out.extend_from_slice(&id.to_le_bytes());
+            let posting =
+                u64::try_from(*new_posting).context("wal posting id does not fit u64")?;
+            out.extend_from_slice(&posting.to_le_bytes());
+            let dim =
+                u32::try_from(new_vector.len()).context("wal diskmeta vector dim does not fit u32")?;
+            out.extend_from_slice(&dim.to_le_bytes());
+            for value in new_vector {
+                out.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+        IndexWalEntry::DiskMetaDelete { id } => {
+            out.push(WAL_KIND_DISKMETA_DELETE);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn decode_wal_entry(raw: &[u8]) -> anyhow::Result<IndexWalEntry> {
-    bincode::deserialize::<IndexWalEntry>(raw).context("decode wal entry")
+    if !raw.starts_with(WAL_BIN_TAG) {
+        anyhow::bail!("unsupported wal tag");
+    }
+    let mut cursor = WAL_BIN_TAG.len();
+    let kind = read_u8(raw, &mut cursor)?;
+    let entry = match kind {
+        WAL_KIND_UPSERT => {
+            let id = read_u64(raw, &mut cursor)?;
+            let dim =
+                usize::try_from(read_u32(raw, &mut cursor)?).context("wal vector dim overflow")?;
+            let mut vector = Vec::with_capacity(dim);
+            for _ in 0..dim {
+                vector.push(read_f32(raw, &mut cursor)?);
+            }
+            IndexWalEntry::Upsert { id, vector }
+        }
+        WAL_KIND_DELETE => {
+            let id = read_u64(raw, &mut cursor)?;
+            IndexWalEntry::Delete { id }
+        }
+        WAL_KIND_DISKMETA_UPSERT => {
+            let id = read_u64(raw, &mut cursor)?;
+            let posting_u64 = read_u64(raw, &mut cursor)?;
+            let new_posting =
+                usize::try_from(posting_u64).context("wal posting id does not fit usize")?;
+            let dim = usize::try_from(read_u32(raw, &mut cursor)?)
+                .context("wal diskmeta vector dim overflow")?;
+            let mut new_vector = Vec::with_capacity(dim);
+            for _ in 0..dim {
+                new_vector.push(read_f32(raw, &mut cursor)?);
+            }
+            IndexWalEntry::DiskMetaUpsert {
+                id,
+                new_posting,
+                new_vector,
+            }
+        }
+        WAL_KIND_DISKMETA_DELETE => {
+            let id = read_u64(raw, &mut cursor)?;
+            IndexWalEntry::DiskMetaDelete { id }
+        }
+        _ => anyhow::bail!("unsupported wal kind {}", kind),
+    };
+    if cursor != raw.len() {
+        anyhow::bail!("wal entry trailing bytes");
+    }
+    Ok(entry)
 }
 
 pub(crate) fn load_wal_entries_since(
@@ -569,15 +664,7 @@ pub(crate) fn posting_member_event_key(
 }
 
 const POSTING_MEMBER_EVENT_RKYV_V3_TAG: &[u8] = b"pk3";
-
-#[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug)]
-#[archive(check_bytes)]
-struct PostingMemberEventValueRkyvV3 {
-    id: u64,
-    tombstone: bool,
-    residual_scale: f32,
-    residual_code: Vec<i8>,
-}
+const POSTING_MEMBER_EVENT_FLAG_TOMBSTONE: u8 = 1 << 0;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PostingMember {
@@ -621,33 +708,77 @@ pub(crate) fn posting_member_event_upsert_value_from_sketch(
     residual_scale: f32,
     residual_code: &[i8],
 ) -> anyhow::Result<Vec<u8>> {
-    let payload = PostingMemberEventValueRkyvV3 {
-        id,
-        tombstone: false,
-        residual_scale,
-        residual_code: residual_code.to_vec(),
-    };
-    let archived = rkyv::to_bytes::<_, 1_024>(&payload)
-        .context("encode posting member value (residual) with rkyv")?;
-    let mut out = Vec::with_capacity(POSTING_MEMBER_EVENT_RKYV_V3_TAG.len() + archived.len());
+    let mut out = Vec::with_capacity(
+        POSTING_MEMBER_EVENT_RKYV_V3_TAG.len() + 1 + 8 + 4 + 4 + residual_code.len(),
+    );
     out.extend_from_slice(POSTING_MEMBER_EVENT_RKYV_V3_TAG);
-    out.extend_from_slice(archived.as_ref());
+    out.push(0);
+    out.extend_from_slice(&id.to_le_bytes());
+    out.extend_from_slice(&residual_scale.to_bits().to_le_bytes());
+    let code_len = u32::try_from(residual_code.len())
+        .context("posting-member residual code len does not fit u32")?;
+    out.extend_from_slice(&code_len.to_le_bytes());
+    for value in residual_code {
+        out.push(*value as u8);
+    }
     Ok(out)
 }
 
 pub(crate) fn posting_member_event_tombstone_value(id: u64) -> anyhow::Result<Vec<u8>> {
-    let payload = PostingMemberEventValueRkyvV3 {
-        id,
-        tombstone: true,
-        residual_scale: 1.0,
-        residual_code: Vec::new(),
-    };
-    let archived = rkyv::to_bytes::<_, 1_024>(&payload)
-        .context("encode posting member tombstone value with rkyv")?;
-    let mut out = Vec::with_capacity(POSTING_MEMBER_EVENT_RKYV_V3_TAG.len() + archived.len());
+    let mut out = Vec::with_capacity(POSTING_MEMBER_EVENT_RKYV_V3_TAG.len() + 1 + 8);
     out.extend_from_slice(POSTING_MEMBER_EVENT_RKYV_V3_TAG);
-    out.extend_from_slice(archived.as_ref());
+    out.push(POSTING_MEMBER_EVENT_FLAG_TOMBSTONE);
+    out.extend_from_slice(&id.to_le_bytes());
     Ok(out)
+}
+
+#[derive(Clone, Debug)]
+struct DecodedPostingMemberEvent {
+    id: u64,
+    tombstone: bool,
+    residual_scale: Option<f32>,
+    residual_code: Option<Vec<i8>>,
+}
+
+fn decode_posting_member_event(raw: &[u8]) -> anyhow::Result<DecodedPostingMemberEvent> {
+    if !raw.starts_with(POSTING_MEMBER_EVENT_RKYV_V3_TAG) {
+        anyhow::bail!("unsupported posting-member event tag");
+    }
+    let mut cursor = POSTING_MEMBER_EVENT_RKYV_V3_TAG.len();
+    let flags = read_u8(raw, &mut cursor)?;
+    let id = read_u64(raw, &mut cursor)?;
+    if (flags & POSTING_MEMBER_EVENT_FLAG_TOMBSTONE) != 0 {
+        if cursor != raw.len() {
+            anyhow::bail!("posting-member tombstone trailing bytes");
+        }
+        return Ok(DecodedPostingMemberEvent {
+            id,
+            tombstone: true,
+            residual_scale: None,
+            residual_code: None,
+        });
+    }
+    let scale = read_f32(raw, &mut cursor)?;
+    let code_len = usize::try_from(read_u32(raw, &mut cursor)?)
+        .context("posting-member code len overflow")?;
+    let end = cursor.saturating_add(code_len);
+    let Some(code_raw) = raw.get(cursor..end) else {
+        anyhow::bail!("posting-member code underflow");
+    };
+    let mut code = Vec::with_capacity(code_len);
+    for byte in code_raw {
+        code.push(*byte as i8);
+    }
+    cursor = end;
+    if cursor != raw.len() {
+        anyhow::bail!("posting-member event trailing bytes");
+    }
+    Ok(DecodedPostingMemberEvent {
+        id,
+        tombstone: false,
+        residual_scale: Some(scale),
+        residual_code: Some(code),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -684,24 +815,7 @@ pub(crate) fn load_posting_members(
         };
         scanned_events = scanned_events.saturating_add(1);
         let raw = value.as_ref();
-        let decoded = (|| -> anyhow::Result<PostingMemberEventValueRkyvV3> {
-            if !raw.starts_with(POSTING_MEMBER_EVENT_RKYV_V3_TAG) {
-                anyhow::bail!("unsupported posting-member event tag");
-            }
-            let mut aligned = rkyv::AlignedVec::with_capacity(
-                raw.len().saturating_sub(POSTING_MEMBER_EVENT_RKYV_V3_TAG.len()),
-            );
-            aligned.extend_from_slice(&raw[POSTING_MEMBER_EVENT_RKYV_V3_TAG.len()..]);
-            let archived = rkyv::check_archived_root::<PostingMemberEventValueRkyvV3>(&aligned)
-                .map_err(|err| anyhow::anyhow!("decode posting-member event: {err}"))?;
-            Ok(PostingMemberEventValueRkyvV3 {
-                id: archived.id,
-                tombstone: archived.tombstone,
-                residual_scale: archived.residual_scale,
-                residual_code: archived.residual_code.iter().copied().collect(),
-            })
-        })()
-        .with_context(|| {
+        let decoded = decode_posting_member_event(raw).with_context(|| {
             format!(
                 "decode posting-member event key={}",
                 String::from_utf8_lossy(&key)
@@ -711,12 +825,18 @@ pub(crate) fn load_posting_members(
             latest.remove(&decoded.id);
             continue;
         }
+        let Some(scale) = decoded.residual_scale else {
+            anyhow::bail!("missing posting-member residual scale");
+        };
+        let Some(code) = decoded.residual_code else {
+            anyhow::bail!("missing posting-member residual code");
+        };
         latest.insert(
             decoded.id,
             PostingMember {
                 id: decoded.id,
-                residual_scale: Some(decoded.residual_scale),
-                residual_code: Some(decoded.residual_code),
+                residual_scale: Some(scale),
+                residual_code: Some(code),
             },
         );
     }

@@ -9,7 +9,8 @@ use clap::Parser;
 use serde::Deserialize;
 use vectordb::ground_truth::recall_at_k;
 use vectordb::index::{
-    SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig, SpFreshLayerDbShardedIndex, SpFreshMemoryMode,
+    SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig, SpFreshLayerDbShardedIndex,
+    SpFreshMemoryMode,
 };
 use vectordb::types::{VectorIndex, VectorRecord};
 
@@ -47,6 +48,8 @@ struct Args {
     offheap: bool,
     #[arg(long, default_value_t = false)]
     diskmeta: bool,
+    #[arg(long, default_value_t = 1024)]
+    update_batch: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +78,9 @@ fn main() -> Result<()> {
     }
     if args.offheap && args.diskmeta {
         anyhow::bail!("--offheap and --diskmeta are mutually exclusive");
+    }
+    if args.update_batch == 0 {
+        anyhow::bail!("--update-batch must be > 0");
     }
 
     let dataset: Dataset = serde_json::from_slice(
@@ -156,8 +162,12 @@ fn main() -> Result<()> {
     let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
 
     let update_start = Instant::now();
-    for (id, v) in &dataset.updates {
-        index.try_upsert(*id, v.clone())?;
+    for chunk in dataset.updates.chunks(args.update_batch) {
+        let rows: Vec<VectorRecord> = chunk
+            .iter()
+            .map(|(id, v)| VectorRecord::new(*id, v.clone()))
+            .collect();
+        let _ = index.try_upsert_batch(&rows)?;
     }
     let update_s = update_start.elapsed().as_secs_f64().max(1e-9);
     let update_qps = dataset.updates.len() as f64 / update_s;
@@ -194,6 +204,7 @@ fn main() -> Result<()> {
         "durable": args.durable,
         "offheap": args.offheap,
         "diskmeta": args.diskmeta,
+        "update_batch": args.update_batch,
         "memory_mode": format!("{:?}", memory_mode),
         "build_ms": build_ms,
         "update_qps": update_qps,

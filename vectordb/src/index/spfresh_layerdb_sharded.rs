@@ -167,11 +167,51 @@ impl SpFreshLayerDbShardedIndex {
             .with_context(|| format!("upsert shard {}", shard))
     }
 
+    pub fn try_upsert_batch(&mut self, rows: &[VectorRecord]) -> anyhow::Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut partitioned = vec![Vec::<VectorRecord>::new(); self.cfg.shard_count];
+        for row in rows {
+            partitioned[self.shard_for_id(row.id)].push(row.clone());
+        }
+        let mut total = 0usize;
+        for (shard_id, chunk) in partitioned.into_iter().enumerate() {
+            if chunk.is_empty() {
+                continue;
+            }
+            total += self.shards[shard_id]
+                .try_upsert_batch(&chunk)
+                .with_context(|| format!("upsert batch shard {}", shard_id))?;
+        }
+        Ok(total)
+    }
+
     pub fn try_delete(&mut self, id: u64) -> anyhow::Result<bool> {
         let shard = self.shard_for_id(id);
         self.shards[shard]
             .try_delete(id)
             .with_context(|| format!("delete shard {}", shard))
+    }
+
+    pub fn try_delete_batch(&mut self, ids: &[u64]) -> anyhow::Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut partitioned = vec![Vec::<u64>::new(); self.cfg.shard_count];
+        for id in ids {
+            partitioned[self.shard_for_id(*id)].push(*id);
+        }
+        let mut total_deleted = 0usize;
+        for (shard_id, chunk) in partitioned.into_iter().enumerate() {
+            if chunk.is_empty() {
+                continue;
+            }
+            total_deleted += self.shards[shard_id]
+                .try_delete_batch(&chunk)
+                .with_context(|| format!("delete batch shard {}", shard_id))?;
+        }
+        Ok(total_deleted)
     }
 
     pub fn force_rebuild(&self) -> anyhow::Result<()> {
@@ -336,6 +376,35 @@ mod tests {
         assert_eq!(idx.len(), 2);
         let got = idx.search(&vec![0.2; 64], 3);
         assert!(got.iter().all(|n| n.id != 18));
+        Ok(())
+    }
+
+    #[test]
+    fn sharded_batch_upsert_delete_round_trip() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let cfg = SpFreshLayerDbShardedConfig {
+            shard_count: 4,
+            ..Default::default()
+        };
+        {
+            let mut idx = SpFreshLayerDbShardedIndex::open(dir.path(), cfg.clone())?;
+            let rows = vec![
+                crate::types::VectorRecord::new(1, vec![0.1; cfg.shard.spfresh.dim]),
+                crate::types::VectorRecord::new(2, vec![0.2; cfg.shard.spfresh.dim]),
+                crate::types::VectorRecord::new(9, vec![0.9; cfg.shard.spfresh.dim]),
+                crate::types::VectorRecord::new(1, vec![0.15; cfg.shard.spfresh.dim]),
+            ];
+            assert_eq!(idx.try_upsert_batch(&rows)?, 3);
+            assert_eq!(idx.try_delete_batch(&[2, 2, 99])?, 1);
+            idx.close()?;
+        }
+
+        let idx = SpFreshLayerDbShardedIndex::open(dir.path(), cfg)?;
+        assert_eq!(idx.len(), 2);
+        let got = idx.search(&vec![0.9; 64], 2);
+        assert!(got.iter().all(|n| n.id != 2));
+        assert!(got.iter().any(|n| n.id == 1));
+        assert!(got.iter().any(|n| n.id == 9));
         Ok(())
     }
 

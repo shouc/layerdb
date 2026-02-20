@@ -554,36 +554,21 @@ impl SpFreshLayerDbIndex {
         index: &mut RuntimeSpFreshIndex,
         from_seq: u64,
     ) -> anyhow::Result<()> {
-        #[derive(Debug)]
-        enum ReplayAction {
-            Upsert(Vec<f32>),
-            Delete,
-            LookupRowState,
-        }
-
         let entries = load_wal_entries_since(db, from_seq)?;
         if entries.is_empty() {
             return Ok(());
         }
 
-        let mut latest: HashMap<u64, ReplayAction> = HashMap::with_capacity(entries.len());
+        let mut touched = HashSet::with_capacity(entries.len());
         for entry in entries {
-            match entry {
-                IndexWalEntry::Upsert { id, vector } => {
-                    latest.insert(id, ReplayAction::Upsert(vector));
-                }
-                IndexWalEntry::Delete { id } => {
-                    latest.insert(id, ReplayAction::Delete);
-                }
-                IndexWalEntry::DiskMetaUpsert { id, .. } | IndexWalEntry::DiskMetaDelete { id } => {
-                    latest.insert(id, ReplayAction::LookupRowState);
-                }
-            }
+            let IndexWalEntry::Touch { id } = entry;
+            touched.insert(id);
         }
 
-        for (id, action) in latest {
-            match action {
-                ReplayAction::Upsert(values) => match index {
+        for id in touched {
+            let resolved = Self::load_vector_for_id(db, vector_cache, vector_blocks, generation, id)?;
+            match resolved {
+                Some(values) => match index {
                     RuntimeSpFreshIndex::Resident(index) => index.upsert(id, values),
                     RuntimeSpFreshIndex::OffHeap(index) => {
                         let mut loader = Self::loader_for(
@@ -600,7 +585,7 @@ impl SpFreshLayerDbIndex {
                         index.apply_upsert(None, posting, values);
                     }
                 },
-                ReplayAction::Delete => match index {
+                None => match index {
                     RuntimeSpFreshIndex::Resident(index) => {
                         let _ = index.delete(id);
                     }
@@ -612,43 +597,6 @@ impl SpFreshLayerDbIndex {
                     RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
                         let _ = index.apply_delete(None);
                     }
-                },
-                ReplayAction::LookupRowState => match load_row(db, generation, id)? {
-                    Some(row) => match index {
-                        RuntimeSpFreshIndex::Resident(index) => index.upsert(row.id, row.values),
-                        RuntimeSpFreshIndex::OffHeap(index) => {
-                            let mut loader = Self::loader_for(
-                                db,
-                                vector_cache,
-                                vector_blocks,
-                                generation,
-                                Some((row.id, row.values.clone())),
-                            );
-                            index.upsert_with(row.id, row.values, &mut loader)?;
-                        }
-                        RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
-                            let posting = index.choose_posting(&row.values).unwrap_or_default();
-                            index.apply_upsert(None, posting, row.values);
-                        }
-                    },
-                    None => match index {
-                        RuntimeSpFreshIndex::Resident(index) => {
-                            let _ = index.delete(id);
-                        }
-                        RuntimeSpFreshIndex::OffHeap(index) => {
-                            let mut loader = Self::loader_for(
-                                db,
-                                vector_cache,
-                                vector_blocks,
-                                generation,
-                                None,
-                            );
-                            let _ = index.delete_with(id, &mut loader)?;
-                        }
-                        RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
-                            let _ = index.apply_delete(None);
-                        }
-                    },
                 },
             }
         }
@@ -1342,11 +1290,7 @@ impl SpFreshLayerDbIndex {
                     }
                 }
                 persist_entries.push((
-                    IndexWalEntry::DiskMetaUpsert {
-                        id: *id,
-                        new_posting,
-                        new_vector: vector.clone(),
-                    },
+                    IndexWalEntry::Touch { id: *id },
                     ops,
                 ));
                 apply_entries.push((*id, old.clone(), new_posting, vector.clone()));
@@ -1423,10 +1367,7 @@ impl SpFreshLayerDbIndex {
             let row = VectorRecord::new(*id, vector.clone());
             let value = encode_vector_row_value(&row).context("serialize vector row")?;
             persist_entries.push((
-                IndexWalEntry::Upsert {
-                    id: *id,
-                    vector: vector.clone(),
-                },
+                IndexWalEntry::Touch { id: *id },
                 vec![layerdb::Op::put(vector_key(generation, *id), value)],
             ));
         }
@@ -1521,7 +1462,7 @@ impl SpFreshLayerDbIndex {
                     ));
                 }
                 persist_entries.push((
-                    IndexWalEntry::DiskMetaDelete { id: *id },
+                    IndexWalEntry::Touch { id: *id },
                     ops,
                 ));
                 apply_entries.push((*id, old));
@@ -1589,7 +1530,7 @@ impl SpFreshLayerDbIndex {
         let mut persist_entries = Vec::with_capacity(mutations.len());
         for id in &mutations {
             persist_entries.push((
-                IndexWalEntry::Delete { id: *id },
+                IndexWalEntry::Touch { id: *id },
                 vec![layerdb::Op::delete(vector_key(generation, *id))],
             ));
         }

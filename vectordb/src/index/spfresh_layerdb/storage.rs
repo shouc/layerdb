@@ -460,65 +460,20 @@ pub(crate) fn wal_key(seq: u64) -> String {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum IndexWalEntry {
-    Upsert {
-        id: u64,
-        vector: Vec<f32>,
-    },
-    Delete {
-        id: u64,
-    },
-    DiskMetaUpsert {
-        id: u64,
-        new_posting: usize,
-        new_vector: Vec<f32>,
-    },
-    DiskMetaDelete {
+    Touch {
         id: u64,
     },
 }
 
 const WAL_BIN_TAG: &[u8] = b"wl2";
-const WAL_KIND_UPSERT: u8 = 1;
-const WAL_KIND_DELETE: u8 = 2;
-const WAL_KIND_DISKMETA_UPSERT: u8 = 3;
-const WAL_KIND_DISKMETA_DELETE: u8 = 4;
+const WAL_KIND_TOUCH: u8 = 1;
 
 pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(WAL_BIN_TAG.len() + 1 + 8);
     out.extend_from_slice(WAL_BIN_TAG);
     match entry {
-        IndexWalEntry::Upsert { id, vector } => {
-            out.push(WAL_KIND_UPSERT);
-            out.extend_from_slice(&id.to_le_bytes());
-            let dim = u32::try_from(vector.len()).context("wal vector dim does not fit u32")?;
-            out.extend_from_slice(&dim.to_le_bytes());
-            for value in vector {
-                out.extend_from_slice(&value.to_bits().to_le_bytes());
-            }
-        }
-        IndexWalEntry::Delete { id } => {
-            out.push(WAL_KIND_DELETE);
-            out.extend_from_slice(&id.to_le_bytes());
-        }
-        IndexWalEntry::DiskMetaUpsert {
-            id,
-            new_posting,
-            new_vector,
-        } => {
-            out.push(WAL_KIND_DISKMETA_UPSERT);
-            out.extend_from_slice(&id.to_le_bytes());
-            let posting =
-                u64::try_from(*new_posting).context("wal posting id does not fit u64")?;
-            out.extend_from_slice(&posting.to_le_bytes());
-            let dim =
-                u32::try_from(new_vector.len()).context("wal diskmeta vector dim does not fit u32")?;
-            out.extend_from_slice(&dim.to_le_bytes());
-            for value in new_vector {
-                out.extend_from_slice(&value.to_bits().to_le_bytes());
-            }
-        }
-        IndexWalEntry::DiskMetaDelete { id } => {
-            out.push(WAL_KIND_DISKMETA_DELETE);
+        IndexWalEntry::Touch { id } => {
+            out.push(WAL_KIND_TOUCH);
             out.extend_from_slice(&id.to_le_bytes());
         }
     }
@@ -532,40 +487,9 @@ pub(crate) fn decode_wal_entry(raw: &[u8]) -> anyhow::Result<IndexWalEntry> {
     let mut cursor = WAL_BIN_TAG.len();
     let kind = read_u8(raw, &mut cursor)?;
     let entry = match kind {
-        WAL_KIND_UPSERT => {
+        WAL_KIND_TOUCH => {
             let id = read_u64(raw, &mut cursor)?;
-            let dim =
-                usize::try_from(read_u32(raw, &mut cursor)?).context("wal vector dim overflow")?;
-            let mut vector = Vec::with_capacity(dim);
-            for _ in 0..dim {
-                vector.push(read_f32(raw, &mut cursor)?);
-            }
-            IndexWalEntry::Upsert { id, vector }
-        }
-        WAL_KIND_DELETE => {
-            let id = read_u64(raw, &mut cursor)?;
-            IndexWalEntry::Delete { id }
-        }
-        WAL_KIND_DISKMETA_UPSERT => {
-            let id = read_u64(raw, &mut cursor)?;
-            let posting_u64 = read_u64(raw, &mut cursor)?;
-            let new_posting =
-                usize::try_from(posting_u64).context("wal posting id does not fit usize")?;
-            let dim = usize::try_from(read_u32(raw, &mut cursor)?)
-                .context("wal diskmeta vector dim overflow")?;
-            let mut new_vector = Vec::with_capacity(dim);
-            for _ in 0..dim {
-                new_vector.push(read_f32(raw, &mut cursor)?);
-            }
-            IndexWalEntry::DiskMetaUpsert {
-                id,
-                new_posting,
-                new_vector,
-            }
-        }
-        WAL_KIND_DISKMETA_DELETE => {
-            let id = read_u64(raw, &mut cursor)?;
-            IndexWalEntry::DiskMetaDelete { id }
+            IndexWalEntry::Touch { id }
         }
         _ => anyhow::bail!("unsupported wal kind {}", kind),
     };

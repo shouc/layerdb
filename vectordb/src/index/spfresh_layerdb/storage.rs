@@ -258,6 +258,13 @@ pub(crate) fn wal_key(seq: u64) -> String {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum IndexWalEntry {
+    Upsert {
+        id: u64,
+        vector: Vec<f32>,
+    },
+    Delete {
+        id: u64,
+    },
     IdOnly {
         id: u64,
     },
@@ -276,6 +283,8 @@ pub(crate) enum IndexWalEntry {
 impl IndexWalEntry {
     pub(crate) fn id(&self) -> u64 {
         match self {
+            Self::Upsert { id, .. } => *id,
+            Self::Delete { id } => *id,
             Self::IdOnly { id } => *id,
             Self::DiskMetaUpsert { id, .. } => *id,
             Self::DiskMetaDelete { id, .. } => *id,
@@ -324,13 +333,6 @@ pub(crate) fn load_wal_entries_since(
         out.push(entry);
     }
     Ok(out)
-}
-
-pub(crate) fn load_wal_touched_ids_since(db: &Db, start_seq: u64) -> anyhow::Result<Vec<u64>> {
-    Ok(load_wal_entries_since(db, start_seq)?
-        .into_iter()
-        .map(|entry| entry.id())
-        .collect())
 }
 
 pub(crate) fn prune_wal_before(db: &Db, seq_exclusive: u64, sync: bool) -> anyhow::Result<()> {

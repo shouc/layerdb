@@ -30,11 +30,10 @@ use storage::{
     encode_wal_entry, ensure_active_generation, ensure_metadata, ensure_wal_exists,
     ensure_wal_next_seq, load_index_checkpoint_bytes, load_metadata, load_posting_assignment,
     load_posting_assignments, load_posting_members, load_row, load_rows, load_wal_entries_since,
-    load_wal_touched_ids_since, persist_index_checkpoint_bytes, posting_assignment_value,
-    posting_map_key, posting_map_prefix, posting_member_key, posting_member_value,
-    posting_members_generation_prefix, prefix_exclusive_end, prune_wal_before,
-    refresh_read_snapshot, set_active_generation, validate_config, vector_key, vector_prefix,
-    wal_key, IndexWalEntry,
+    persist_index_checkpoint_bytes, posting_assignment_value, posting_map_key, posting_map_prefix,
+    posting_member_key, posting_member_value, posting_members_generation_prefix,
+    prefix_exclusive_end, prune_wal_before, refresh_read_snapshot, set_active_generation,
+    validate_config, vector_key, vector_prefix, wal_key, IndexWalEntry,
 };
 use sync_utils::{lock_mutex, lock_read, lock_write};
 
@@ -352,34 +351,54 @@ impl SpFreshLayerDbIndex {
         index: &mut RuntimeSpFreshIndex,
         from_seq: u64,
     ) -> anyhow::Result<()> {
-        let touched_ids = load_wal_touched_ids_since(db, from_seq)?;
-        if touched_ids.is_empty() {
+        #[derive(Debug)]
+        enum ReplayAction {
+            Upsert(Vec<f32>),
+            Delete,
+            LookupRowState,
+        }
+
+        let entries = load_wal_entries_since(db, from_seq)?;
+        if entries.is_empty() {
             return Ok(());
         }
 
-        let mut unique = HashSet::with_capacity(touched_ids.len());
-        for id in touched_ids {
-            unique.insert(id);
+        let mut latest: HashMap<u64, ReplayAction> = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            match entry {
+                IndexWalEntry::Upsert { id, vector } => {
+                    latest.insert(id, ReplayAction::Upsert(vector));
+                }
+                IndexWalEntry::Delete { id } => {
+                    latest.insert(id, ReplayAction::Delete);
+                }
+                IndexWalEntry::IdOnly { id }
+                | IndexWalEntry::DiskMetaUpsert { id, .. }
+                | IndexWalEntry::DiskMetaDelete { id, .. } => {
+                    latest.insert(id, ReplayAction::LookupRowState);
+                }
+            }
         }
-        for id in unique {
-            match load_row(db, generation, id)? {
-                Some(row) => match index {
-                    RuntimeSpFreshIndex::Resident(index) => index.upsert(row.id, row.values),
+
+        for (id, action) in latest {
+            match action {
+                ReplayAction::Upsert(values) => match index {
+                    RuntimeSpFreshIndex::Resident(index) => index.upsert(id, values),
                     RuntimeSpFreshIndex::OffHeap(index) => {
                         let mut loader = Self::loader_for(
                             db,
                             vector_cache,
                             generation,
-                            Some((row.id, row.values.clone())),
+                            Some((id, values.clone())),
                         );
-                        index.upsert_with(row.id, row.values, &mut loader)?;
+                        index.upsert_with(id, values, &mut loader)?;
                     }
                     RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
-                        let posting = index.choose_posting(&row.values).unwrap_or_default();
-                        index.apply_upsert(None, posting, row.values);
+                        let posting = index.choose_posting(&values).unwrap_or_default();
+                        index.apply_upsert(None, posting, values);
                     }
                 },
-                None => match index {
+                ReplayAction::Delete => match index {
                     RuntimeSpFreshIndex::Resident(index) => {
                         let _ = index.delete(id);
                     }
@@ -390,6 +409,36 @@ impl SpFreshLayerDbIndex {
                     RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
                         let _ = index.apply_delete(None);
                     }
+                },
+                ReplayAction::LookupRowState => match load_row(db, generation, id)? {
+                    Some(row) => match index {
+                        RuntimeSpFreshIndex::Resident(index) => index.upsert(row.id, row.values),
+                        RuntimeSpFreshIndex::OffHeap(index) => {
+                            let mut loader = Self::loader_for(
+                                db,
+                                vector_cache,
+                                generation,
+                                Some((row.id, row.values.clone())),
+                            );
+                            index.upsert_with(row.id, row.values, &mut loader)?;
+                        }
+                        RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
+                            let posting = index.choose_posting(&row.values).unwrap_or_default();
+                            index.apply_upsert(None, posting, row.values);
+                        }
+                    },
+                    None => match index {
+                        RuntimeSpFreshIndex::Resident(index) => {
+                            let _ = index.delete(id);
+                        }
+                        RuntimeSpFreshIndex::OffHeap(index) => {
+                            let mut loader = Self::loader_for(db, vector_cache, generation, None);
+                            let _ = index.delete_with(id, &mut loader)?;
+                        }
+                        RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
+                            let _ = index.apply_delete(None);
+                        }
+                    },
                 },
             }
         }
@@ -407,6 +456,9 @@ impl SpFreshLayerDbIndex {
         let entries = load_wal_entries_since(db, from_seq)?;
         for entry in entries {
             match entry {
+                IndexWalEntry::Upsert { .. } | IndexWalEntry::Delete { .. } => {
+                    anyhow::bail!("non-diskmeta wal entry cannot be replayed for diskmeta")
+                }
                 IndexWalEntry::IdOnly { .. } => {
                     anyhow::bail!("legacy id-only wal entry cannot be replayed for diskmeta")
                 }
@@ -725,20 +777,25 @@ impl SpFreshLayerDbIndex {
         Ok(())
     }
 
-    fn persist_with_wal(&self, id: u64, vector_op: layerdb::Op) -> anyhow::Result<()> {
-        self.persist_with_wal_ops(IndexWalEntry::IdOnly { id }, vec![vector_op])
-    }
-
     fn persist_upsert(&self, id: u64, vector: &[f32]) -> anyhow::Result<()> {
         let generation = self.active_generation.load(Ordering::Relaxed);
         let row = VectorRecord::new(id, vector.to_vec());
         let value = bincode::serialize(&row).context("serialize vector row")?;
-        self.persist_with_wal(id, layerdb::Op::put(vector_key(generation, id), value))
+        self.persist_with_wal_ops(
+            IndexWalEntry::Upsert {
+                id,
+                vector: vector.to_vec(),
+            },
+            vec![layerdb::Op::put(vector_key(generation, id), value)],
+        )
     }
 
     fn persist_delete(&self, id: u64) -> anyhow::Result<()> {
         let generation = self.active_generation.load(Ordering::Relaxed);
-        self.persist_with_wal(id, layerdb::Op::delete(vector_key(generation, id)))
+        self.persist_with_wal_ops(
+            IndexWalEntry::Delete { id },
+            vec![layerdb::Op::delete(vector_key(generation, id))],
+        )
     }
 
     fn persist_diskmeta_upsert(

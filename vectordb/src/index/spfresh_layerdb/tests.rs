@@ -276,6 +276,36 @@ fn startup_replays_wal_tail_after_checkpoint() -> anyhow::Result<()> {
 }
 
 #[test]
+fn startup_replays_typed_wal_tail_without_vector_rows() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig::default();
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(1, vec![0.1; cfg.spfresh.dim])?;
+        idx.close()?;
+    }
+
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(2, vec![0.2; cfg.spfresh.dim])?;
+    }
+
+    let db = Db::open(dir.path(), cfg.db_options.clone())?;
+    let generation = super::storage::ensure_active_generation(&db)?;
+    db.delete(
+        super::storage::vector_key(generation, 2),
+        WriteOptions { sync: true },
+    )?;
+
+    let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
+    assert_eq!(idx.len(), 2);
+    let got = idx.search(&vec![0.2; 64], 2);
+    assert!(got.iter().any(|n| n.id == 1));
+    assert!(got.iter().any(|n| n.id == 2));
+    Ok(())
+}
+
+#[test]
 fn offheap_diskmeta_replays_wal_tail_without_row_rebuild() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let cfg = SpFreshLayerDbConfig {

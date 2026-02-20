@@ -234,6 +234,36 @@ impl SpFreshLayerDbShardedIndex {
         Ok(total)
     }
 
+    pub fn try_upsert_batch_owned(&mut self, rows: Vec<VectorRecord>) -> anyhow::Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut partitioned = vec![Vec::<VectorRecord>::new(); self.cfg.shard_count];
+        for row in rows {
+            partitioned[self.shard_for_id(row.id)].push(row);
+        }
+        let results: Vec<anyhow::Result<usize>> = self
+            .shards
+            .par_iter_mut()
+            .enumerate()
+            .map(|(shard_id, shard)| {
+                let chunk = &partitioned[shard_id];
+                if chunk.is_empty() {
+                    Ok(0)
+                } else {
+                    shard
+                        .try_upsert_batch(chunk)
+                        .with_context(|| format!("upsert batch shard {}", shard_id))
+                }
+            })
+            .collect();
+        let mut total = 0usize;
+        for result in results {
+            total += result?;
+        }
+        Ok(total)
+    }
+
     pub fn try_delete(&mut self, id: u64) -> anyhow::Result<bool> {
         let shard = self.shard_for_id(id);
         self.shards[shard]

@@ -59,13 +59,27 @@ impl SpFreshLayerDbShardedIndex {
         let root = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)
             .with_context(|| format!("create sharded index root {}", root.display()))?;
-        let mut shards = Vec::with_capacity(cfg.shard_count);
         for shard_id in 0..cfg.shard_count {
             let shard_path = Self::shard_path(&root, shard_id);
             std::fs::create_dir_all(&shard_path)
                 .with_context(|| format!("create shard dir {}", shard_path.display()))?;
-            let shard = SpFreshLayerDbIndex::open(&shard_path, cfg.shard.clone())
-                .with_context(|| format!("open shard {} at {}", shard_id, shard_path.display()))?;
+        }
+        let mut opened: Vec<anyhow::Result<(usize, SpFreshLayerDbIndex)>> = (0..cfg.shard_count)
+            .into_par_iter()
+            .map(|shard_id| {
+                let shard_path = Self::shard_path(&root, shard_id);
+                let shard = SpFreshLayerDbIndex::open(&shard_path, cfg.shard.clone())
+                    .with_context(|| format!("open shard {} at {}", shard_id, shard_path.display()))?;
+                Ok((shard_id, shard))
+            })
+            .collect();
+        let mut shards = Vec::with_capacity(cfg.shard_count);
+        let mut pairs = Vec::with_capacity(cfg.shard_count);
+        for result in opened.drain(..) {
+            pairs.push(result?);
+        }
+        pairs.sort_by_key(|(id, _)| *id);
+        for (_id, shard) in pairs {
             shards.push(shard);
         }
         Ok(Self { root, cfg, shards })
@@ -80,17 +94,28 @@ impl SpFreshLayerDbShardedIndex {
             anyhow::bail!("shard_count must be > 0");
         }
         let root = path.as_ref().to_path_buf();
+        let mut opened: Vec<anyhow::Result<(usize, SpFreshLayerDbIndex)>> = (0..shard_count)
+            .into_par_iter()
+            .map(|shard_id| {
+                let shard_path = Self::shard_path(&root, shard_id);
+                let shard = SpFreshLayerDbIndex::open_existing(&shard_path, db_options.clone())
+                    .with_context(|| {
+                        format!(
+                            "open existing shard {} at {}",
+                            shard_id,
+                            shard_path.display()
+                        )
+                    })?;
+                Ok((shard_id, shard))
+            })
+            .collect();
         let mut shards = Vec::with_capacity(shard_count);
-        for shard_id in 0..shard_count {
-            let shard_path = Self::shard_path(&root, shard_id);
-            let shard = SpFreshLayerDbIndex::open_existing(&shard_path, db_options.clone())
-                .with_context(|| {
-                    format!(
-                        "open existing shard {} at {}",
-                        shard_id,
-                        shard_path.display()
-                    )
-                })?;
+        let mut pairs = Vec::with_capacity(shard_count);
+        for result in opened.drain(..) {
+            pairs.push(result?);
+        }
+        pairs.sort_by_key(|(id, _)| *id);
+        for (_id, shard) in pairs {
             shards.push(shard);
         }
         Ok(Self {

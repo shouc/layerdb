@@ -195,6 +195,14 @@ impl VectorBlockStore {
         self.get_state(id).map(|state| state.values)
     }
 
+    pub(crate) fn live_len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub(crate) fn live_ids(&self) -> Vec<u64> {
+        self.offsets.keys().copied().collect()
+    }
+
     pub(crate) fn get_state(&self, id: u64) -> Option<VectorBlockState> {
         let offset = *self.offsets.get(&id)?;
         let mmap = self.mmap.as_ref()?;

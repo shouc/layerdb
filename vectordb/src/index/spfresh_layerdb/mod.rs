@@ -1053,6 +1053,37 @@ impl SpFreshLayerDbIndex {
         self.pending_ops.store(dirty.len(), Ordering::Relaxed);
     }
 
+    fn maybe_prewarm_vector_cache_from_blocks(&self) {
+        let capacity = lock_mutex(&self.vector_cache).capacity;
+        if capacity == 0 {
+            return;
+        }
+
+        let warmed = {
+            let blocks = lock_mutex(&self.vector_blocks);
+            if blocks.live_len() > capacity {
+                Vec::new()
+            } else {
+                let ids = blocks.live_ids();
+                let mut rows = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(values) = blocks.get(id) {
+                        rows.push((id, values));
+                    }
+                }
+                rows
+            }
+        };
+        if warmed.is_empty() {
+            return;
+        }
+
+        let mut cache = lock_mutex(&self.vector_cache);
+        for (id, values) in warmed {
+            cache.put(id, values);
+        }
+    }
+
     pub fn bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
         self.try_bulk_load(rows)
     }
@@ -1180,6 +1211,7 @@ impl SpFreshLayerDbIndex {
             cache.map.clear();
             cache.order.clear();
         }
+        self.maybe_prewarm_vector_cache_from_blocks();
         lock_mutex(&self.posting_members_cache).clear();
         lock_mutex(&self.dirty_ids).clear();
         self.pending_ops.store(0, Ordering::Relaxed);
@@ -1191,7 +1223,9 @@ impl SpFreshLayerDbIndex {
     pub fn force_rebuild(&self) -> anyhow::Result<()> {
         self.flush_pending_commits()?;
         let runtime = self.runtime();
-        rebuild_once(&runtime)
+        rebuild_once(&runtime)?;
+        self.maybe_prewarm_vector_cache_from_blocks();
+        Ok(())
     }
 
     fn persist_with_wal_batch_ops(

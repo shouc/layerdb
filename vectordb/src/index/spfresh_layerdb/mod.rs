@@ -72,6 +72,7 @@ pub struct VectorMutationBatchResult {
 type DiskMetaRowState = Option<(usize, Vec<f32>)>;
 type DiskMetaStateMap = HashMap<u64, DiskMetaRowState>;
 type EphemeralPostingMembers = HashMap<usize, HashMap<u64, PostingMemberSketch>>;
+type EphemeralRowStates = HashMap<u64, (usize, Vec<f32>)>;
 type DistanceRow = (u64, f32);
 type DistanceLoadResult = (Vec<DistanceRow>, Vec<u64>);
 const DISKMETA_RERANK_FACTOR: usize = 8;
@@ -254,6 +255,7 @@ pub struct SpFreshLayerDbIndex {
     vector_blocks: Arc<Mutex<VectorBlockStore>>,
     posting_members_cache: Arc<Mutex<PostingMembersCache>>,
     ephemeral_posting_members: Arc<Mutex<Option<EphemeralPostingMembers>>>,
+    ephemeral_row_states: Arc<Mutex<Option<EphemeralRowStates>>>,
     diskmeta_search_snapshot: Arc<ArcSwapOption<SpFreshDiskMetaIndex>>,
     wal_next_seq: Arc<AtomicU64>,
     posting_event_next_seq: Arc<AtomicU64>,
@@ -341,6 +343,7 @@ impl SpFreshLayerDbIndex {
             cfg.posting_delta_compact_budget_entries,
         )));
         let ephemeral_posting_members = Arc::new(Mutex::new(None));
+        let ephemeral_row_states = Arc::new(Mutex::new(None));
         let replay_from = applied_wal_seq.map_or(0, |seq| seq.saturating_add(1));
         if replay_from < wal_next_seq {
             if matches!(index_state, RuntimeSpFreshIndex::OffHeapDiskMeta(_)) {
@@ -431,6 +434,7 @@ impl SpFreshLayerDbIndex {
             vector_blocks,
             posting_members_cache,
             ephemeral_posting_members,
+            ephemeral_row_states,
             diskmeta_search_snapshot,
             wal_next_seq,
             posting_event_next_seq,
@@ -446,6 +450,7 @@ impl SpFreshLayerDbIndex {
             stats,
         };
         if out.use_nondurable_fast_path() && out.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
+            out.refresh_ephemeral_row_states_from_storage()?;
             out.refresh_ephemeral_posting_members_from_storage()?;
         }
         Ok(out)
@@ -828,6 +833,68 @@ impl SpFreshLayerDbIndex {
         }
         *lock_mutex(&self.ephemeral_posting_members) = Some(refreshed);
         Ok(())
+    }
+
+    fn refresh_ephemeral_row_states_from_storage(&self) -> anyhow::Result<()> {
+        if !self.use_nondurable_fast_path()
+            || self.cfg.memory_mode != SpFreshMemoryMode::OffHeapDiskMeta
+        {
+            *lock_mutex(&self.ephemeral_row_states) = None;
+            return Ok(());
+        }
+        let generation = self.active_generation.load(Ordering::Relaxed);
+        let (rows, assignments) = load_rows_with_posting_assignments(&self.db, generation)?;
+        let mut refreshed: EphemeralRowStates = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let Some(posting_id) = assignments.get(&row.id).copied() else {
+                continue;
+            };
+            refreshed.insert(row.id, (posting_id, row.values));
+        }
+        *lock_mutex(&self.ephemeral_row_states) = Some(refreshed);
+        Ok(())
+    }
+
+    fn load_ephemeral_row_states_for_ids(&self, ids: &[u64]) -> DiskMetaStateMap {
+        let guard = lock_mutex(&self.ephemeral_row_states);
+        let mut out = HashMap::with_capacity(ids.len());
+        if let Some(states) = guard.as_ref() {
+            for id in ids {
+                out.insert(*id, states.get(id).cloned());
+            }
+        } else {
+            for id in ids {
+                out.insert(*id, None);
+            }
+        }
+        out
+    }
+
+    fn apply_ephemeral_row_upserts(
+        &self,
+        mutations: &[(u64, Vec<f32>)],
+        new_postings: &HashMap<u64, usize>,
+    ) {
+        let mut guard = lock_mutex(&self.ephemeral_row_states);
+        let Some(states) = guard.as_mut() else {
+            return;
+        };
+        for (id, vector) in mutations {
+            let Some(new_posting) = new_postings.get(id).copied() else {
+                continue;
+            };
+            states.insert(*id, (new_posting, vector.clone()));
+        }
+    }
+
+    fn apply_ephemeral_row_deletes(&self, ids: &[u64]) {
+        let mut guard = lock_mutex(&self.ephemeral_row_states);
+        let Some(states) = guard.as_mut() else {
+            return;
+        };
+        for id in ids {
+            states.remove(id);
+        }
     }
 
     fn apply_ephemeral_posting_upsert_deltas(&self, deltas: Vec<(u64, Option<usize>, usize)>) {
@@ -1261,9 +1328,23 @@ impl SpFreshLayerDbIndex {
             Self::extract_diskmeta_snapshot(&guard)
         };
         self.diskmeta_search_snapshot.store(snapshot);
-        if self.use_nondurable_fast_path() && self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta
+        if self.use_nondurable_fast_path()
+            && self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta
         {
+            let mut ephemeral_states = HashMap::with_capacity(rows.len());
+            if let Some(assignments) = disk_assignments.as_ref() {
+                for row in rows {
+                    let Some(posting_id) = assignments.get(&row.id).copied() else {
+                        continue;
+                    };
+                    ephemeral_states.insert(row.id, (posting_id, row.values.clone()));
+                }
+            }
+            *lock_mutex(&self.ephemeral_row_states) = Some(ephemeral_states);
             self.refresh_ephemeral_posting_members_from_storage()?;
+        } else {
+            *lock_mutex(&self.ephemeral_row_states) = None;
+            *lock_mutex(&self.ephemeral_posting_members) = None;
         }
         {
             let mut cache = lock_mutex(&self.vector_cache);
@@ -1485,13 +1566,17 @@ impl SpFreshLayerDbIndex {
         let persist_started = Instant::now();
 
         if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
+            let use_fast_path = self.use_nondurable_fast_path();
             let ids: Vec<u64> = mutations.iter().map(|(id, _)| *id).collect();
-            let states = self.load_diskmeta_states_for_ids(generation, &ids)?;
+            let states = if use_fast_path {
+                self.load_ephemeral_row_states_for_ids(&ids)
+            } else {
+                self.load_diskmeta_states_for_ids(generation, &ids)?
+            };
             let mut shadow = match &*lock_read(&self.index) {
                 RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.clone(),
                 _ => anyhow::bail!("diskmeta upsert batch called for non-diskmeta index"),
             };
-            let use_fast_path = self.use_nondurable_fast_path();
             let mut posting_event_next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(3));
             let mut touched_ids = Vec::with_capacity(mutations.len());
@@ -1602,6 +1687,7 @@ impl SpFreshLayerDbIndex {
                 }
             }
             if use_fast_path {
+                self.apply_ephemeral_row_upserts(&mutations, &new_postings);
                 self.apply_ephemeral_posting_upsert_deltas(ephemeral_deltas);
             }
             for _ in 0..mutations.len() {
@@ -1696,12 +1782,16 @@ impl SpFreshLayerDbIndex {
         let persist_started = Instant::now();
 
         if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
-            let states = self.load_diskmeta_states_for_ids(generation, &mutations)?;
+            let use_fast_path = self.use_nondurable_fast_path();
+            let states = if use_fast_path {
+                self.load_ephemeral_row_states_for_ids(&mutations)
+            } else {
+                self.load_diskmeta_states_for_ids(generation, &mutations)?
+            };
             let mut shadow = match &*lock_read(&self.index) {
                 RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.clone(),
                 _ => anyhow::bail!("diskmeta delete batch called for non-diskmeta index"),
             };
-            let use_fast_path = self.use_nondurable_fast_path();
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(2));
             let mut touched_ids = Vec::with_capacity(mutations.len());
             let mut deleted = 0usize;
@@ -1793,6 +1883,7 @@ impl SpFreshLayerDbIndex {
                 }
             }
             if use_fast_path {
+                self.apply_ephemeral_row_deletes(&mutations);
                 self.apply_ephemeral_posting_delete_deltas(ephemeral_deletions);
             }
             for _ in 0..deleted {

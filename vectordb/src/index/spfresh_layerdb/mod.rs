@@ -31,15 +31,17 @@ use stats::SpFreshLayerDbStatsInner;
 use storage::{
     decode_vector_row_value, decode_vector_row_with_posting, encode_vector_row_value,
     encode_vector_row_value_with_posting, encode_wal_entry, ensure_active_generation,
-    ensure_metadata, ensure_wal_exists, ensure_wal_next_seq, load_index_checkpoint_bytes,
+    ensure_metadata, ensure_posting_event_next_seq, ensure_wal_exists, ensure_wal_next_seq,
+    load_index_checkpoint_bytes,
     load_metadata, load_posting_assignments, load_posting_members, load_row, load_rows,
     load_rows_with_posting_assignments,
     load_wal_entries_since, persist_index_checkpoint_bytes,
-    posting_map_key, posting_map_prefix, posting_member_key, posting_member_value_with_residual,
-    posting_member_value_with_residual_only,
-    posting_members_generation_prefix, prefix_exclusive_end, prune_wal_before,
-    refresh_read_snapshot, set_active_generation, validate_config, vector_key, vector_prefix,
-    wal_key, IndexWalEntry, PostingMember,
+    posting_map_key, posting_map_prefix, posting_member_event_key,
+    posting_member_event_tombstone_value, posting_member_event_upsert_value_with_residual,
+    posting_member_event_upsert_value_from_sketch, posting_members_generation_prefix,
+    posting_members_prefix, prefix_exclusive_end, prune_wal_before,
+    refresh_read_snapshot, set_active_generation, set_posting_event_next_seq, validate_config,
+    vector_key, vector_prefix, wal_key, IndexWalEntry, PostingMember,
 };
 use sync_utils::{lock_mutex, lock_read, lock_write};
 
@@ -70,6 +72,8 @@ pub struct VectorMutationBatchResult {
 type DiskMetaRowState = Option<(usize, Vec<f32>)>;
 type DiskMetaStateMap = HashMap<u64, DiskMetaRowState>;
 const DISKMETA_RERANK_FACTOR: usize = 8;
+const POSTING_LOG_COMPACT_MIN_EVENTS: usize = 512;
+const POSTING_LOG_COMPACT_FACTOR: usize = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum RuntimeSpFreshIndex {
@@ -279,6 +283,7 @@ pub struct SpFreshLayerDbIndex {
     posting_members_cache: Arc<Mutex<PostingMembersCache>>,
     diskmeta_search_snapshot: Arc<ArcSwapOption<SpFreshDiskMetaIndex>>,
     wal_next_seq: Arc<AtomicU64>,
+    posting_event_next_seq: Arc<AtomicU64>,
     rebuild_tx: mpsc::Sender<()>,
     stop_worker: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -330,6 +335,7 @@ impl SpFreshLayerDbIndex {
     fn open_with_db(db_path: &Path, db: Db, mut cfg: SpFreshLayerDbConfig) -> anyhow::Result<Self> {
         let generation = ensure_active_generation(&db)?;
         let wal_next_seq = ensure_wal_next_seq(&db)?;
+        let posting_event_next_seq = ensure_posting_event_next_seq(&db)?;
         let (mut index_state, applied_wal_seq) =
             Self::load_or_rebuild_index(&db, &cfg, generation, wal_next_seq)?;
         cfg.memory_mode = match &index_state {
@@ -379,6 +385,7 @@ impl SpFreshLayerDbIndex {
         let dirty_ids = Arc::new(Mutex::new(HashSet::new()));
         let pending_ops = Arc::new(AtomicUsize::new(0));
         let wal_next_seq = Arc::new(AtomicU64::new(wal_next_seq));
+        let posting_event_next_seq = Arc::new(AtomicU64::new(posting_event_next_seq));
         let stop_worker = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(SpFreshLayerDbStatsInner::default());
         let (rebuild_tx, rebuild_rx) = mpsc::channel::<()>();
@@ -413,6 +420,7 @@ impl SpFreshLayerDbIndex {
             posting_members_cache,
             diskmeta_search_snapshot,
             wal_next_seq,
+            posting_event_next_seq,
             rebuild_tx,
             stop_worker,
             worker: Some(worker),
@@ -706,20 +714,64 @@ impl SpFreshLayerDbIndex {
         if let Some(ids) = lock_mutex(&self.posting_members_cache).get(generation, posting_id) {
             return Ok(ids);
         }
-        let members = load_posting_members(&self.db, generation, posting_id)?;
-        let mut sketches = Vec::with_capacity(members.len());
+        let loaded = load_posting_members(&self.db, generation, posting_id)?;
+        if loaded.scanned_events >= POSTING_LOG_COMPACT_MIN_EVENTS
+            && loaded.scanned_events > loaded.members.len().saturating_mul(POSTING_LOG_COMPACT_FACTOR)
         {
-            let mut vector_cache = lock_mutex(&self.vector_cache);
-            for member in members {
-                sketches.push(PostingMemberSketch::from_loaded(&member));
-                if let Some(values) = member.values {
-                    vector_cache.put(member.id, values);
-                }
+            if let Err(err) =
+                self.compact_posting_members_log(generation, posting_id, &loaded.members)
+            {
+                eprintln!(
+                    "spfresh-layerdb posting log compaction failed generation={} posting={}: {err:#}",
+                    generation, posting_id
+                );
             }
+        }
+        let mut sketches = Vec::with_capacity(loaded.members.len());
+        for member in loaded.members {
+            sketches.push(PostingMemberSketch::from_loaded(&member));
         }
         let sketches = Arc::new(sketches);
         lock_mutex(&self.posting_members_cache).put_arc(generation, posting_id, sketches.clone());
         Ok(sketches)
+    }
+
+    fn compact_posting_members_log(
+        &self,
+        generation: u64,
+        posting_id: usize,
+        members: &[PostingMember],
+    ) -> anyhow::Result<()> {
+        let mut canonical = members.to_vec();
+        canonical.sort_by_key(|m| m.id);
+
+        let mut next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
+        let prefix = posting_members_prefix(generation, posting_id);
+        let prefix_bytes = prefix.into_bytes();
+        let end = prefix_exclusive_end(&prefix_bytes)?;
+        let mut ops = vec![layerdb::Op::delete_range(prefix_bytes, end)];
+        for member in canonical {
+            let seq = next_seq;
+            next_seq = next_seq.saturating_add(1);
+            let scale = member.residual_scale.unwrap_or(1.0);
+            let code = member.residual_code.unwrap_or_default();
+            let value = posting_member_event_upsert_value_from_sketch(member.id, scale, &code)?;
+            ops.push(layerdb::Op::put(
+                posting_member_event_key(generation, posting_id, seq, member.id),
+                value,
+            ));
+        }
+        let posting_event_next =
+            bincode::serialize(&next_seq).context("encode posting-event next seq")?;
+        ops.push(layerdb::Op::put(
+            config::META_POSTING_EVENT_NEXT_SEQ_KEY,
+            posting_event_next,
+        ));
+        self.db
+            .write_batch(ops, WriteOptions { sync: false })
+            .context("compact posting-member append log")?;
+        self.posting_event_next_seq.store(next_seq, Ordering::Relaxed);
+        Ok(())
     }
 
     fn neighbor_cmp(a: &Neighbor, b: &Neighbor) -> std::cmp::Ordering {
@@ -845,6 +897,7 @@ impl SpFreshLayerDbIndex {
             .ok_or_else(|| anyhow::anyhow!("active generation overflow"))?;
         let mut disk_assignments = None;
         let mut disk_index = None;
+        let mut posting_event_next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
         if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
             let (index, assignments) =
                 SpFreshDiskMetaIndex::build_with_assignments(self.cfg.spfresh.clone(), rows);
@@ -871,9 +924,15 @@ impl SpFreshLayerDbIndex {
                                 posting
                             )
                         })?;
+                    let event_seq = posting_event_next_seq;
+                    posting_event_next_seq = posting_event_next_seq.saturating_add(1);
                     ops.push(layerdb::Op::put(
-                        posting_member_key(new_generation, posting, row.id),
-                        posting_member_value_with_residual(row.id, &row.values, centroid)?,
+                        posting_member_event_key(new_generation, posting, event_seq, row.id),
+                        posting_member_event_upsert_value_with_residual(
+                            row.id,
+                            &row.values,
+                            centroid,
+                        )?,
                     ));
                 } else {
                     let value = encode_vector_row_value(row)
@@ -893,6 +952,11 @@ impl SpFreshLayerDbIndex {
         set_active_generation(&self.db, new_generation, self.cfg.write_sync)?;
         self.active_generation
             .store(new_generation, Ordering::Relaxed);
+        if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
+            set_posting_event_next_seq(&self.db, posting_event_next_seq, self.cfg.write_sync)?;
+            self.posting_event_next_seq
+                .store(posting_event_next_seq, Ordering::Relaxed);
+        }
 
         // best-effort cleanup of the old generation after pointer switch.
         for prefix in [
@@ -950,6 +1014,7 @@ impl SpFreshLayerDbIndex {
     fn persist_with_wal_batch_ops(
         &self,
         entries: Vec<(IndexWalEntry, Vec<layerdb::Op>)>,
+        mut trailer_ops: Vec<layerdb::Op>,
     ) -> anyhow::Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -970,6 +1035,7 @@ impl SpFreshLayerDbIndex {
             config::META_INDEX_WAL_NEXT_SEQ_KEY,
             wal_next,
         ));
+        ops.append(&mut trailer_ops);
         self.db
             .write_batch(
                 ops,
@@ -1125,6 +1191,8 @@ impl SpFreshLayerDbIndex {
                 RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.clone(),
                 _ => anyhow::bail!("diskmeta upsert batch called for non-diskmeta index"),
             };
+            let mut posting_event_next_seq =
+                self.posting_event_next_seq.load(Ordering::Relaxed);
 
             let mut persist_entries = Vec::with_capacity(mutations.len());
             let mut apply_entries = Vec::with_capacity(mutations.len());
@@ -1139,20 +1207,25 @@ impl SpFreshLayerDbIndex {
                 let row = VectorRecord::new(*id, vector.clone());
                 let value = encode_vector_row_value_with_posting(&row, Some(new_posting))
                     .context("serialize vector row")?;
+                let upsert_event_seq = posting_event_next_seq;
+                posting_event_next_seq = posting_event_next_seq.saturating_add(1);
                 let mut ops = vec![
                     layerdb::Op::put(vector_key(generation, *id), value),
                     layerdb::Op::put(
-                        posting_member_key(generation, new_posting, *id),
-                        posting_member_value_with_residual_only(*id, vector, centroid)?,
+                        posting_member_event_key(generation, new_posting, upsert_event_seq, *id),
+                        posting_member_event_upsert_value_with_residual(*id, vector, centroid)?,
                     ),
                 ];
                 if let Some((old_posting, _)) = &old {
                     if *old_posting != new_posting {
-                        ops.push(layerdb::Op::delete(posting_member_key(
+                        let tombstone_event_seq = posting_event_next_seq;
+                        posting_event_next_seq = posting_event_next_seq.saturating_add(1);
+                        ops.push(layerdb::Op::put(posting_member_event_key(
                             generation,
                             *old_posting,
+                            tombstone_event_seq,
                             *id,
-                        )));
+                        ), posting_member_event_tombstone_value(*id)?));
                     }
                 }
                 persist_entries.push((
@@ -1168,8 +1241,14 @@ impl SpFreshLayerDbIndex {
                 shadow.apply_upsert(old, new_posting, vector.clone());
                 states.insert(*id, Some((new_posting, vector.clone())));
             }
+            let posting_event_next = bincode::serialize(&posting_event_next_seq)
+                .context("encode posting-event next seq")?;
+            let trailer_ops = vec![layerdb::Op::put(
+                config::META_POSTING_EVENT_NEXT_SEQ_KEY,
+                posting_event_next,
+            )];
 
-            if let Err(err) = self.persist_with_wal_batch_ops(persist_entries) {
+            if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, trailer_ops) {
                 self.stats
                     .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
                 self.stats.inc_persist_errors();
@@ -1177,6 +1256,8 @@ impl SpFreshLayerDbIndex {
             }
             self.stats
                 .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
+            self.posting_event_next_seq
+                .store(posting_event_next_seq, Ordering::Relaxed);
 
             let snapshot = {
                 let mut index = lock_write(&self.index);
@@ -1224,7 +1305,7 @@ impl SpFreshLayerDbIndex {
                 vec![layerdb::Op::put(vector_key(generation, *id), value)],
             ));
         }
-        if let Err(err) = self.persist_with_wal_batch_ops(persist_entries) {
+        if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, Vec::new()) {
             self.stats
                 .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
             self.stats.inc_persist_errors();
@@ -1291,15 +1372,18 @@ impl SpFreshLayerDbIndex {
             let states = self.load_diskmeta_states_for_ids(generation, &mutations)?;
             let mut persist_entries = Vec::with_capacity(mutations.len());
             let mut apply_entries = Vec::with_capacity(mutations.len());
+            let mut posting_event_next_seq =
+                self.posting_event_next_seq.load(Ordering::Relaxed);
             for id in &mutations {
                 let old = states.get(id).cloned().unwrap_or(None);
                 let mut ops = vec![layerdb::Op::delete(vector_key(generation, *id))];
                 if let Some((old_posting, _)) = &old {
-                    ops.push(layerdb::Op::delete(posting_member_key(
-                        generation,
-                        *old_posting,
-                        *id,
-                    )));
+                    let tombstone_event_seq = posting_event_next_seq;
+                    posting_event_next_seq = posting_event_next_seq.saturating_add(1);
+                    ops.push(layerdb::Op::put(
+                        posting_member_event_key(generation, *old_posting, tombstone_event_seq, *id),
+                        posting_member_event_tombstone_value(*id)?,
+                    ));
                 }
                 persist_entries.push((
                     IndexWalEntry::DiskMetaDelete { id: *id },
@@ -1307,7 +1391,13 @@ impl SpFreshLayerDbIndex {
                 ));
                 apply_entries.push((*id, old));
             }
-            if let Err(err) = self.persist_with_wal_batch_ops(persist_entries) {
+            let posting_event_next = bincode::serialize(&posting_event_next_seq)
+                .context("encode posting-event next seq")?;
+            let trailer_ops = vec![layerdb::Op::put(
+                config::META_POSTING_EVENT_NEXT_SEQ_KEY,
+                posting_event_next,
+            )];
+            if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, trailer_ops) {
                 self.stats
                     .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
                 self.stats.inc_persist_errors();
@@ -1315,6 +1405,8 @@ impl SpFreshLayerDbIndex {
             }
             self.stats
                 .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
+            self.posting_event_next_seq
+                .store(posting_event_next_seq, Ordering::Relaxed);
 
             let mut deleted = 0usize;
             let snapshot = {
@@ -1357,7 +1449,7 @@ impl SpFreshLayerDbIndex {
                 vec![layerdb::Op::delete(vector_key(generation, *id))],
             ));
         }
-        if let Err(err) = self.persist_with_wal_batch_ops(persist_entries) {
+        if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, Vec::new()) {
             self.stats
                 .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
             self.stats.inc_persist_errors();

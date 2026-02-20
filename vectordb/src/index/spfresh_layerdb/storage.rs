@@ -12,7 +12,8 @@ use crate::types::VectorRecord;
 
 use super::config::{
     SpFreshLayerDbConfig, SpFreshPersistedMeta, INDEX_WAL_PREFIX, META_ACTIVE_GENERATION_KEY,
-    META_CONFIG_KEY, META_INDEX_CHECKPOINT_KEY, META_INDEX_WAL_NEXT_SEQ_KEY, META_SCHEMA_VERSION,
+    META_CONFIG_KEY, META_INDEX_CHECKPOINT_KEY, META_INDEX_WAL_NEXT_SEQ_KEY,
+    META_POSTING_EVENT_NEXT_SEQ_KEY, META_SCHEMA_VERSION,
     POSTING_MAP_ROOT_PREFIX, POSTING_MEMBERS_ROOT_PREFIX, VECTOR_ROOT_PREFIX,
 };
 
@@ -292,6 +293,29 @@ pub(crate) fn set_wal_next_seq(db: &Db, next_seq: u64, sync: bool) -> anyhow::Re
         .context("persist wal next seq")
 }
 
+pub(crate) fn ensure_posting_event_next_seq(db: &Db) -> anyhow::Result<u64> {
+    match db
+        .get(META_POSTING_EVENT_NEXT_SEQ_KEY, ReadOptions::default())
+        .context("read spfresh posting-event next seq")?
+    {
+        Some(bytes) => bincode::deserialize(bytes.as_ref()).context("decode posting-event next seq"),
+        None => {
+            set_posting_event_next_seq(db, 0, true)?;
+            Ok(0)
+        }
+    }
+}
+
+pub(crate) fn set_posting_event_next_seq(
+    db: &Db,
+    next_seq: u64,
+    sync: bool,
+) -> anyhow::Result<()> {
+    let bytes = bincode::serialize(&next_seq).context("encode posting-event next seq")?;
+    db.put(META_POSTING_EVENT_NEXT_SEQ_KEY, bytes, WriteOptions { sync })
+        .context("persist posting-event next seq")
+}
+
 pub(crate) fn refresh_read_snapshot(db: &Db) -> anyhow::Result<()> {
     db.write_batch(
         vec![
@@ -535,55 +559,31 @@ pub(crate) fn posting_members_generation_prefix(generation: u64) -> String {
     format!("{POSTING_MEMBERS_ROOT_PREFIX}{generation:016x}")
 }
 
-pub(crate) fn posting_member_key(generation: u64, posting_id: usize, id: u64) -> String {
-    format!("{}{id:020}", posting_members_prefix(generation, posting_id))
+pub(crate) fn posting_member_event_key(
+    generation: u64,
+    posting_id: usize,
+    seq: u64,
+    id: u64,
+) -> String {
+    format!("{}{seq:020}/{id:020}", posting_members_prefix(generation, posting_id))
 }
 
-const POSTING_MEMBER_RKYV_TAG: &[u8] = b"rk1";
-const POSTING_MEMBER_RKYV_V2_TAG: &[u8] = b"rk2";
+const POSTING_MEMBER_EVENT_RKYV_V3_TAG: &[u8] = b"pk3";
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug)]
 #[archive(check_bytes)]
-struct PostingMemberValueRkyv {
+struct PostingMemberEventValueRkyvV3 {
     id: u64,
-    values: Vec<f32>,
-}
-
-#[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug)]
-#[archive(check_bytes)]
-struct PostingMemberValueRkyvV2 {
-    id: u64,
-    values: Option<Vec<f32>>,
+    tombstone: bool,
     residual_scale: f32,
     residual_code: Vec<i8>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PostingMemberValueLegacy {
-    id: u64,
-    values: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PostingMember {
     pub id: u64,
-    pub values: Option<Vec<f32>>,
     pub residual_scale: Option<f32>,
     pub residual_code: Option<Vec<i8>>,
-}
-
-#[cfg(test)]
-pub(crate) fn posting_member_value(id: u64, values: &[f32]) -> anyhow::Result<Vec<u8>> {
-    let payload = PostingMemberValueRkyv {
-        id,
-        values: values.to_vec(),
-    };
-    let archived =
-        rkyv::to_bytes::<_, 1_024>(&payload).context("encode posting member value with rkyv")?;
-    let mut out = Vec::with_capacity(POSTING_MEMBER_RKYV_TAG.len() + archived.len());
-    out.extend_from_slice(POSTING_MEMBER_RKYV_TAG);
-    out.extend_from_slice(archived.as_ref());
-    Ok(out)
 }
 
 fn quantize_residual(values: &[f32], centroid: &[f32]) -> (f32, Vec<i8>) {
@@ -607,52 +607,62 @@ fn quantize_residual(values: &[f32], centroid: &[f32]) -> (f32, Vec<i8>) {
     (scale, code)
 }
 
-pub(crate) fn posting_member_value_with_residual(
+pub(crate) fn posting_member_event_upsert_value_with_residual(
     id: u64,
     values: &[f32],
     centroid: &[f32],
 ) -> anyhow::Result<Vec<u8>> {
     let (residual_scale, residual_code) = quantize_residual(values, centroid);
-    let payload = PostingMemberValueRkyvV2 {
+    posting_member_event_upsert_value_from_sketch(id, residual_scale, &residual_code)
+}
+
+pub(crate) fn posting_member_event_upsert_value_from_sketch(
+    id: u64,
+    residual_scale: f32,
+    residual_code: &[i8],
+) -> anyhow::Result<Vec<u8>> {
+    let payload = PostingMemberEventValueRkyvV3 {
         id,
-        values: Some(values.to_vec()),
+        tombstone: false,
         residual_scale,
-        residual_code,
+        residual_code: residual_code.to_vec(),
     };
     let archived = rkyv::to_bytes::<_, 1_024>(&payload)
         .context("encode posting member value (residual) with rkyv")?;
-    let mut out = Vec::with_capacity(POSTING_MEMBER_RKYV_V2_TAG.len() + archived.len());
-    out.extend_from_slice(POSTING_MEMBER_RKYV_V2_TAG);
+    let mut out = Vec::with_capacity(POSTING_MEMBER_EVENT_RKYV_V3_TAG.len() + archived.len());
+    out.extend_from_slice(POSTING_MEMBER_EVENT_RKYV_V3_TAG);
     out.extend_from_slice(archived.as_ref());
     Ok(out)
 }
 
-pub(crate) fn posting_member_value_with_residual_only(
-    id: u64,
-    values: &[f32],
-    centroid: &[f32],
-) -> anyhow::Result<Vec<u8>> {
-    let (residual_scale, residual_code) = quantize_residual(values, centroid);
-    let payload = PostingMemberValueRkyvV2 {
+pub(crate) fn posting_member_event_tombstone_value(id: u64) -> anyhow::Result<Vec<u8>> {
+    let payload = PostingMemberEventValueRkyvV3 {
         id,
-        values: None,
-        residual_scale,
-        residual_code,
+        tombstone: true,
+        residual_scale: 1.0,
+        residual_code: Vec::new(),
     };
     let archived = rkyv::to_bytes::<_, 1_024>(&payload)
-        .context("encode posting member value (residual) with rkyv")?;
-    let mut out = Vec::with_capacity(POSTING_MEMBER_RKYV_V2_TAG.len() + archived.len());
-    out.extend_from_slice(POSTING_MEMBER_RKYV_V2_TAG);
+        .context("encode posting member tombstone value with rkyv")?;
+    let mut out = Vec::with_capacity(POSTING_MEMBER_EVENT_RKYV_V3_TAG.len() + archived.len());
+    out.extend_from_slice(POSTING_MEMBER_EVENT_RKYV_V3_TAG);
     out.extend_from_slice(archived.as_ref());
     Ok(out)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PostingMembersLoadResult {
+    pub members: Vec<PostingMember>,
+    pub scanned_events: usize,
 }
 
 pub(crate) fn load_posting_members(
     db: &Db,
     generation: u64,
     posting_id: usize,
-) -> anyhow::Result<Vec<PostingMember>> {
-    let mut out = Vec::new();
+) -> anyhow::Result<PostingMembersLoadResult> {
+    let mut latest = HashMap::<u64, PostingMember>::new();
+    let mut scanned_events = 0usize;
     let prefix = posting_members_prefix(generation, posting_id);
     let prefix_bytes = prefix.as_bytes().to_vec();
     let end = prefix_exclusive_end(&prefix_bytes)?;
@@ -672,64 +682,49 @@ pub(crate) fn load_posting_members(
         let Some(value) = value else {
             continue;
         };
+        scanned_events = scanned_events.saturating_add(1);
         let raw = value.as_ref();
-        let decoded = (|| -> anyhow::Result<PostingMember> {
-            if raw.starts_with(POSTING_MEMBER_RKYV_V2_TAG) {
-                let mut aligned = rkyv::AlignedVec::with_capacity(
-                    raw.len().saturating_sub(POSTING_MEMBER_RKYV_V2_TAG.len()),
-                );
-                aligned.extend_from_slice(&raw[POSTING_MEMBER_RKYV_V2_TAG.len()..]);
-                let archived = rkyv::check_archived_root::<PostingMemberValueRkyvV2>(&aligned)
-                    .map_err(|err| anyhow::anyhow!("decode rkyv posting member v2: {err}"))?;
-                return Ok(PostingMember {
-                    id: archived.id,
-                    values: archived
-                        .values
-                        .as_ref()
-                        .map(|vals| vals.iter().copied().collect()),
-                    residual_scale: Some(archived.residual_scale),
-                    residual_code: Some(archived.residual_code.iter().copied().collect()),
-                });
+        let decoded = (|| -> anyhow::Result<PostingMemberEventValueRkyvV3> {
+            if !raw.starts_with(POSTING_MEMBER_EVENT_RKYV_V3_TAG) {
+                anyhow::bail!("unsupported posting-member event tag");
             }
-            if raw.starts_with(POSTING_MEMBER_RKYV_TAG) {
-                let mut aligned = rkyv::AlignedVec::with_capacity(
-                    raw.len().saturating_sub(POSTING_MEMBER_RKYV_TAG.len()),
-                );
-                aligned.extend_from_slice(&raw[POSTING_MEMBER_RKYV_TAG.len()..]);
-                let archived = rkyv::check_archived_root::<PostingMemberValueRkyv>(&aligned)
-                    .map_err(|err| anyhow::anyhow!("decode rkyv posting member: {err}"))?;
-                return Ok(PostingMember {
-                    id: archived.id,
-                    values: Some(archived.values.iter().copied().collect()),
-                    residual_scale: None,
-                    residual_code: None,
-                });
-            }
-            if let Ok(payload) = bincode::deserialize::<PostingMemberValueLegacy>(raw) {
-                return Ok(PostingMember {
-                    id: payload.id,
-                    values: Some(payload.values),
-                    residual_scale: None,
-                    residual_code: None,
-                });
-            }
-            let id = bincode::deserialize::<u64>(raw)?;
-            Ok(PostingMember {
-                id,
-                values: None,
-                residual_scale: None,
-                residual_code: None,
+            let mut aligned = rkyv::AlignedVec::with_capacity(
+                raw.len().saturating_sub(POSTING_MEMBER_EVENT_RKYV_V3_TAG.len()),
+            );
+            aligned.extend_from_slice(&raw[POSTING_MEMBER_EVENT_RKYV_V3_TAG.len()..]);
+            let archived = rkyv::check_archived_root::<PostingMemberEventValueRkyvV3>(&aligned)
+                .map_err(|err| anyhow::anyhow!("decode posting-member event: {err}"))?;
+            Ok(PostingMemberEventValueRkyvV3 {
+                id: archived.id,
+                tombstone: archived.tombstone,
+                residual_scale: archived.residual_scale,
+                residual_code: archived.residual_code.iter().copied().collect(),
             })
         })()
         .with_context(|| {
             format!(
-                "decode posting member key={}",
+                "decode posting-member event key={}",
                 String::from_utf8_lossy(&key)
             )
         })?;
-        out.push(decoded);
+        if decoded.tombstone {
+            latest.remove(&decoded.id);
+            continue;
+        }
+        latest.insert(
+            decoded.id,
+            PostingMember {
+                id: decoded.id,
+                residual_scale: Some(decoded.residual_scale),
+                residual_code: Some(decoded.residual_code),
+            },
+        );
     }
-    Ok(out)
+    let members = latest.into_values().collect();
+    Ok(PostingMembersLoadResult {
+        members,
+        scanned_events,
+    })
 }
 
 pub(crate) fn load_posting_assignments(

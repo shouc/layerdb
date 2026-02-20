@@ -397,16 +397,32 @@ fn posting_metadata_helpers_round_trip() -> anyhow::Result<()> {
                 super::storage::posting_assignment_value(7)?,
             ),
             Op::put(
-                super::storage::posting_member_key(generation, 7, 11),
-                super::storage::posting_member_value(11, &vec![0.11; cfg.spfresh.dim])?,
+                super::storage::posting_member_event_key(generation, 7, 1, 11),
+                super::storage::posting_member_event_upsert_value_with_residual(
+                    11,
+                    &vec![0.11; cfg.spfresh.dim],
+                    &vec![0.0; cfg.spfresh.dim],
+                )?,
             ),
             Op::put(
-                super::storage::posting_member_key(generation, 7, 12),
-                super::storage::posting_member_value(12, &vec![0.12; cfg.spfresh.dim])?,
+                super::storage::posting_member_event_key(generation, 7, 2, 12),
+                super::storage::posting_member_event_upsert_value_with_residual(
+                    12,
+                    &vec![0.12; cfg.spfresh.dim],
+                    &vec![0.0; cfg.spfresh.dim],
+                )?,
             ),
             Op::put(
-                super::storage::posting_member_key(generation, 7, 13),
-                bincode::serialize(&13u64)?,
+                super::storage::posting_member_event_key(generation, 7, 3, 13),
+                super::storage::posting_member_event_upsert_value_with_residual(
+                    13,
+                    &vec![0.13; cfg.spfresh.dim],
+                    &vec![0.0; cfg.spfresh.dim],
+                )?,
+            ),
+            Op::put(
+                super::storage::posting_member_event_key(generation, 7, 4, 13),
+                super::storage::posting_member_event_tombstone_value(13)?,
             ),
         ],
         WriteOptions { sync: true },
@@ -421,23 +437,19 @@ fn posting_metadata_helpers_round_trip() -> anyhow::Result<()> {
         None
     );
 
-    let mut posting_members = super::storage::load_posting_members(&db, generation, 7)?;
+    let loaded = super::storage::load_posting_members(&db, generation, 7)?;
+    assert_eq!(loaded.scanned_events, 4);
+    let mut posting_members = loaded.members;
     posting_members.sort_by_key(|entry| entry.id);
-    assert_eq!(posting_members.len(), 3);
+    posting_members.dedup_by_key(|entry| entry.id);
+    posting_members.shrink_to_fit();
     let members: Vec<u64> = posting_members.iter().map(|entry| entry.id).collect();
-    assert_eq!(members, vec![11, 12, 13]);
+    assert_eq!(members, vec![11, 12]);
+    assert_eq!(posting_members.len(), 2);
     assert_eq!(posting_members[0].id, 11);
-    assert_eq!(
-        posting_members[0].values.as_ref().map(Vec::len),
-        Some(cfg.spfresh.dim)
-    );
+    assert_eq!(posting_members[0].residual_code.as_ref().map(Vec::len), Some(cfg.spfresh.dim));
     assert_eq!(posting_members[1].id, 12);
-    assert_eq!(
-        posting_members[1].values.as_ref().map(Vec::len),
-        Some(cfg.spfresh.dim)
-    );
-    assert_eq!(posting_members[2].id, 13);
-    assert!(posting_members[2].values.is_none());
+    assert_eq!(posting_members[1].residual_code.as_ref().map(Vec::len), Some(cfg.spfresh.dim));
 
     let map_prefix = super::storage::posting_map_prefix(generation).into_bytes();
     let map_end = super::storage::prefix_exclusive_end(&map_prefix)?;
@@ -464,16 +476,19 @@ fn posting_member_residual_round_trip_omits_values_payload() -> anyhow::Result<(
     let vector = vec![0.75f32; cfg.spfresh.dim];
     db.write_batch(
         vec![Op::put(
-            super::storage::posting_member_key(generation, 5, 42),
-            super::storage::posting_member_value_with_residual_only(42, &vector, &centroid)?,
+            super::storage::posting_member_event_key(generation, 5, 1, 42),
+            super::storage::posting_member_event_upsert_value_with_residual(
+                42,
+                &vector,
+                &centroid,
+            )?,
         )],
         WriteOptions { sync: true },
     )?;
 
-    let members = super::storage::load_posting_members(&db, generation, 5)?;
+    let members = super::storage::load_posting_members(&db, generation, 5)?.members;
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].id, 42);
-    assert!(members[0].values.is_none());
     assert!(members[0].residual_scale.is_some());
     assert_eq!(
         members[0].residual_code.as_ref().map(Vec::len),

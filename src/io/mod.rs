@@ -161,6 +161,14 @@ impl UringExecutor {
 
     pub async fn append(&self, path: impl AsRef<Path>, data: &[u8]) -> anyhow::Result<u64> {
         let _permit = self.acquire_permit().await?;
+        if matches!(self.backend, IoBackend::Blocking | IoBackend::Kqueue) {
+            let path = path.as_ref().to_path_buf();
+            let data = data.to_vec();
+            let this = self.clone();
+            return tokio::task::spawn_blocking(move || this.append_blocking(path, &data))
+                .await
+                .context("join append task")?;
+        }
         let path = path.as_ref();
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -244,6 +252,14 @@ impl UringExecutor {
         data: &[u8],
     ) -> anyhow::Result<()> {
         let _permit = self.acquire_permit().await?;
+        if matches!(self.backend, IoBackend::Blocking | IoBackend::Kqueue) {
+            let path = path.as_ref().to_path_buf();
+            let data = data.to_vec();
+            let this = self.clone();
+            return tokio::task::spawn_blocking(move || this.write_all_at_blocking(path, offset, &data))
+                .await
+                .context("join write_all_at task")?;
+        }
         let path = path.as_ref();
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -269,6 +285,17 @@ impl UringExecutor {
         len: usize,
     ) -> anyhow::Result<Bytes> {
         let _permit = self.acquire_permit().await?;
+        if matches!(self.backend, IoBackend::Blocking | IoBackend::Kqueue) {
+            let path = path.as_ref().to_path_buf();
+            let this = self.clone();
+            return tokio::task::spawn_blocking(move || -> anyhow::Result<Bytes> {
+                let mut buf = vec![0u8; len];
+                this.read_into_at_blocking(path, offset, &mut buf)?;
+                Ok(Bytes::from(buf))
+            })
+            .await
+            .context("join read_exact_at task")?;
+        }
         let path = path.as_ref();
         let mut file = tokio::fs::OpenOptions::new()
             .read(true)
@@ -292,6 +319,20 @@ impl UringExecutor {
         buf: &mut [u8],
     ) -> anyhow::Result<()> {
         let _permit = self.acquire_permit().await?;
+        if matches!(self.backend, IoBackend::Blocking | IoBackend::Kqueue) {
+            let path = path.as_ref().to_path_buf();
+            let this = self.clone();
+            let len = buf.len();
+            let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+                let mut out = vec![0u8; len];
+                this.read_into_at_blocking(path, offset, &mut out)?;
+                Ok(out)
+            })
+            .await
+            .context("join read_into_at task")??;
+            buf.copy_from_slice(&bytes);
+            return Ok(());
+        }
         let path = path.as_ref();
         let mut file = tokio::fs::OpenOptions::new()
             .read(true)
@@ -309,6 +350,13 @@ impl UringExecutor {
 
     pub async fn sync_file(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         let _permit = self.acquire_permit().await?;
+        if matches!(self.backend, IoBackend::Blocking | IoBackend::Kqueue) {
+            let path = path.as_ref().to_path_buf();
+            let this = self.clone();
+            return tokio::task::spawn_blocking(move || this.sync_file_blocking(path))
+                .await
+                .context("join sync_file task")?;
+        }
         let path = path.as_ref();
         let file = tokio::fs::OpenOptions::new()
             .read(true)

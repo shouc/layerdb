@@ -176,20 +176,14 @@ struct PostingMembersCache {
     capacity: usize,
     map: HashMap<(u64, usize), Arc<Vec<PostingMemberSketch>>>,
     order: VecDeque<(u64, usize)>,
-    mutation_ops: usize,
-    compact_interval_ops: usize,
-    compact_budget_entries: usize,
 }
 
 impl PostingMembersCache {
-    fn new(capacity: usize, compact_interval_ops: usize, compact_budget_entries: usize) -> Self {
+    fn new(capacity: usize, _compact_interval_ops: usize, _compact_budget_entries: usize) -> Self {
         Self {
             capacity: capacity.max(1),
             map: HashMap::new(),
             order: VecDeque::new(),
-            mutation_ops: 0,
-            compact_interval_ops: compact_interval_ops.max(1),
-            compact_budget_entries: compact_budget_entries.max(1),
         }
     }
 
@@ -227,65 +221,8 @@ impl PostingMembersCache {
         self.map.insert((generation, posting_id), members);
     }
 
-    fn apply_upsert_delta(
-        &mut self,
-        generation: u64,
-        posting_id: usize,
-        member: PostingMemberSketch,
-    ) {
-        let key = (generation, posting_id);
-        let Some(current) = self.map.get(&key).cloned() else {
-            return;
-        };
-        let mut next: Vec<PostingMemberSketch> = current.as_ref().clone();
-        if let Some(existing) = next.iter_mut().find(|m| m.id == member.id) {
-            *existing = member;
-        } else {
-            next.push(member);
-        }
-        self.map.insert(key, Arc::new(next));
-        self.maybe_compact();
-    }
-
-    fn apply_delete_delta(&mut self, generation: u64, posting_id: usize, id: u64) {
-        let key = (generation, posting_id);
-        let Some(current) = self.map.get(&key).cloned() else {
-            return;
-        };
-        let mut next: Vec<PostingMemberSketch> = current
-            .iter()
-            .filter(|m| m.id != id)
-            .cloned()
-            .collect();
-        next.shrink_to_fit();
-        self.map.insert(key, Arc::new(next));
-        self.maybe_compact();
-    }
-
-    fn maybe_compact(&mut self) {
-        self.mutation_ops = self.mutation_ops.saturating_add(1);
-        if !self.mutation_ops.is_multiple_of(self.compact_interval_ops) {
-            return;
-        }
-
-        let mut compacted = 0usize;
-        let mut cursor = 0usize;
-        while compacted < self.compact_budget_entries && cursor < self.order.len() {
-            let key = self.order[cursor];
-            cursor += 1;
-            let Some(current) = self.map.get(&key).cloned() else {
-                continue;
-            };
-            if current.len() < 2 {
-                continue;
-            }
-            let mut next = current.as_ref().clone();
-            next.sort_by_key(|m| m.id);
-            next.dedup_by_key(|m| m.id);
-            next.shrink_to_fit();
-            self.map.insert(key, Arc::new(next));
-            compacted += 1;
-        }
+    fn invalidate(&mut self, generation: u64, posting_id: usize) {
+        self.map.remove(&(generation, posting_id));
     }
 
     fn clear(&mut self) {
@@ -1029,34 +966,6 @@ impl SpFreshLayerDbIndex {
         scored.into_iter().map(|(id, _)| id).collect()
     }
 
-    fn residual_sketch_for_member(id: u64, values: &[f32], centroid: &[f32]) -> PostingMemberSketch {
-        if values.len() != centroid.len() || values.is_empty() {
-            return PostingMemberSketch {
-                id,
-                residual_scale: None,
-                residual_code: None,
-            };
-        }
-        let mut max_abs = 0.0f32;
-        for (v, c) in values.iter().zip(centroid.iter()) {
-            let a = (*v - *c).abs();
-            if a > max_abs {
-                max_abs = a;
-            }
-        }
-        let scale = if max_abs <= 1e-9 { 1e-9 } else { max_abs / 127.0 };
-        let mut code = Vec::with_capacity(values.len());
-        for (v, c) in values.iter().zip(centroid.iter()) {
-            let q = ((*v - *c) / scale).round().clamp(-127.0, 127.0) as i8;
-            code.push(q);
-        }
-        PostingMemberSketch {
-            id,
-            residual_scale: Some(scale),
-            residual_code: Some(code),
-        }
-    }
-
     fn mark_dirty(&self, id: u64) {
         let mut dirty = lock_mutex(&self.dirty_ids);
         dirty.insert(id);
@@ -1476,14 +1385,13 @@ impl SpFreshLayerDbIndex {
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(3));
             let mut touched_ids = Vec::with_capacity(mutations.len());
             let mut new_postings = HashMap::with_capacity(mutations.len());
-            let mut cache_deltas = Vec::with_capacity(mutations.len());
+            let mut dirty_postings = HashSet::with_capacity(mutations.len().saturating_mul(2));
             for (id, vector) in &mutations {
                 let old = states.get(id).and_then(|state| state.as_ref());
                 let new_posting = shadow.choose_posting(vector).unwrap_or(0);
                 let centroid = shadow
                     .posting_centroid(new_posting)
                     .unwrap_or(vector.as_slice());
-                let sketch = Self::residual_sketch_for_member(*id, vector, centroid);
                 let value = encode_vector_row_fields(*id, 0, false, vector.as_slice(), Some(new_posting))
                     .context("serialize vector row")?;
                 let upsert_event_seq = posting_event_next_seq;
@@ -1507,7 +1415,10 @@ impl SpFreshLayerDbIndex {
                 }
                 touched_ids.push(*id);
                 let old_posting = old.map(|(posting, _)| *posting);
-                cache_deltas.push((*id, old_posting, new_posting, sketch));
+                if let Some(old_posting) = old_posting {
+                    dirty_postings.insert(old_posting);
+                }
+                dirty_postings.insert(new_posting);
                 shadow.apply_upsert_ref(
                     old.map(|(posting, values)| (*posting, values.as_slice())),
                     new_posting,
@@ -1562,13 +1473,8 @@ impl SpFreshLayerDbIndex {
             }
             {
                 let mut members_cache = lock_mutex(&self.posting_members_cache);
-                for (id, old_posting, new_posting, sketch) in cache_deltas {
-                    if let Some(old_posting) = old_posting {
-                        if old_posting != new_posting {
-                            members_cache.apply_delete_delta(generation, old_posting, id);
-                        }
-                    }
-                    members_cache.apply_upsert_delta(generation, new_posting, sketch);
+                for posting_id in dirty_postings {
+                    members_cache.invalidate(generation, posting_id);
                 }
             }
             for _ in 0..mutations.len() {
@@ -1669,12 +1575,14 @@ impl SpFreshLayerDbIndex {
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(2));
             let mut touched_ids = Vec::with_capacity(mutations.len());
             let mut deleted = 0usize;
+            let mut dirty_postings = HashSet::with_capacity(mutations.len());
             let mut posting_event_next_seq =
                 self.posting_event_next_seq.load(Ordering::Relaxed);
             for id in &mutations {
                 let old = states.get(id).cloned().unwrap_or(None);
                 batch_ops.push(layerdb::Op::delete(vector_key(generation, *id)));
                 if let Some((old_posting, _)) = &old {
+                    dirty_postings.insert(*old_posting);
                     let tombstone_event_seq = posting_event_next_seq;
                     posting_event_next_seq = posting_event_next_seq.saturating_add(1);
                     batch_ops.push(layerdb::Op::put(
@@ -1731,10 +1639,8 @@ impl SpFreshLayerDbIndex {
             }
             {
                 let mut members_cache = lock_mutex(&self.posting_members_cache);
-                for id in &mutations {
-                    if let Some(Some((old_posting, _))) = states.get(id) {
-                        members_cache.apply_delete_delta(generation, *old_posting, *id);
-                    }
+                for posting_id in dirty_postings {
+                    members_cache.invalidate(generation, posting_id);
                 }
             }
             for _ in 0..deleted {

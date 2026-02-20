@@ -296,9 +296,31 @@ impl SpFreshDiskMetaIndex {
     }
 
     pub(crate) fn choose_posting(&self, vector: &[f32]) -> Option<usize> {
-        self.nearest_postings(vector, 1)
-            .first()
-            .map(|(pid, _)| *pid)
+        if vector.len() != self.cfg.dim {
+            return None;
+        }
+        let candidates = self.candidate_postings_for_query(vector);
+        let mut best: Option<(usize, f32)> = None;
+        for posting_id in candidates {
+            let Some(posting) = self.postings.get(&posting_id) else {
+                continue;
+            };
+            let distance = squared_l2(vector, posting.centroid.as_slice());
+            match best {
+                Some((_best_id, best_distance)) if distance >= best_distance => {}
+                _ => best = Some((posting_id, distance)),
+            }
+        }
+        if best.is_none() {
+            for posting in self.postings.values() {
+                let distance = squared_l2(vector, posting.centroid.as_slice());
+                match best {
+                    Some((_best_id, best_distance)) if distance >= best_distance => {}
+                    _ => best = Some((posting.id, distance)),
+                }
+            }
+        }
+        best.map(|(posting_id, _)| posting_id)
     }
 
     pub(crate) fn posting_centroid(&self, posting_id: usize) -> Option<&[f32]> {

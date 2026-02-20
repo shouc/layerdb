@@ -19,6 +19,7 @@ use bytes::Bytes;
 use layerdb::{Db, DbOptions, ReadOptions, WriteOptions};
 use serde::{Deserialize, Serialize};
 
+use crate::columnar::VectorColumnarPage;
 use crate::types::{Neighbor, VectorIndex, VectorRecord};
 
 use super::spfresh_diskmeta::SpFreshDiskMetaIndex;
@@ -1512,13 +1513,15 @@ impl VectorIndex for SpFreshLayerDbIndex {
                 let vectors =
                     Self::load_vectors_for_ids(&self.db, &self.vector_cache, generation, &candidate_ids)
                         .unwrap_or_else(|err| panic!("offheap-diskmeta load vectors failed: {err:#}"));
-                for (id, values) in vectors {
+                let page = VectorColumnarPage::from_owned_rows(vectors, self.cfg.spfresh.dim)
+                    .unwrap_or_else(|err| panic!("offheap-diskmeta build columnar page failed: {err:#}"));
+                let local = page
+                    .scan_l2(query, k)
+                    .unwrap_or_else(|err| panic!("offheap-diskmeta columnar scan failed: {err:#}"));
+                for n in local {
                     Self::push_neighbor_topk(
                         &mut top,
-                        Neighbor {
-                            id,
-                            distance: crate::linalg::squared_l2(query, &values),
-                        },
+                        n,
                         k,
                     );
                 }

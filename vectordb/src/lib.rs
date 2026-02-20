@@ -1,5 +1,6 @@
 //! VectorDB core library.
 
+pub mod columnar;
 pub mod dataset;
 pub mod ground_truth;
 pub mod index;

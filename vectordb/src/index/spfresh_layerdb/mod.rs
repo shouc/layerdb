@@ -21,7 +21,7 @@ use bytes::Bytes;
 use layerdb::{Db, DbOptions, ReadOptions, WriteOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::columnar::VectorColumnarPage;
+use crate::linalg::squared_l2;
 use crate::types::{Neighbor, VectorIndex, VectorRecord};
 
 use super::spfresh_diskmeta::SpFreshDiskMetaIndex;
@@ -34,17 +34,14 @@ use storage::{
     decode_vector_row_value, decode_vector_row_with_posting, encode_vector_row_value,
     encode_vector_row_value_with_posting, encode_wal_entry, ensure_active_generation,
     ensure_metadata, ensure_posting_event_next_seq, ensure_wal_exists, ensure_wal_next_seq,
-    load_index_checkpoint_bytes,
-    load_startup_manifest_bytes,
-    load_metadata, load_posting_members, load_row, load_rows,
-    load_rows_with_posting_assignments,
-    load_wal_entries_since, persist_index_checkpoint_bytes, persist_startup_manifest_bytes,
-    posting_map_prefix, posting_member_event_key,
-    posting_member_event_tombstone_value, posting_member_event_upsert_value_with_residual,
-    posting_member_event_upsert_value_from_sketch, posting_members_generation_prefix,
-    posting_members_prefix, prefix_exclusive_end, prune_wal_before,
-    refresh_read_snapshot, set_active_generation, set_posting_event_next_seq, validate_config,
-    vector_key, vector_prefix, wal_key, IndexWalEntry, PostingMember,
+    load_index_checkpoint_bytes, load_metadata, load_posting_members, load_row, load_rows,
+    load_rows_with_posting_assignments, load_startup_manifest_bytes, load_wal_entries_since,
+    persist_index_checkpoint_bytes, persist_startup_manifest_bytes, posting_map_prefix,
+    posting_member_event_key, posting_member_event_tombstone_value,
+    posting_member_event_upsert_value_from_sketch, posting_member_event_upsert_value_with_residual,
+    posting_members_generation_prefix, posting_members_prefix, prefix_exclusive_end,
+    prune_wal_before, refresh_read_snapshot, set_active_generation, set_posting_event_next_seq,
+    validate_config, vector_key, vector_prefix, wal_key, IndexWalEntry, PostingMember,
 };
 use sync_utils::{lock_mutex, lock_read, lock_write};
 
@@ -74,9 +71,12 @@ pub struct VectorMutationBatchResult {
 
 type DiskMetaRowState = Option<(usize, Vec<f32>)>;
 type DiskMetaStateMap = HashMap<u64, DiskMetaRowState>;
+type DistanceRow = (u64, f32);
+type DistanceLoadResult = (Vec<DistanceRow>, Vec<u64>);
 const DISKMETA_RERANK_FACTOR: usize = 8;
 const POSTING_LOG_COMPACT_MIN_EVENTS: usize = 512;
 const POSTING_LOG_COMPACT_FACTOR: usize = 3;
+const ASYNC_COMMIT_MAX_INFLIGHT: usize = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum RuntimeSpFreshIndex {
@@ -122,6 +122,12 @@ impl VectorCache {
 
     fn get(&self, id: u64) -> Option<Vec<f32>> {
         self.map.get(&id).cloned()
+    }
+
+    fn distance_to(&self, id: u64, query: &[f32]) -> Option<f32> {
+        self.map
+            .get(&id)
+            .map(|values| squared_l2(query, values.as_slice()))
     }
 
     fn put(&mut self, id: u64, values: Vec<f32>) {
@@ -311,6 +317,9 @@ pub struct SpFreshLayerDbIndex {
     startup_epoch: Arc<AtomicU64>,
     commit_tx: mpsc::Sender<CommitRequest>,
     commit_worker: Option<JoinHandle<()>>,
+    pending_commit_acks: Arc<Mutex<VecDeque<mpsc::Receiver<anyhow::Result<()>>>>>,
+    commit_error: Arc<Mutex<Option<String>>>,
+    max_async_commit_inflight: usize,
     rebuild_tx: mpsc::Sender<()>,
     stop_worker: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -483,6 +492,9 @@ impl SpFreshLayerDbIndex {
             startup_epoch,
             commit_tx,
             commit_worker: Some(commit_worker),
+            pending_commit_acks: Arc::new(Mutex::new(VecDeque::new())),
+            commit_error: Arc::new(Mutex::new(None)),
+            max_async_commit_inflight: ASYNC_COMMIT_MAX_INFLIGHT,
             rebuild_tx,
             stop_worker,
             worker: Some(worker),
@@ -604,6 +616,7 @@ impl SpFreshLayerDbIndex {
     }
 
     fn persist_index_checkpoint(&self) -> anyhow::Result<()> {
+        self.flush_pending_commits()?;
         let next_wal_seq = self.wal_next_seq.load(Ordering::Relaxed);
         let snapshot = lock_read(&self.index).clone();
         let generation = self.active_generation.load(Ordering::Relaxed);
@@ -672,75 +685,81 @@ impl SpFreshLayerDbIndex {
         Ok(Some(values))
     }
 
-    fn load_vectors_for_ids(
+    fn load_distances_for_ids(
         db: &Db,
         vector_cache: &Arc<Mutex<VectorCache>>,
         vector_blocks: &Arc<Mutex<VectorBlockStore>>,
         generation: u64,
         ids: &[u64],
-    ) -> anyhow::Result<Vec<(u64, Vec<f32>)>> {
+        query: &[f32],
+    ) -> anyhow::Result<DistanceLoadResult> {
         let mut out = Vec::with_capacity(ids.len());
         let mut cache_misses = Vec::new();
         {
             let cache = lock_mutex(vector_cache);
             for id in ids.iter().copied() {
-                if let Some(values) = cache.get(id) {
-                    out.push((id, values));
+                if let Some(distance) = cache.distance_to(id, query) {
+                    out.push((id, distance));
                 } else {
                     cache_misses.push(id);
                 }
             }
         }
         if cache_misses.is_empty() {
-            return Ok(out);
+            return Ok((out, Vec::new()));
         }
 
-        let mut db_misses = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut fetched_for_cache = Vec::new();
         {
             let blocks = lock_mutex(vector_blocks);
             for id in cache_misses {
                 if let Some(values) = blocks.get(id) {
-                    out.push((id, values));
+                    let distance = squared_l2(query, values.as_slice());
+                    out.push((id, distance));
+                    fetched_for_cache.push((id, values));
                 } else {
-                    db_misses.push(id);
+                    unresolved.push(id);
                 }
             }
         }
-        if db_misses.is_empty() {
-            let mut cache = lock_mutex(vector_cache);
-            for (id, values) in &out {
-                cache.put(*id, values.clone());
+
+        let mut missing = Vec::new();
+        if !unresolved.is_empty() {
+            let keys: Vec<Bytes> = unresolved
+                .iter()
+                .map(|id| Bytes::from(vector_key(generation, *id)))
+                .collect();
+            let rows = db
+                .multi_get(&keys, ReadOptions::default())
+                .context("diskmeta multi_get fallback vector rows for distance")?;
+            for (id, row_raw) in unresolved.into_iter().zip(rows.into_iter()) {
+                let Some(raw) = row_raw else {
+                    missing.push(id);
+                    continue;
+                };
+                let row = decode_vector_row_value(raw.as_ref()).with_context(|| {
+                    format!(
+                        "decode vector row for distance id={id} generation={generation}"
+                    )
+                })?;
+                if row.deleted {
+                    missing.push(id);
+                    continue;
+                }
+                let distance = squared_l2(query, row.values.as_slice());
+                out.push((id, distance));
+                fetched_for_cache.push((id, row.values));
             }
-            return Ok(out);
         }
 
-        let keys: Vec<Bytes> = db_misses
-            .iter()
-            .map(|id| Bytes::from(vector_key(generation, *id)))
-            .collect();
-        let rows = db
-            .multi_get(&keys, ReadOptions::default())
-            .context("diskmeta multi_get vector rows")?;
-        let mut fetched = Vec::new();
-        for (id, raw) in db_misses.into_iter().zip(rows.into_iter()) {
-            let Some(raw) = raw else {
-                continue;
-            };
-            let row = decode_vector_row_value(raw.as_ref())
-                .with_context(|| format!("decode vector row id={id} generation={generation}"))?;
-            if row.deleted {
-                continue;
-            }
-            out.push((id, row.values.clone()));
-            fetched.push((id, row.values));
-        }
-        if !fetched.is_empty() {
+        if !fetched_for_cache.is_empty() {
             let mut cache = lock_mutex(vector_cache);
-            for (id, values) in fetched {
+            for (id, values) in fetched_for_cache {
                 cache.put(id, values);
             }
         }
-        Ok(out)
+        Ok((out, missing))
     }
 
     fn loader_for<'a>(
@@ -821,13 +840,91 @@ impl SpFreshLayerDbIndex {
             config::META_POSTING_EVENT_NEXT_SEQ_KEY,
             posting_event_next,
         ));
-        self.submit_commit(ops, false)
+        self.submit_commit(ops, false, true)
             .context("compact posting-member append log")?;
         self.posting_event_next_seq.store(next_seq, Ordering::Relaxed);
         Ok(())
     }
 
-    fn submit_commit(&self, ops: Vec<layerdb::Op>, sync: bool) -> anyhow::Result<()> {
+    fn set_commit_error(&self, err: anyhow::Error) {
+        let mut slot = lock_mutex(&self.commit_error);
+        if slot.is_none() {
+            *slot = Some(format!("{err:#}"));
+        }
+    }
+
+    fn check_commit_error(&self) -> anyhow::Result<()> {
+        if let Some(err) = lock_mutex(&self.commit_error).clone() {
+            anyhow::bail!("async commit pipeline failed: {err}");
+        }
+        Ok(())
+    }
+
+    fn handle_commit_result(&self, result: anyhow::Result<()>) -> anyhow::Result<()> {
+        if let Err(err) = result {
+            self.set_commit_error(anyhow::anyhow!("{err:#}"));
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn poll_pending_commits(&self) -> anyhow::Result<()> {
+        loop {
+            let next = {
+                let mut pending = lock_mutex(&self.pending_commit_acks);
+                let Some(front) = pending.front() else {
+                    break;
+                };
+                match front.try_recv() {
+                    Ok(result) => {
+                        pending.pop_front();
+                        Some(result)
+                    }
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        pending.pop_front();
+                        Some(Err(anyhow::anyhow!("commit worker response channel disconnected")))
+                    }
+                }
+            };
+            let Some(result) = next else {
+                break;
+            };
+            self.handle_commit_result(result)?;
+        }
+        self.check_commit_error()
+    }
+
+    fn throttle_pending_commits(&self) -> anyhow::Result<()> {
+        while lock_mutex(&self.pending_commit_acks).len() > self.max_async_commit_inflight.max(1) {
+            let Some(rx) = lock_mutex(&self.pending_commit_acks).pop_front() else {
+                break;
+            };
+            let result = rx.recv().context("receive throttled async commit result")?;
+            self.handle_commit_result(result)?;
+        }
+        self.check_commit_error()
+    }
+
+    fn flush_pending_commits(&self) -> anyhow::Result<()> {
+        loop {
+            let next = lock_mutex(&self.pending_commit_acks).pop_front();
+            let Some(rx) = next else {
+                break;
+            };
+            let result = rx.recv().context("receive async commit result")?;
+            self.handle_commit_result(result)?;
+        }
+        self.check_commit_error()
+    }
+
+    fn submit_commit(
+        &self,
+        ops: Vec<layerdb::Op>,
+        sync: bool,
+        wait_for_ack: bool,
+    ) -> anyhow::Result<()> {
+        self.poll_pending_commits()?;
         let (resp_tx, resp_rx) = mpsc::channel::<anyhow::Result<()>>();
         self.commit_tx
             .send(CommitRequest::Write {
@@ -836,7 +933,14 @@ impl SpFreshLayerDbIndex {
                 resp: resp_tx,
             })
             .context("send commit request")?;
-        resp_rx.recv().context("receive commit result")?
+        if wait_for_ack {
+            let result = resp_rx.recv().context("receive commit result")?;
+            self.handle_commit_result(result)
+        } else {
+            lock_mutex(&self.pending_commit_acks).push_back(resp_rx);
+            self.throttle_pending_commits()?;
+            self.poll_pending_commits()
+        }
     }
 
     fn neighbor_cmp(a: &Neighbor, b: &Neighbor) -> std::cmp::Ordering {
@@ -955,6 +1059,7 @@ impl SpFreshLayerDbIndex {
 
     pub fn try_bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
         let _update_guard = lock_write(&self.update_gate);
+        self.flush_pending_commits()?;
 
         let old_generation = self.active_generation.load(Ordering::Relaxed);
         let new_generation = old_generation
@@ -1005,7 +1110,7 @@ impl SpFreshLayerDbIndex {
                     ops.push(layerdb::Op::put(vector_key(new_generation, row.id), value));
                 }
             }
-            self.submit_commit(ops, self.cfg.write_sync)
+            self.submit_commit(ops, self.cfg.write_sync, true)
                 .context("persist spfresh bulk rows")?;
         }
         set_active_generation(&self.db, new_generation, self.cfg.write_sync)?;
@@ -1084,6 +1189,7 @@ impl SpFreshLayerDbIndex {
     }
 
     pub fn force_rebuild(&self) -> anyhow::Result<()> {
+        self.flush_pending_commits()?;
         let runtime = self.runtime();
         rebuild_once(&runtime)
     }
@@ -1113,7 +1219,7 @@ impl SpFreshLayerDbIndex {
             wal_next,
         ));
         ops.append(&mut trailer_ops);
-        self.submit_commit(ops, self.cfg.write_sync)
+        self.submit_commit(ops, self.cfg.write_sync, self.cfg.write_sync)
             .with_context(|| {
                 format!(
                     "persist vector+wal batch count={} seq_start={} seq_end={}",
@@ -1240,6 +1346,7 @@ impl SpFreshLayerDbIndex {
         if mutations.is_empty() {
             return Ok(0);
         }
+        self.poll_pending_commits()?;
 
         let _update_guard = lock_read(&self.update_gate);
         let generation = self.active_generation.load(Ordering::Relaxed);
@@ -1439,6 +1546,7 @@ impl SpFreshLayerDbIndex {
         if mutations.is_empty() {
             return Ok(0);
         }
+        self.poll_pending_commits()?;
 
         let _update_guard = lock_read(&self.update_gate);
         let generation = self.active_generation.load(Ordering::Relaxed);
@@ -1640,6 +1748,7 @@ impl SpFreshLayerDbIndex {
                 anyhow::bail!("spfresh-layerdb background worker panicked");
             }
         }
+        self.flush_pending_commits()?;
         self.force_rebuild()?;
         self.persist_index_checkpoint()?;
         let _ = self.commit_tx.send(CommitRequest::Shutdown);
@@ -1707,6 +1816,9 @@ impl Drop for SpFreshLayerDbIndex {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        if let Err(err) = self.flush_pending_commits() {
+            eprintln!("spfresh-layerdb flush pending commits on drop failed: {err:#}");
+        }
         let _ = self.commit_tx.send(CommitRequest::Shutdown);
         if let Some(worker) = self.commit_worker.take() {
             let _ = worker.join();
@@ -1739,73 +1851,65 @@ impl VectorIndex for SpFreshLayerDbIndex {
                 let members = self
                     .load_posting_members_for(generation, posting_id)
                     .unwrap_or_else(|err| panic!("offheap-diskmeta load members failed: {err:#}"));
-                let mut selected_ids =
+                let selected_ids =
                     Self::select_diskmeta_candidates(query, centroid, members.as_ref(), k);
                 if selected_ids.is_empty() {
                     continue;
                 }
+                let (selected_exact, missing_selected_ids) = Self::load_distances_for_ids(
+                    &self.db,
+                    &self.vector_cache,
+                    &self.vector_blocks,
+                    generation,
+                    &selected_ids,
+                    query,
+                )
+                .unwrap_or_else(|err| {
+                    panic!("offheap-diskmeta load selected distances failed: {err:#}")
+                });
+                let mut exact_loaded_ids = HashSet::with_capacity(selected_ids.len());
+                for (id, distance) in selected_exact {
+                    Self::push_neighbor_topk(&mut top, Neighbor { id, distance }, k);
+                    exact_loaded_ids.insert(id);
+                }
 
-                let mut vectors =
-                    Self::load_vectors_for_ids(
+                // If selected candidates miss exact payloads, retry exact evaluation across all
+                // members before falling back to residual-only distance estimates.
+                if !missing_selected_ids.is_empty() {
+                    let fallback_ids: Vec<u64> = members
+                        .iter()
+                        .map(|member| member.id)
+                        .filter(|id| !exact_loaded_ids.contains(id))
+                        .collect();
+                    let (fallback_exact, fallback_missing) = Self::load_distances_for_ids(
                         &self.db,
                         &self.vector_cache,
                         &self.vector_blocks,
                         generation,
-                        &selected_ids,
+                        &fallback_ids,
+                        query,
                     )
-                    .unwrap_or_else(|err| panic!("offheap-diskmeta load vectors failed: {err:#}"));
-
-                // If selected candidates miss row payloads, fall back to exact fetch over all
-                // posting members before using residual-only approximate fallback.
-                if vectors.len() < selected_ids.len() {
-                    selected_ids = members.iter().map(|m| m.id).collect();
-                    vectors =
-                        Self::load_vectors_for_ids(
-                            &self.db,
-                            &self.vector_cache,
-                            &self.vector_blocks,
-                            generation,
-                            &selected_ids,
-                        )
-                        .unwrap_or_else(|err| {
-                            panic!("offheap-diskmeta exact fallback load vectors failed: {err:#}")
-                        });
-                }
-
-                let mut loaded_ids = HashSet::with_capacity(vectors.len());
-                for (id, _) in &vectors {
-                    loaded_ids.insert(*id);
-                }
-
-                if !vectors.is_empty() {
-                    let page = VectorColumnarPage::from_owned_rows(vectors, self.cfg.spfresh.dim)
-                        .unwrap_or_else(|err| {
-                            panic!("offheap-diskmeta build columnar page failed: {err:#}")
-                        });
-                    let local = page
-                        .scan_l2(query, k)
-                        .unwrap_or_else(|err| panic!("offheap-diskmeta columnar scan failed: {err:#}"));
-                    for n in local {
-                        Self::push_neighbor_topk(&mut top, n, k);
-                    }
-                }
-
-                if loaded_ids.len() < selected_ids.len() {
-                    let lookup: HashMap<u64, &PostingMemberSketch> =
-                        members.iter().map(|m| (m.id, m)).collect();
-                    for id in selected_ids {
-                        if loaded_ids.contains(&id) {
-                            continue;
-                        }
-                        let Some(member) = lookup.get(&id) else {
-                            continue;
-                        };
-                        let Some(distance) =
-                            Self::approx_distance_from_residual(query, centroid, member)
-                        else {
-                            continue;
-                        };
+                    .unwrap_or_else(|err| {
+                        panic!("offheap-diskmeta load fallback distances failed: {err:#}")
+                    });
+                    for (id, distance) in fallback_exact {
                         Self::push_neighbor_topk(&mut top, Neighbor { id, distance }, k);
+                        exact_loaded_ids.insert(id);
+                    }
+                    if !fallback_missing.is_empty() {
+                        let lookup: HashMap<u64, &PostingMemberSketch> =
+                            members.iter().map(|member| (member.id, member)).collect();
+                        for id in fallback_missing {
+                            let Some(member) = lookup.get(&id) else {
+                                continue;
+                            };
+                            let Some(distance) =
+                                Self::approx_distance_from_residual(query, centroid, member)
+                            else {
+                                continue;
+                            };
+                            Self::push_neighbor_topk(&mut top, Neighbor { id, distance }, k);
+                        }
                     }
                 }
             }

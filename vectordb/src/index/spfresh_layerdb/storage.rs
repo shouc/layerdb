@@ -636,6 +636,26 @@ pub(crate) fn posting_member_value_with_residual(
     Ok(out)
 }
 
+pub(crate) fn posting_member_value_with_residual_only(
+    id: u64,
+    values: &[f32],
+    centroid: &[f32],
+) -> anyhow::Result<Vec<u8>> {
+    let (residual_scale, residual_code) = quantize_residual(values, centroid);
+    let payload = PostingMemberValueRkyvV2 {
+        id,
+        values: None,
+        residual_scale,
+        residual_code,
+    };
+    let archived = rkyv::to_bytes::<_, 1_024>(&payload)
+        .context("encode posting member value (residual) with rkyv")?;
+    let mut out = Vec::with_capacity(POSTING_MEMBER_RKYV_V2_TAG.len() + archived.len());
+    out.extend_from_slice(POSTING_MEMBER_RKYV_V2_TAG);
+    out.extend_from_slice(archived.as_ref());
+    Ok(out)
+}
+
 pub(crate) fn load_posting_members(
     db: &Db,
     generation: u64,

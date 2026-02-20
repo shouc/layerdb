@@ -36,6 +36,7 @@ use storage::{
     load_rows_with_posting_assignments,
     load_wal_entries_since, persist_index_checkpoint_bytes,
     posting_map_key, posting_map_prefix, posting_member_key, posting_member_value_with_residual,
+    posting_member_value_with_residual_only,
     posting_members_generation_prefix, prefix_exclusive_end, prune_wal_before,
     refresh_read_snapshot, set_active_generation, validate_config, vector_key, vector_prefix,
     wal_key, IndexWalEntry, PostingMember,
@@ -345,8 +346,12 @@ impl SpFreshLayerDbIndex {
         let replay_from = applied_wal_seq.map_or(0, |seq| seq.saturating_add(1));
         if replay_from < wal_next_seq {
             if matches!(index_state, RuntimeSpFreshIndex::OffHeapDiskMeta(_)) {
-                if let Err(err) = Self::replay_wal_tail_diskmeta(&db, &mut index_state, replay_from)
-                {
+                if let Err(err) = Self::replay_wal_tail_diskmeta(
+                    &db,
+                    &vector_cache,
+                    &mut index_state,
+                    replay_from,
+                ) {
                     eprintln!(
                         "spfresh-layerdb diskmeta wal replay failed, rebuilding from rows: {err:#}"
                     );
@@ -590,6 +595,7 @@ impl SpFreshLayerDbIndex {
 
     fn replay_wal_tail_diskmeta(
         db: &Db,
+        vector_cache: &Arc<Mutex<VectorCache>>,
         index: &mut RuntimeSpFreshIndex,
         from_seq: u64,
     ) -> anyhow::Result<()> {
@@ -606,12 +612,17 @@ impl SpFreshLayerDbIndex {
                     anyhow::bail!("legacy id-only wal entry cannot be replayed for diskmeta")
                 }
                 IndexWalEntry::DiskMetaUpsert {
+                    id,
                     old,
                     new_posting,
                     new_vector,
                     ..
-                } => index.apply_upsert(old, new_posting, new_vector),
-                IndexWalEntry::DiskMetaDelete { old, .. } => {
+                } => {
+                    lock_mutex(vector_cache).put(id, new_vector.clone());
+                    index.apply_upsert(old, new_posting, new_vector);
+                }
+                IndexWalEntry::DiskMetaDelete { id, old } => {
+                    lock_mutex(vector_cache).remove(id);
                     let _ = index.apply_delete(old);
                 }
             }
@@ -1181,7 +1192,7 @@ impl SpFreshLayerDbIndex {
                     layerdb::Op::put(vector_key(generation, *id), value),
                     layerdb::Op::put(
                         posting_member_key(generation, new_posting, *id),
-                        posting_member_value_with_residual(*id, vector, centroid)?,
+                        posting_member_value_with_residual_only(*id, vector, centroid)?,
                     ),
                 ];
                 if let Some((old_posting, _)) = &old {
@@ -1580,25 +1591,62 @@ impl VectorIndex for SpFreshLayerDbIndex {
                 let members = self
                     .load_posting_members_for(generation, posting_id)
                     .unwrap_or_else(|err| panic!("offheap-diskmeta load members failed: {err:#}"));
-                let candidate_ids =
+                let mut selected_ids =
                     Self::select_diskmeta_candidates(query, centroid, members.as_ref(), k);
-                if candidate_ids.is_empty() {
+                if selected_ids.is_empty() {
                     continue;
                 }
-                let vectors =
-                    Self::load_vectors_for_ids(&self.db, &self.vector_cache, generation, &candidate_ids)
+
+                let mut vectors =
+                    Self::load_vectors_for_ids(&self.db, &self.vector_cache, generation, &selected_ids)
                         .unwrap_or_else(|err| panic!("offheap-diskmeta load vectors failed: {err:#}"));
-                let page = VectorColumnarPage::from_owned_rows(vectors, self.cfg.spfresh.dim)
-                    .unwrap_or_else(|err| panic!("offheap-diskmeta build columnar page failed: {err:#}"));
-                let local = page
-                    .scan_l2(query, k)
-                    .unwrap_or_else(|err| panic!("offheap-diskmeta columnar scan failed: {err:#}"));
-                for n in local {
-                    Self::push_neighbor_topk(
-                        &mut top,
-                        n,
-                        k,
-                    );
+
+                // If selected candidates miss row payloads, fall back to exact fetch over all
+                // posting members before using residual-only approximate fallback.
+                if vectors.len() < selected_ids.len() {
+                    selected_ids = members.iter().map(|m| m.id).collect();
+                    vectors =
+                        Self::load_vectors_for_ids(&self.db, &self.vector_cache, generation, &selected_ids)
+                            .unwrap_or_else(|err| {
+                                panic!("offheap-diskmeta exact fallback load vectors failed: {err:#}")
+                            });
+                }
+
+                let mut loaded_ids = HashSet::with_capacity(vectors.len());
+                for (id, _) in &vectors {
+                    loaded_ids.insert(*id);
+                }
+
+                if !vectors.is_empty() {
+                    let page = VectorColumnarPage::from_owned_rows(vectors, self.cfg.spfresh.dim)
+                        .unwrap_or_else(|err| {
+                            panic!("offheap-diskmeta build columnar page failed: {err:#}")
+                        });
+                    let local = page
+                        .scan_l2(query, k)
+                        .unwrap_or_else(|err| panic!("offheap-diskmeta columnar scan failed: {err:#}"));
+                    for n in local {
+                        Self::push_neighbor_topk(&mut top, n, k);
+                    }
+                }
+
+                if loaded_ids.len() < selected_ids.len() {
+                    let lookup: HashMap<u64, &PostingMemberSketch> =
+                        members.iter().map(|m| (m.id, m)).collect();
+                    for id in selected_ids {
+                        if loaded_ids.contains(&id) {
+                            continue;
+                        }
+                        let Some(member) = lookup.get(&id) else {
+                            continue;
+                        };
+                        let Some(distance) =
+                            Self::approx_distance_from_residual(query, centroid, member)
+                        else {
+                            continue;
+                        };
+                        Self::push_neighbor_topk(&mut top, Neighbor { id, distance }, k);
+                    }
                 }
             }
             top.sort_by(Self::neighbor_cmp);

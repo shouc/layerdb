@@ -457,6 +457,39 @@ fn posting_metadata_helpers_round_trip() -> anyhow::Result<()> {
 }
 
 #[test]
+fn posting_member_residual_round_trip_omits_values_payload() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig::default();
+    {
+        let idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.close()?;
+    }
+
+    let db = Db::open(dir.path(), cfg.db_options.clone())?;
+    let generation = super::storage::ensure_active_generation(&db)?;
+    let centroid = vec![0.25f32; cfg.spfresh.dim];
+    let vector = vec![0.75f32; cfg.spfresh.dim];
+    db.write_batch(
+        vec![Op::put(
+            super::storage::posting_member_key(generation, 5, 42),
+            super::storage::posting_member_value_with_residual_only(42, &vector, &centroid)?,
+        )],
+        WriteOptions { sync: true },
+    )?;
+
+    let members = super::storage::load_posting_members(&db, generation, 5)?;
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].id, 42);
+    assert!(members[0].values.is_none());
+    assert!(members[0].residual_scale.is_some());
+    assert_eq!(
+        members[0].residual_code.as_ref().map(Vec::len),
+        Some(cfg.spfresh.dim)
+    );
+    Ok(())
+}
+
+#[test]
 fn randomized_restarts_preserve_model_state() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let mut cfg = SpFreshLayerDbConfig::default();

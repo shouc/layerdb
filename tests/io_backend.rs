@@ -26,9 +26,18 @@ fn native_uring_support_flag_matches_cfg() {
 }
 
 #[test]
-fn io_backend_defaults_to_uring() {
-    assert_eq!(IoBackend::default(), IoBackend::Uring);
-    assert_eq!(DbOptions::default().io_backend, IoBackend::Uring);
+fn io_backend_default_is_platform_aware() {
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(IoBackend::default(), IoBackend::Kqueue);
+        assert_eq!(DbOptions::default().io_backend, IoBackend::Kqueue);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert_eq!(IoBackend::default(), IoBackend::Uring);
+        assert_eq!(DbOptions::default().io_backend, IoBackend::Uring);
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -43,16 +52,7 @@ fn io_backend_defaults_to_uring() {
     }
 
     let io = UringExecutor::default();
-
-    #[cfg(all(feature = "native-uring", target_os = "linux"))]
-    {
-        assert_eq!(io.backend(), IoBackend::Uring);
-    }
-
-    #[cfg(not(all(feature = "native-uring", target_os = "linux")))]
-    {
-        assert_eq!(io.backend(), IoBackend::Blocking);
-    }
+    assert_eq!(io.backend(), DbOptions::default().io_backend);
 }
 
 #[test]

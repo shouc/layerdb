@@ -26,12 +26,24 @@ pub(crate) mod native_uring;
 pub enum IoBackend {
     Tokio,
     Blocking,
+    /// macOS event-loop backend.
+    ///
+    /// On macOS this maps to the runtime's kqueue-backed async path.
+    /// On non-macOS platforms it falls back to `Blocking`.
+    Kqueue,
     Uring,
 }
 
 impl Default for IoBackend {
     fn default() -> Self {
-        Self::Uring
+        #[cfg(target_os = "macos")]
+        {
+            Self::Kqueue
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::Uring
+        }
     }
 }
 
@@ -53,8 +65,8 @@ impl Default for UringExecutor {
 
 impl UringExecutor {
     pub fn new(max_in_flight: usize) -> Self {
-        // Prefer io_uring when available; fall back safely otherwise.
-        Self::with_backend(max_in_flight, IoBackend::Uring)
+        // Prefer platform default backend (Linux: io_uring, macOS: kqueue runtime path).
+        Self::with_backend(max_in_flight, IoBackend::default())
     }
 
     pub fn with_backend(max_in_flight: usize, backend: IoBackend) -> Self {
@@ -110,6 +122,10 @@ impl UringExecutor {
         {
             false
         }
+    }
+
+    pub fn supports_kqueue() -> bool {
+        cfg!(target_os = "macos")
     }
 
     pub(crate) fn register_file_blocking(&self, file: &std::fs::File) -> Option<u32> {
@@ -655,6 +671,17 @@ fn normalize_backend(backend: IoBackend) -> IoBackend {
     match backend {
         IoBackend::Tokio => IoBackend::Tokio,
         IoBackend::Blocking => IoBackend::Blocking,
+        IoBackend::Kqueue => {
+            #[cfg(target_os = "macos")]
+            {
+                IoBackend::Kqueue
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                IoBackend::Blocking
+            }
+        }
         IoBackend::Uring => {
             #[cfg(all(feature = "native-uring", target_os = "linux"))]
             {
@@ -1039,6 +1066,20 @@ impl FileRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn io_backend_default_is_platform_aware() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(IoBackend::default(), IoBackend::Kqueue);
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(IoBackend::default(), IoBackend::Uring);
+    }
+
+    #[test]
+    fn kqueue_support_flag_matches_platform() {
+        assert_eq!(UringExecutor::supports_kqueue(), cfg!(target_os = "macos"));
+    }
 
     #[tokio::test]
     async fn executor_append_read_and_sync() {

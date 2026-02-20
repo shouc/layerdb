@@ -17,7 +17,10 @@ cargo run --bin layerdb -- --help
 ## IO backend default
 
 - Default build enables `native-uring`.
-- Runtime default backend is `io_uring` (Linux), with automatic fallback to blocking IO when unavailable.
+- Runtime default backend is platform-aware:
+  - Linux: `io_uring` (automatic fallback to blocking IO when unavailable).
+  - macOS: `kqueue` backend (`IoBackend::Kqueue`).
+  - others: `io_uring` preference with fallback to blocking IO.
 
 Native `io_uring` tries to enable SQPOLL mode by default (best effort). Disable with:
 

@@ -346,25 +346,15 @@ impl SpFreshLayerDbIndex {
         let replay_from = applied_wal_seq.map_or(0, |seq| seq.saturating_add(1));
         if replay_from < wal_next_seq {
             if matches!(index_state, RuntimeSpFreshIndex::OffHeapDiskMeta(_)) {
-                if let Err(err) = Self::replay_wal_tail_diskmeta(
-                    &db,
-                    &vector_cache,
-                    &mut index_state,
-                    replay_from,
-                ) {
-                    eprintln!(
-                        "spfresh-layerdb diskmeta wal replay failed, rebuilding from rows: {err:#}"
-                    );
-                    let rows = load_rows(&db, generation)?;
-                    let assignments = load_posting_assignments(&db, generation)?;
-                    let (rebuilt, _assigned_now) =
-                        SpFreshDiskMetaIndex::build_from_rows_with_assignments(
-                            cfg.spfresh.clone(),
-                            &rows,
-                            Some(&assignments),
-                        );
-                    index_state = RuntimeSpFreshIndex::OffHeapDiskMeta(rebuilt);
-                }
+                // WAL v2 for diskmeta only stores new-state payloads. To preserve exact centroid
+                // accounting, rebuild from authoritative rows whenever a tail exists.
+                let (rows, assignments) = load_rows_with_posting_assignments(&db, generation)?;
+                let (rebuilt, _assigned_now) = SpFreshDiskMetaIndex::build_from_rows_with_assignments(
+                    cfg.spfresh.clone(),
+                    &rows,
+                    Some(&assignments),
+                );
+                index_state = RuntimeSpFreshIndex::OffHeapDiskMeta(rebuilt);
             } else {
                 Self::replay_wal_tail(
                     &db,
@@ -520,9 +510,7 @@ impl SpFreshLayerDbIndex {
                 IndexWalEntry::Delete { id } => {
                     latest.insert(id, ReplayAction::Delete);
                 }
-                IndexWalEntry::IdOnly { id }
-                | IndexWalEntry::DiskMetaUpsert { id, .. }
-                | IndexWalEntry::DiskMetaDelete { id, .. } => {
+                IndexWalEntry::DiskMetaUpsert { id, .. } | IndexWalEntry::DiskMetaDelete { id } => {
                     latest.insert(id, ReplayAction::LookupRowState);
                 }
             }
@@ -588,43 +576,6 @@ impl SpFreshLayerDbIndex {
                         }
                     },
                 },
-            }
-        }
-        Ok(())
-    }
-
-    fn replay_wal_tail_diskmeta(
-        db: &Db,
-        vector_cache: &Arc<Mutex<VectorCache>>,
-        index: &mut RuntimeSpFreshIndex,
-        from_seq: u64,
-    ) -> anyhow::Result<()> {
-        let RuntimeSpFreshIndex::OffHeapDiskMeta(index) = index else {
-            anyhow::bail!("diskmeta wal replay called for non-diskmeta index");
-        };
-        let entries = load_wal_entries_since(db, from_seq)?;
-        for entry in entries {
-            match entry {
-                IndexWalEntry::Upsert { .. } | IndexWalEntry::Delete { .. } => {
-                    anyhow::bail!("non-diskmeta wal entry cannot be replayed for diskmeta")
-                }
-                IndexWalEntry::IdOnly { .. } => {
-                    anyhow::bail!("legacy id-only wal entry cannot be replayed for diskmeta")
-                }
-                IndexWalEntry::DiskMetaUpsert {
-                    id,
-                    old,
-                    new_posting,
-                    new_vector,
-                    ..
-                } => {
-                    lock_mutex(vector_cache).put(id, new_vector.clone());
-                    index.apply_upsert(old, new_posting, new_vector);
-                }
-                IndexWalEntry::DiskMetaDelete { id, old } => {
-                    lock_mutex(vector_cache).remove(id);
-                    let _ = index.apply_delete(old);
-                }
             }
         }
         Ok(())
@@ -1207,7 +1158,6 @@ impl SpFreshLayerDbIndex {
                 persist_entries.push((
                     IndexWalEntry::DiskMetaUpsert {
                         id: *id,
-                        old: old.clone(),
                         new_posting,
                         new_vector: vector.clone(),
                     },
@@ -1352,10 +1302,7 @@ impl SpFreshLayerDbIndex {
                     )));
                 }
                 persist_entries.push((
-                    IndexWalEntry::DiskMetaDelete {
-                        id: *id,
-                        old: old.clone(),
-                    },
+                    IndexWalEntry::DiskMetaDelete { id: *id },
                     ops,
                 ));
                 apply_entries.push((*id, old));

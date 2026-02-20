@@ -306,7 +306,7 @@ fn startup_replays_typed_wal_tail_without_vector_rows() -> anyhow::Result<()> {
 }
 
 #[test]
-fn offheap_diskmeta_replays_wal_tail_without_row_rebuild() -> anyhow::Result<()> {
+fn offheap_diskmeta_wal_tail_rebuilds_from_rows() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let cfg = SpFreshLayerDbConfig {
         memory_mode: SpFreshMemoryMode::OffHeapDiskMeta,
@@ -327,13 +327,6 @@ fn offheap_diskmeta_replays_wal_tail_without_row_rebuild() -> anyhow::Result<()>
         let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
         idx.try_upsert(2, vec![0.2; cfg.spfresh.dim])?;
     }
-
-    let db = Db::open(dir.path(), cfg.db_options.clone())?;
-    let generation = super::storage::ensure_active_generation(&db)?;
-    let prefix = super::storage::vector_prefix(generation);
-    let prefix_bytes = prefix.into_bytes();
-    let end = super::storage::prefix_exclusive_end(&prefix_bytes)?;
-    db.delete_range(prefix_bytes, end, WriteOptions { sync: true })?;
 
     let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
     assert_eq!(idx.memory_mode(), SpFreshMemoryMode::OffHeapDiskMeta);

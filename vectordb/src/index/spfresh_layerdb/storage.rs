@@ -422,18 +422,13 @@ pub(crate) enum IndexWalEntry {
     Delete {
         id: u64,
     },
-    IdOnly {
-        id: u64,
-    },
     DiskMetaUpsert {
         id: u64,
-        old: Option<(usize, Vec<f32>)>,
         new_posting: usize,
         new_vector: Vec<f32>,
     },
     DiskMetaDelete {
         id: u64,
-        old: Option<(usize, Vec<f32>)>,
     },
 }
 
@@ -442,11 +437,7 @@ pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>>
 }
 
 pub(crate) fn decode_wal_entry(raw: &[u8]) -> anyhow::Result<IndexWalEntry> {
-    if let Ok(entry) = bincode::deserialize::<IndexWalEntry>(raw) {
-        return Ok(entry);
-    }
-    let id = bincode::deserialize::<u64>(raw).context("decode legacy wal id")?;
-    Ok(IndexWalEntry::IdOnly { id })
+    bincode::deserialize::<IndexWalEntry>(raw).context("decode wal entry")
 }
 
 pub(crate) fn load_wal_entries_since(

@@ -87,6 +87,10 @@ cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
     vector payload, `id -> posting`, and `posting -> member` metadata in LayerDB. Hot posting
     lists are cached in memory (`offheap_posting_cache_entries`), and posting scans can prefill
     vector cache from persisted member payloads.
+- Startup behavior:
+  - resident/offheap replay WAL tail by touched IDs.
+  - diskmeta replays WAL delta payloads directly from checkpoint, avoiding full-row startup rebuild
+    on normal WAL-tail recovery.
 - prefer fallible APIs in services:
   - `try_upsert`, `try_delete`, `try_bulk_load`
   - `open_existing` to recover config from persisted metadata

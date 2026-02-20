@@ -446,6 +446,72 @@ Latest gate summary (`target/vectordb-gate/summary.json`):
   - update_qps: `0.558x`
   - search_qps: `1.791x`
 
+## I) Production Refactor: WAL v2 + Append Logs + Fixed Binary + Mmap + Manifest
+
+Implemented in this cycle:
+
+1. WAL v2 (lean diskmeta entries):
+- Removed legacy/id-only WAL compatibility paths.
+- WAL now stores only new-state payload for diskmeta (`id + new_posting + new_vector`), without
+  embedding old `(posting, vector)` pre-image payload.
+- Diskmeta startup with WAL tail now rebuilds from authoritative vector rows for exact centroid
+  accounting under the lean WAL schema.
+
+2. Append-only posting-member segments:
+- Replaced point `put/delete` posting-member keys with append-only event keys:
+  `posting/{generation}/{posting}/{seq}/{id}`.
+- Added event types: upsert residual sketch and tombstone.
+- Search-time loader materializes latest member state by replaying append events.
+- Added deterministic compaction trigger that rewrites canonical posting segments when event bloat
+  exceeds configured ratio.
+
+3. Fixed-layout binary codecs in hot path:
+- Replaced generic serde/rkyv hot-path encodes with fixed binary layout for:
+  - vector rows (`vr3`)
+  - posting-member events (`pk3`)
+  - WAL entries (`wl2`)
+- This avoids schema-agnostic decoding overhead in critical update/search paths.
+
+4. Mmap vector block store:
+- Added sidecar append-only vector block files (`vector_blocks/epoch-*.vb`) with id->offset map.
+- Exact rerank/load path now checks:
+  1) RAM vector cache
+  2) mmap vector blocks
+  3) LayerDB vector rows fallback
+- Added tombstone records for deletes.
+
+5. Startup manifest + epoch snapshots:
+- Added persisted startup manifest (`spfresh/meta/startup_manifest`) containing:
+  - generation
+  - applied WAL seq
+  - posting-event next seq
+  - startup epoch
+- Manifest is persisted atomically with checkpoint writes.
+- Bulk-load path increments epoch and rotates vector-block epoch file.
+
+6. Shard-local single-writer commit pipeline:
+- Added a dedicated commit worker per `SpFreshLayerDbIndex` instance.
+- Update paths now build ops locally and submit write batches through commit worker channel for
+  deterministic serialized commit order per shard/index.
+
+Validation:
+- `cargo clippy -p vectordb --all-targets -- -D warnings`
+- `cargo test -p vectordb spfresh_layerdb::tests:: -- --nocapture`
+- `scripts/vectordb_bench_gate.sh`
+
+Latest gate summary after full refactor (`target/vectordb-gate/summary.json`):
+- SPFresh-sharded diskmeta:
+  - update_qps: `64228.05`
+  - search_qps: `1165.21`
+  - recall@k: `1.0000`
+- LanceDB IVF-flat:
+  - update_qps: `122800.15`
+  - search_qps: `779.72`
+  - recall@k: `0.4700`
+- Ratios (SPFresh / LanceDB):
+  - update_qps: `0.523x`
+  - search_qps: `1.494x`
+
 ## Production Readiness Checks Performed
 
 - `cargo clippy -p vectordb --all-targets -- -D warnings`

@@ -1312,6 +1312,18 @@ impl SpFreshLayerDbIndex {
         out_rev
     }
 
+    fn dedup_last_upserts_owned(rows: Vec<VectorRecord>) -> Vec<(u64, Vec<f32>)> {
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut out_rev = Vec::with_capacity(rows.len());
+        for row in rows.into_iter().rev() {
+            if seen.insert(row.id) {
+                out_rev.push((row.id, row.values));
+            }
+        }
+        out_rev.reverse();
+        out_rev
+    }
+
     fn dedup_ids(ids: &[u64]) -> Vec<u64> {
         let mut seen = HashSet::with_capacity(ids.len());
         let mut out = Vec::with_capacity(ids.len());
@@ -1411,6 +1423,31 @@ impl SpFreshLayerDbIndex {
 
         // Last-write-wins dedup keeps persistence/apply work proportional to unique ids.
         let mutations = Self::dedup_last_upserts(rows);
+        self.try_upsert_batch_mutations(mutations)
+    }
+
+    pub fn try_upsert_batch_owned(&mut self, rows: Vec<VectorRecord>) -> anyhow::Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        for row in &rows {
+            if row.values.len() != self.cfg.spfresh.dim {
+                anyhow::bail!(
+                    "invalid vector dim for id={}: got {}, expected {}",
+                    row.id,
+                    row.values.len(),
+                    self.cfg.spfresh.dim
+                );
+            }
+        }
+        let mutations = Self::dedup_last_upserts_owned(rows);
+        self.try_upsert_batch_mutations(mutations)
+    }
+
+    fn try_upsert_batch_mutations(
+        &mut self,
+        mutations: Vec<(u64, Vec<f32>)>,
+    ) -> anyhow::Result<usize> {
         if mutations.is_empty() {
             return Ok(0);
         }

@@ -245,14 +245,14 @@ impl SpFreshLayerDbShardedIndex {
         let results: Vec<anyhow::Result<usize>> = self
             .shards
             .par_iter_mut()
+            .zip(partitioned.into_par_iter())
             .enumerate()
-            .map(|(shard_id, shard)| {
-                let chunk = &partitioned[shard_id];
+            .map(|(shard_id, (shard, chunk))| {
                 if chunk.is_empty() {
                     Ok(0)
                 } else {
                     shard
-                        .try_upsert_batch(chunk)
+                        .try_upsert_batch_owned(chunk)
                         .with_context(|| format!("upsert batch shard {}", shard_id))
                 }
             })

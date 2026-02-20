@@ -9,7 +9,7 @@ use vectordb::dataset::{generate_synthetic, SyntheticConfig};
 use vectordb::ground_truth::{exact_knn, recall_at_k};
 use vectordb::index::{
     AppendOnlyConfig, AppendOnlyIndex, SaqConfig, SaqIndex, SpFreshConfig, SpFreshIndex,
-    SpFreshLayerDbConfig, SpFreshLayerDbIndex, SpFreshLayerDbShardedConfig,
+    SpFreshLayerDbConfig, SpFreshLayerDbIndex, SpFreshLayerDbShardedConfig, SpFreshMemoryMode,
     SpFreshLayerDbShardedIndex,
 };
 use vectordb::types::{VectorIndex, VectorRecord};
@@ -65,6 +65,8 @@ struct BenchArgs {
     spfresh_rebuild_interval_ms: u64,
     #[arg(long, default_value_t = 4)]
     spfresh_shards: usize,
+    #[arg(long, default_value_t = false)]
+    spfresh_offheap: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -454,6 +456,10 @@ fn bench_spfresh_layerdb(
         rebuild_interval: Duration::from_millis(args.spfresh_rebuild_interval_ms.max(1)),
         ..Default::default()
     };
+    let mut cfg = cfg;
+    if args.spfresh_offheap {
+        cfg.memory_mode = SpFreshMemoryMode::OffHeap;
+    }
 
     let db_dir = tempfile::TempDir::new()?;
 
@@ -512,6 +518,10 @@ fn bench_spfresh_layerdb_sharded(
             ..Default::default()
         },
     };
+    let mut cfg = cfg;
+    if args.spfresh_offheap {
+        cfg.shard.memory_mode = SpFreshMemoryMode::OffHeap;
+    }
 
     let db_dir = tempfile::TempDir::new()?;
 

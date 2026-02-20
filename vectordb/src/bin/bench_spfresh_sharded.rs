@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 use vectordb::ground_truth::recall_at_k;
-use vectordb::index::{SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig, SpFreshLayerDbShardedIndex};
+use vectordb::index::{
+    SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig, SpFreshLayerDbShardedIndex, SpFreshMemoryMode,
+};
 use vectordb::types::{VectorIndex, VectorRecord};
 
 #[derive(Debug, Parser)]
@@ -41,6 +43,8 @@ struct Args {
     keep_db: bool,
     #[arg(long, default_value_t = false)]
     durable: bool,
+    #[arg(long, default_value_t = false)]
+    offheap: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +122,9 @@ fn main() -> Result<()> {
         rebuild_interval: Duration::from_millis(args.rebuild_interval_ms.max(1)),
         ..Default::default()
     };
+    if args.offheap {
+        shard_cfg.memory_mode = SpFreshMemoryMode::OffHeap;
+    }
     if !args.durable {
         shard_cfg.write_sync = false;
         shard_cfg.db_options.fsync_writes = false;
@@ -175,6 +182,7 @@ fn main() -> Result<()> {
         "merge_limit": args.merge_limit,
         "reassign_range": args.reassign_range,
         "durable": args.durable,
+        "offheap": args.offheap,
         "build_ms": build_ms,
         "update_qps": update_qps,
         "search_qps": search_qps,

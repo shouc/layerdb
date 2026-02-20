@@ -338,7 +338,7 @@ fn offheap_diskmeta_replays_wal_tail_without_row_rebuild() -> anyhow::Result<()>
     let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
     assert_eq!(idx.memory_mode(), SpFreshMemoryMode::OffHeapDiskMeta);
     assert_eq!(idx.len(), 2);
-    let got = idx.search(&vec![0.2; 16], 2);
+    let got = idx.search(&[0.2; 16], 2);
     assert!(got.iter().any(|n| n.id == 1));
     assert!(got.iter().any(|n| n.id == 2));
     Ok(())
@@ -631,7 +631,7 @@ fn offheap_diskmeta_batch_upsert_delete_round_trip() -> anyhow::Result<()> {
 
     let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
     assert_eq!(idx.len(), 2);
-    let got = idx.search(&vec![0.3; 16], 2);
+    let got = idx.search(&[0.3; 16], 2);
     assert!(got.iter().any(|n| n.id == 1));
     assert!(got.iter().any(|n| n.id == 3));
     assert!(got.iter().all(|n| n.id != 2));

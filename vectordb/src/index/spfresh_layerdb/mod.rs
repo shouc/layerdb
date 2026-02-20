@@ -62,6 +62,9 @@ pub struct VectorMutationBatchResult {
     pub deletes: usize,
 }
 
+type DiskMetaRowState = Option<(usize, Vec<f32>)>;
+type DiskMetaStateMap = HashMap<u64, DiskMetaRowState>;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum RuntimeSpFreshIndex {
     Resident(SpFreshIndex),
@@ -852,7 +855,7 @@ impl SpFreshLayerDbIndex {
         &self,
         generation: u64,
         ids: &[u64],
-    ) -> anyhow::Result<HashMap<u64, Option<(usize, Vec<f32>)>>> {
+    ) -> anyhow::Result<DiskMetaStateMap> {
         let mut out = HashMap::with_capacity(ids.len());
         if ids.is_empty() {
             return Ok(out);

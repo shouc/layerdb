@@ -192,6 +192,30 @@ Implementation:
 This addresses the primary memory blocker for 100B+ planning on small machines:
 resident RAM no longer needs to scale with full vector payload.
 
+## D) Strict batched write path (insert/update focus)
+
+Implemented a non-heuristic batch commit protocol in `SpFreshLayerDbIndex`:
+
+- `try_upsert_batch(&[VectorRecord])` and `try_delete_batch(&[u64])`.
+- One LayerDB write-batch persists:
+  - all row mutations,
+  - a contiguous WAL entry range,
+  - one `index_wal_next_seq` advance.
+- Per-batch deterministic semantics:
+  - last-write-wins dedup for duplicate IDs inside the same upsert batch,
+  - exact sequential application to in-memory index after durable commit.
+- Diskmeta batches prefetch prior state with `multi_get` and compute exact centroid deltas.
+- Single-row APIs (`try_upsert`, `try_delete`) now route through the same batched path.
+- Sharded API now exposes batched routing:
+  - `SpFreshLayerDbShardedIndex::try_upsert_batch`
+  - `SpFreshLayerDbShardedIndex::try_delete_batch`
+- Benchmark runner `bench_spfresh_sharded` now supports `--update-batch`.
+
+Validation added:
+- `upsert_batch_last_write_wins_and_recovers`
+- `offheap_diskmeta_batch_upsert_delete_round_trip`
+- `sharded_batch_upsert_delete_round_trip`
+
 ## Benchmarks vs LanceDB
 
 All runs used the same exported datasets and `k=10`.
@@ -257,6 +281,27 @@ Interpretation:
   adaptive probing + WAL-delta startup replay, it is materially faster than the prior implementation
   while staying restart-safe/update-safe. In this profile, diskmeta now exceeds LanceDB search QPS
   while maintaining much higher recall.
+
+### Batch-write sensitivity (latest)
+
+Dataset: `dim=64, base=10000, updates=2000, queries=200`, non-durable, `shards=8`.
+
+SPFresh-sharded offheap:
+- `update_batch=1`: update_qps `4488.23`
+- `update_batch=1024`: update_qps `5104.93` (+13.7%)
+
+SPFresh-sharded diskmeta:
+- `update_batch=1`: update_qps `5929.34`
+- `update_batch=1024`: update_qps `8913.02` (+50.3%)
+
+LanceDB IVF-flat:
+- `update_batch=1`: update_qps `13.17`, search_qps `15.12`, recall@k `0.5475`
+- `update_batch=1024`: update_qps `40406.15`, search_qps `811.28`, recall@k `0.5195`
+
+Interpretation:
+- Batch commit materially improves SPFresh insert/update throughput, especially in diskmeta mode.
+- SPFresh remains clearly stronger on search throughput at high recall in this workload.
+- LanceDB remains stronger on large-batch update throughput.
 
 ## Production Readiness Checks Performed
 

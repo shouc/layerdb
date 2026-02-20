@@ -88,11 +88,13 @@ cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
     lists are cached in memory (`offheap_posting_cache_entries`), and posting scans can prefill
     vector cache from persisted member payloads.
 - Startup behavior:
-  - resident/offheap replay WAL tail by touched IDs.
+  - resident/offheap replay WAL tail from typed upsert/delete payloads (row rebuild fallback only
+    for legacy WAL entries).
   - diskmeta replays WAL delta payloads directly from checkpoint, avoiding full-row startup rebuild
     on normal WAL-tail recovery.
 - prefer fallible APIs in services:
   - `try_upsert`, `try_delete`, `try_bulk_load`
+  - `try_upsert_batch`, `try_delete_batch` for strict batched WAL commit path
   - `open_existing` to recover config from persisted metadata
   - `close` for graceful worker shutdown + final rebuild
   - `health_check` and `stats` for operational monitoring

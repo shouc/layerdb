@@ -12,7 +12,7 @@ use crate::types::VectorRecord;
 use super::config::{
     SpFreshLayerDbConfig, SpFreshPersistedMeta, INDEX_WAL_PREFIX, META_ACTIVE_GENERATION_KEY,
     META_CONFIG_KEY, META_INDEX_CHECKPOINT_KEY, META_INDEX_WAL_NEXT_SEQ_KEY,
-    META_POSTING_EVENT_NEXT_SEQ_KEY, META_SCHEMA_VERSION,
+    META_POSTING_EVENT_NEXT_SEQ_KEY, META_SCHEMA_VERSION, META_STARTUP_MANIFEST_KEY,
     POSTING_MAP_ROOT_PREFIX, POSTING_MEMBERS_ROOT_PREFIX, VECTOR_ROOT_PREFIX,
 };
 
@@ -436,6 +436,22 @@ pub(crate) fn persist_index_checkpoint_bytes(
 ) -> anyhow::Result<()> {
     db.put(META_INDEX_CHECKPOINT_KEY, bytes, WriteOptions { sync })
         .context("persist spfresh index checkpoint")
+}
+
+pub(crate) fn load_startup_manifest_bytes(db: &Db) -> anyhow::Result<Option<Vec<u8>>> {
+    let current = db
+        .get(META_STARTUP_MANIFEST_KEY, ReadOptions::default())
+        .context("read spfresh startup manifest")?;
+    Ok(current.map(|bytes| bytes.to_vec()))
+}
+
+pub(crate) fn persist_startup_manifest_bytes(
+    db: &Db,
+    bytes: Vec<u8>,
+    sync: bool,
+) -> anyhow::Result<()> {
+    db.put(META_STARTUP_MANIFEST_KEY, bytes, WriteOptions { sync })
+        .context("persist spfresh startup manifest")
 }
 
 pub(crate) fn wal_key(seq: u64) -> String {

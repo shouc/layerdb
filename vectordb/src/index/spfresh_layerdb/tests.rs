@@ -203,6 +203,40 @@ fn health_check_reports_stats_and_integrity() -> anyhow::Result<()> {
 }
 
 #[test]
+fn startup_manifest_persists_with_checkpoint() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig::default();
+
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(10, vec![0.10; cfg.spfresh.dim])?;
+        idx.close()?;
+    }
+
+    let db = Db::open(dir.path(), cfg.db_options.clone())?;
+    let raw = db
+        .get(
+            super::config::META_STARTUP_MANIFEST_KEY,
+            layerdb::ReadOptions::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("startup manifest missing"))?;
+    let manifest: super::PersistedStartupManifest = bincode::deserialize(raw.as_ref())?;
+    assert_eq!(
+        manifest.schema_version,
+        super::STARTUP_MANIFEST_SCHEMA_VERSION
+    );
+    assert_eq!(
+        manifest.generation,
+        super::storage::ensure_active_generation(&db)?
+    );
+    assert_eq!(
+        manifest.posting_event_next_seq,
+        super::storage::ensure_posting_event_next_seq(&db)?
+    );
+    Ok(())
+}
+
+#[test]
 fn open_existing_uses_persisted_metadata() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let cfg = SpFreshLayerDbConfig::default();

@@ -33,9 +33,10 @@ use storage::{
     encode_vector_row_value_with_posting, encode_wal_entry, ensure_active_generation,
     ensure_metadata, ensure_posting_event_next_seq, ensure_wal_exists, ensure_wal_next_seq,
     load_index_checkpoint_bytes,
+    load_startup_manifest_bytes,
     load_metadata, load_posting_assignments, load_posting_members, load_row, load_rows,
     load_rows_with_posting_assignments,
-    load_wal_entries_since, persist_index_checkpoint_bytes,
+    load_wal_entries_since, persist_index_checkpoint_bytes, persist_startup_manifest_bytes,
     posting_map_key, posting_map_prefix, posting_member_event_key,
     posting_member_event_tombstone_value, posting_member_event_upsert_value_with_residual,
     posting_member_event_upsert_value_from_sketch, posting_members_generation_prefix,
@@ -88,6 +89,17 @@ struct PersistedIndexCheckpoint {
     generation: u64,
     applied_wal_seq: Option<u64>,
     index: RuntimeSpFreshIndex,
+}
+
+const STARTUP_MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedStartupManifest {
+    schema_version: u32,
+    generation: u64,
+    applied_wal_seq: Option<u64>,
+    posting_event_next_seq: u64,
+    epoch: u64,
 }
 
 #[derive(Debug)]
@@ -284,6 +296,7 @@ pub struct SpFreshLayerDbIndex {
     diskmeta_search_snapshot: Arc<ArcSwapOption<SpFreshDiskMetaIndex>>,
     wal_next_seq: Arc<AtomicU64>,
     posting_event_next_seq: Arc<AtomicU64>,
+    startup_epoch: Arc<AtomicU64>,
     rebuild_tx: mpsc::Sender<()>,
     stop_worker: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -336,6 +349,13 @@ impl SpFreshLayerDbIndex {
         let generation = ensure_active_generation(&db)?;
         let wal_next_seq = ensure_wal_next_seq(&db)?;
         let posting_event_next_seq = ensure_posting_event_next_seq(&db)?;
+        let manifest_epoch = load_startup_manifest_bytes(&db)?
+            .and_then(|raw| bincode::deserialize::<PersistedStartupManifest>(&raw).ok())
+            .filter(|m| {
+                m.schema_version == STARTUP_MANIFEST_SCHEMA_VERSION && m.generation == generation
+            })
+            .map(|m| m.epoch)
+            .unwrap_or(0);
         let (mut index_state, applied_wal_seq) =
             Self::load_or_rebuild_index(&db, &cfg, generation, wal_next_seq)?;
         cfg.memory_mode = match &index_state {
@@ -386,6 +406,7 @@ impl SpFreshLayerDbIndex {
         let pending_ops = Arc::new(AtomicUsize::new(0));
         let wal_next_seq = Arc::new(AtomicU64::new(wal_next_seq));
         let posting_event_next_seq = Arc::new(AtomicU64::new(posting_event_next_seq));
+        let startup_epoch = Arc::new(AtomicU64::new(manifest_epoch));
         let stop_worker = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(SpFreshLayerDbStatsInner::default());
         let (rebuild_tx, rebuild_rx) = mpsc::channel::<()>();
@@ -421,6 +442,7 @@ impl SpFreshLayerDbIndex {
             diskmeta_search_snapshot,
             wal_next_seq,
             posting_event_next_seq,
+            startup_epoch,
             rebuild_tx,
             stop_worker,
             worker: Some(worker),
@@ -592,14 +614,27 @@ impl SpFreshLayerDbIndex {
     fn persist_index_checkpoint(&self) -> anyhow::Result<()> {
         let next_wal_seq = self.wal_next_seq.load(Ordering::Relaxed);
         let snapshot = lock_read(&self.index).clone();
+        let generation = self.active_generation.load(Ordering::Relaxed);
+        let posting_event_next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
+        let epoch = self.startup_epoch.load(Ordering::Relaxed);
         let checkpoint = PersistedIndexCheckpoint {
             schema_version: config::META_INDEX_CHECKPOINT_SCHEMA_VERSION,
-            generation: self.active_generation.load(Ordering::Relaxed),
+            generation,
             applied_wal_seq: next_wal_seq.checked_sub(1),
             index: snapshot,
         };
         let bytes = bincode::serialize(&checkpoint).context("encode spfresh index checkpoint")?;
         persist_index_checkpoint_bytes(&self.db, bytes, self.cfg.write_sync)?;
+        let manifest = PersistedStartupManifest {
+            schema_version: STARTUP_MANIFEST_SCHEMA_VERSION,
+            generation,
+            applied_wal_seq: next_wal_seq.checked_sub(1),
+            posting_event_next_seq,
+            epoch,
+        };
+        let manifest_bytes =
+            bincode::serialize(&manifest).context("encode spfresh startup manifest")?;
+        persist_startup_manifest_bytes(&self.db, manifest_bytes, self.cfg.write_sync)?;
         if let Err(err) = prune_wal_before(&self.db, next_wal_seq, false) {
             eprintln!("spfresh-layerdb wal prune failed: {err:#}");
         }
@@ -952,6 +987,7 @@ impl SpFreshLayerDbIndex {
         set_active_generation(&self.db, new_generation, self.cfg.write_sync)?;
         self.active_generation
             .store(new_generation, Ordering::Relaxed);
+        self.startup_epoch.fetch_add(1, Ordering::Relaxed);
         if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
             set_posting_event_next_seq(&self.db, posting_event_next_seq, self.cfg.write_sync)?;
             self.posting_event_next_seq

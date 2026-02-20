@@ -11,6 +11,7 @@ pub(crate) const POSTING_MEMBERS_ROOT_PREFIX: &str = "spfresh/p/";
 pub(crate) const META_CONFIG_KEY: &str = "spfresh/meta/config";
 pub(crate) const META_ACTIVE_GENERATION_KEY: &str = "spfresh/meta/active_generation";
 pub(crate) const META_INDEX_CHECKPOINT_KEY: &str = "spfresh/meta/index_checkpoint";
+pub(crate) const META_STARTUP_MANIFEST_KEY: &str = "spfresh/meta/startup_manifest";
 pub(crate) const META_INDEX_WAL_NEXT_SEQ_KEY: &str = "spfresh/meta/index_wal_next_seq";
 pub(crate) const META_POSTING_EVENT_NEXT_SEQ_KEY: &str = "spfresh/meta/posting_event_next_seq";
 pub(crate) const INDEX_WAL_PREFIX: &str = "spfresh/wal/";

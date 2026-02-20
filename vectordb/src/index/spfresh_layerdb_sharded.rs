@@ -152,10 +152,18 @@ impl SpFreshLayerDbShardedIndex {
         for row in rows {
             partitioned[self.shard_for_id(row.id)].push(row.clone());
         }
-        for (shard_id, chunk) in partitioned.iter().enumerate() {
-            self.shards[shard_id]
-                .try_bulk_load(chunk)
-                .with_context(|| format!("bulk load shard {}", shard_id))?;
+        let results: Vec<anyhow::Result<()>> = self
+            .shards
+            .par_iter_mut()
+            .enumerate()
+            .map(|(shard_id, shard)| {
+                shard
+                    .try_bulk_load(&partitioned[shard_id])
+                    .with_context(|| format!("bulk load shard {}", shard_id))
+            })
+            .collect();
+        for result in results {
+            result?;
         }
         Ok(())
     }
@@ -175,14 +183,24 @@ impl SpFreshLayerDbShardedIndex {
         for row in rows {
             partitioned[self.shard_for_id(row.id)].push(row.clone());
         }
+        let results: Vec<anyhow::Result<usize>> = self
+            .shards
+            .par_iter_mut()
+            .enumerate()
+            .map(|(shard_id, shard)| {
+                let chunk = &partitioned[shard_id];
+                if chunk.is_empty() {
+                    Ok(0)
+                } else {
+                    shard
+                        .try_upsert_batch(chunk)
+                        .with_context(|| format!("upsert batch shard {}", shard_id))
+                }
+            })
+            .collect();
         let mut total = 0usize;
-        for (shard_id, chunk) in partitioned.into_iter().enumerate() {
-            if chunk.is_empty() {
-                continue;
-            }
-            total += self.shards[shard_id]
-                .try_upsert_batch(&chunk)
-                .with_context(|| format!("upsert batch shard {}", shard_id))?;
+        for result in results {
+            total += result?;
         }
         Ok(total)
     }
@@ -202,14 +220,24 @@ impl SpFreshLayerDbShardedIndex {
         for id in ids {
             partitioned[self.shard_for_id(*id)].push(*id);
         }
+        let results: Vec<anyhow::Result<usize>> = self
+            .shards
+            .par_iter_mut()
+            .enumerate()
+            .map(|(shard_id, shard)| {
+                let chunk = &partitioned[shard_id];
+                if chunk.is_empty() {
+                    Ok(0)
+                } else {
+                    shard
+                        .try_delete_batch(chunk)
+                        .with_context(|| format!("delete batch shard {}", shard_id))
+                }
+            })
+            .collect();
         let mut total_deleted = 0usize;
-        for (shard_id, chunk) in partitioned.into_iter().enumerate() {
-            if chunk.is_empty() {
-                continue;
-            }
-            total_deleted += self.shards[shard_id]
-                .try_delete_batch(&chunk)
-                .with_context(|| format!("delete batch shard {}", shard_id))?;
+        for result in results {
+            total_deleted += result?;
         }
         Ok(total_deleted)
     }

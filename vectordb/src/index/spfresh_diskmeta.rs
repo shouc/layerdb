@@ -387,11 +387,11 @@ impl SpFreshDiskMetaIndex {
         posting.size += 1;
     }
 
-    pub(crate) fn apply_upsert(
+    pub(crate) fn apply_upsert_ref(
         &mut self,
-        old: Option<(usize, Vec<f32>)>,
+        old: Option<(usize, &[f32])>,
         new_posting: usize,
-        new_vector: Vec<f32>,
+        new_vector: &[f32],
     ) {
         match old {
             Some((old_posting, old_vector)) if old_posting == new_posting => {
@@ -404,8 +404,8 @@ impl SpFreshDiskMetaIndex {
                 }
             }
             Some((old_posting, old_vector)) => {
-                self.remove_from_posting(old_posting, &old_vector);
-                self.add_to_posting(new_posting, &new_vector);
+                self.remove_from_posting(old_posting, old_vector);
+                self.add_to_posting(new_posting, new_vector);
             }
             None => {
                 if let std::collections::hash_map::Entry::Vacant(entry) =
@@ -413,14 +413,14 @@ impl SpFreshDiskMetaIndex {
                 {
                     entry.insert(DiskPosting {
                         id: new_posting,
-                        centroid: new_vector.clone(),
+                        centroid: new_vector.to_vec(),
                         size: 0,
                     });
                     if self.next_posting_id <= new_posting {
                         self.next_posting_id = new_posting + 1;
                     }
                 }
-                self.add_to_posting(new_posting, &new_vector);
+                self.add_to_posting(new_posting, new_vector);
                 self.total_rows = self.total_rows.saturating_add(1);
             }
         }
@@ -428,15 +428,30 @@ impl SpFreshDiskMetaIndex {
         self.maybe_refresh_coarse_index();
     }
 
-    pub(crate) fn apply_delete(&mut self, old: Option<(usize, Vec<f32>)>) -> bool {
+    pub(crate) fn apply_upsert(
+        &mut self,
+        old: Option<(usize, Vec<f32>)>,
+        new_posting: usize,
+        new_vector: Vec<f32>,
+    ) {
+        let old_ref = old.as_ref().map(|(posting, values)| (*posting, values.as_slice()));
+        self.apply_upsert_ref(old_ref, new_posting, new_vector.as_slice());
+    }
+
+    pub(crate) fn apply_delete_ref(&mut self, old: Option<(usize, &[f32])>) -> bool {
         let Some((old_posting, old_vector)) = old else {
             return false;
         };
-        self.remove_from_posting(old_posting, &old_vector);
+        self.remove_from_posting(old_posting, old_vector);
         self.total_rows = self.total_rows.saturating_sub(1);
         self.postings.retain(|_, posting| posting.size > 0);
         self.maybe_refresh_coarse_index();
         true
+    }
+
+    pub(crate) fn apply_delete(&mut self, old: Option<(usize, Vec<f32>)>) -> bool {
+        let old_ref = old.as_ref().map(|(posting, values)| (*posting, values.as_slice()));
+        self.apply_delete_ref(old_ref)
     }
 
     pub(crate) fn len(&self) -> usize {

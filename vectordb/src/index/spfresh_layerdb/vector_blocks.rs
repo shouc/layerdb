@@ -123,12 +123,59 @@ impl VectorBlockStore {
         Ok(())
     }
 
-    pub(crate) fn append_upsert(
+    pub(crate) fn append_upsert_batch_with_posting<F>(
         &mut self,
-        id: u64,
-        values: &[f32],
-    ) -> anyhow::Result<()> {
-        self.append_upsert_with_posting(id, None, values)
+        rows: &[(u64, Vec<f32>)],
+        mut posting_for_id: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(u64) -> Option<usize>,
+    {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let rec_size = record_size(self.dim);
+        let mut buf = Vec::with_capacity(rec_size.saturating_mul(rows.len()));
+        let mut offset = self
+            .file
+            .seek(SeekFrom::End(0))
+            .context("seek vector blocks end")?;
+
+        for (id, values) in rows {
+            if values.len() != self.dim {
+                anyhow::bail!(
+                    "vector block upsert dim mismatch: got {}, expected {}",
+                    values.len(),
+                    self.dim
+                );
+            }
+            let mut flags = VECTOR_BLOCK_LIVE;
+            let posting_u64 = posting_for_id(*id)
+                .map(|pid| u64::try_from(pid).context("vector block posting id does not fit u64"))
+                .transpose()?;
+            if posting_u64.is_some() {
+                flags |= VECTOR_BLOCK_HAS_POSTING;
+            }
+
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.push(flags);
+            buf.extend_from_slice(&posting_u64.unwrap_or_default().to_le_bytes());
+            for value in values {
+                buf.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+            self.offsets.insert(*id, offset);
+            offset = offset
+                .checked_add(u64::try_from(rec_size).context("vector block record size overflow")?)
+                .ok_or_else(|| anyhow::anyhow!("vector block offset overflow"))?;
+        }
+
+        self.file
+            .write_all(&buf)
+            .context("append vector block upsert batch")?;
+        self.pending_remap_records = self.pending_remap_records.saturating_add(rows.len());
+        self.maybe_remap()?;
+        Ok(())
     }
 
     pub(crate) fn append_upsert_with_posting(
@@ -171,22 +218,26 @@ impl VectorBlockStore {
         Ok(())
     }
 
-    pub(crate) fn append_delete(&mut self, id: u64) -> anyhow::Result<()> {
-        let offset = self
-            .file
+    pub(crate) fn append_delete_batch(&mut self, ids: &[u64]) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let rec_size = record_size(self.dim);
+        let mut buf = Vec::with_capacity(rec_size.saturating_mul(ids.len()));
+        self.file
             .seek(SeekFrom::End(0))
             .context("seek vector blocks end")?;
-        let mut buf = Vec::with_capacity(record_size(self.dim));
-        buf.extend_from_slice(&id.to_le_bytes());
-        buf.push(VECTOR_BLOCK_TOMBSTONE);
-        buf.extend_from_slice(&0u64.to_le_bytes());
-        buf.resize(record_size(self.dim), 0);
+        for id in ids {
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.push(VECTOR_BLOCK_TOMBSTONE);
+            buf.extend_from_slice(&0u64.to_le_bytes());
+            buf.resize(buf.len().saturating_add(rec_size.saturating_sub(17)), 0);
+            self.offsets.remove(id);
+        }
         self.file
             .write_all(&buf)
-            .context("append vector block tombstone")?;
-        let _ = offset;
-        self.offsets.remove(&id);
-        self.pending_remap_records = self.pending_remap_records.saturating_add(1);
+            .context("append vector block tombstone batch")?;
+        self.pending_remap_records = self.pending_remap_records.saturating_add(ids.len());
         self.maybe_remap()?;
         Ok(())
     }

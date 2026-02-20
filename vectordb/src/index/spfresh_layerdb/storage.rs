@@ -62,18 +62,28 @@ fn read_f32(raw: &[u8], cursor: &mut usize) -> anyhow::Result<f32> {
 }
 
 pub(crate) fn encode_vector_row_value(row: &VectorRecord) -> anyhow::Result<Vec<u8>> {
-    encode_vector_row_value_with_posting(row, None)
+    encode_vector_row_fields(row.id, row.version, row.deleted, &row.values, None)
 }
 
 pub(crate) fn encode_vector_row_value_with_posting(
     row: &VectorRecord,
     posting_id: Option<usize>,
 ) -> anyhow::Result<Vec<u8>> {
+    encode_vector_row_fields(row.id, row.version, row.deleted, &row.values, posting_id)
+}
+
+pub(crate) fn encode_vector_row_fields(
+    id: u64,
+    version: u32,
+    deleted: bool,
+    values: &[f32],
+    posting_id: Option<usize>,
+) -> anyhow::Result<Vec<u8>> {
     let posting_u64 = posting_id
         .map(|v| u64::try_from(v).context("posting id does not fit u64"))
         .transpose()?;
     let mut flags = 0u8;
-    if row.deleted {
+    if deleted {
         flags |= VECTOR_ROW_FLAG_DELETED;
     }
     if posting_u64.is_some() {
@@ -85,16 +95,16 @@ pub(crate) fn encode_vector_row_value_with_posting(
             + 4
             + 8
             + 4
-            + row.values.len().saturating_mul(4)
+            + values.len().saturating_mul(4)
             + posting_u64.map_or(0, |_| 8),
     );
     out.extend_from_slice(VECTOR_ROW_BIN_TAG);
     out.push(flags);
-    out.extend_from_slice(&row.version.to_le_bytes());
-    out.extend_from_slice(&row.id.to_le_bytes());
-    let dim = u32::try_from(row.values.len()).context("vector row dim does not fit u32")?;
+    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(&id.to_le_bytes());
+    let dim = u32::try_from(values.len()).context("vector row dim does not fit u32")?;
     out.extend_from_slice(&dim.to_le_bytes());
-    for value in &row.values {
+    for value in values {
         out.extend_from_slice(&value.to_bits().to_le_bytes());
     }
     if let Some(posting) = posting_u64 {

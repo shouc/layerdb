@@ -32,7 +32,7 @@ use stats::SpFreshLayerDbStatsInner;
 use vector_blocks::VectorBlockStore;
 use storage::{
     decode_vector_row_value, decode_vector_row_with_posting, encode_vector_row_value,
-    encode_vector_row_value_with_posting, encode_wal_entry, ensure_active_generation,
+    encode_vector_row_fields, encode_vector_row_value_with_posting, encode_wal_entry, ensure_active_generation,
     ensure_metadata, ensure_posting_event_next_seq, ensure_wal_exists, ensure_wal_next_seq,
     load_index_checkpoint_bytes, load_metadata, load_posting_members, load_row, load_rows,
     load_rows_with_posting_assignments, load_startup_manifest_bytes, load_wal_entries_since,
@@ -1422,7 +1422,7 @@ impl SpFreshLayerDbIndex {
 
         if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
             let ids: Vec<u64> = mutations.iter().map(|(id, _)| *id).collect();
-            let mut states = self.load_diskmeta_states_for_ids(generation, &ids)?;
+            let states = self.load_diskmeta_states_for_ids(generation, &ids)?;
             let mut shadow = match &*lock_read(&self.index) {
                 RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.clone(),
                 _ => anyhow::bail!("diskmeta upsert batch called for non-diskmeta index"),
@@ -1431,17 +1431,16 @@ impl SpFreshLayerDbIndex {
                 self.posting_event_next_seq.load(Ordering::Relaxed);
 
             let mut persist_entries = Vec::with_capacity(mutations.len());
-            let mut apply_entries = Vec::with_capacity(mutations.len());
+            let mut new_postings = HashMap::with_capacity(mutations.len());
             let mut cache_deltas = Vec::with_capacity(mutations.len());
             for (id, vector) in &mutations {
-                let old = states.get(id).cloned().unwrap_or(None);
+                let old = states.get(id).and_then(|state| state.as_ref());
                 let new_posting = shadow.choose_posting(vector).unwrap_or(0);
                 let centroid = shadow
                     .posting_centroid(new_posting)
                     .unwrap_or(vector.as_slice());
                 let sketch = Self::residual_sketch_for_member(*id, vector, centroid);
-                let row = VectorRecord::new(*id, vector.clone());
-                let value = encode_vector_row_value_with_posting(&row, Some(new_posting))
+                let value = encode_vector_row_fields(*id, 0, false, vector.as_slice(), Some(new_posting))
                     .context("serialize vector row")?;
                 let upsert_event_seq = posting_event_next_seq;
                 posting_event_next_seq = posting_event_next_seq.saturating_add(1);
@@ -1452,7 +1451,7 @@ impl SpFreshLayerDbIndex {
                         posting_member_event_upsert_value_with_residual(*id, vector, centroid)?,
                     ),
                 ];
-                if let Some((old_posting, _)) = &old {
+                if let Some((old_posting, _)) = old {
                     if *old_posting != new_posting {
                         let tombstone_event_seq = posting_event_next_seq;
                         posting_event_next_seq = posting_event_next_seq.saturating_add(1);
@@ -1468,10 +1467,14 @@ impl SpFreshLayerDbIndex {
                     IndexWalEntry::Touch { id: *id },
                     ops,
                 ));
-                apply_entries.push((*id, old.clone(), new_posting, vector.clone()));
-                cache_deltas.push((*id, old.as_ref().map(|(posting, _)| *posting), new_posting, sketch));
-                shadow.apply_upsert(old, new_posting, vector.clone());
-                states.insert(*id, Some((new_posting, vector.clone())));
+                let old_posting = old.map(|(posting, _)| *posting);
+                cache_deltas.push((*id, old_posting, new_posting, sketch));
+                shadow.apply_upsert_ref(
+                    old.map(|(posting, values)| (*posting, values.as_slice())),
+                    new_posting,
+                    vector.as_slice(),
+                );
+                new_postings.insert(*id, new_posting);
             }
             let posting_event_next = bincode::serialize(&posting_event_next_seq)
                 .context("encode posting-event next seq")?;
@@ -1492,14 +1495,10 @@ impl SpFreshLayerDbIndex {
                 .store(posting_event_next_seq, Ordering::Relaxed);
             {
                 let mut blocks = lock_mutex(&self.vector_blocks);
-                for (id, vector) in &mutations {
-                    let posting = states
-                        .get(id)
-                        .and_then(|state| state.as_ref().map(|(posting, _)| *posting));
-                    if let Err(err) = blocks.append_upsert_with_posting(*id, posting, vector) {
-                        eprintln!("spfresh-layerdb vector blocks upsert append failed: {err:#}");
-                        break;
-                    }
+                if let Err(err) =
+                    blocks.append_upsert_batch_with_posting(&mutations, |id| new_postings.get(&id).copied())
+                {
+                    eprintln!("spfresh-layerdb vector blocks upsert append failed: {err:#}");
                 }
             }
 
@@ -1508,8 +1507,16 @@ impl SpFreshLayerDbIndex {
                 let RuntimeSpFreshIndex::OffHeapDiskMeta(index) = &mut *index else {
                     anyhow::bail!("diskmeta upsert batch called for non-diskmeta runtime");
                 };
-                for (_id, old, new_posting, vector) in apply_entries {
-                    index.apply_upsert(old, new_posting, vector);
+                for (id, vector) in &mutations {
+                    let Some(new_posting) = new_postings.get(id).copied() else {
+                        continue;
+                    };
+                    let old = states.get(id).and_then(|state| state.as_ref());
+                    index.apply_upsert_ref(
+                        old.map(|(posting, values)| (*posting, values.as_slice())),
+                        new_posting,
+                        vector.as_slice(),
+                    );
                 }
                 Some(Arc::new(index.clone()))
             };
@@ -1539,8 +1546,8 @@ impl SpFreshLayerDbIndex {
 
         let mut persist_entries = Vec::with_capacity(mutations.len());
         for (id, vector) in &mutations {
-            let row = VectorRecord::new(*id, vector.clone());
-            let value = encode_vector_row_value(&row).context("serialize vector row")?;
+            let value = encode_vector_row_fields(*id, 0, false, vector.as_slice(), None)
+                .context("serialize vector row")?;
             persist_entries.push((
                 IndexWalEntry::Touch { id: *id },
                 vec![layerdb::Op::put(vector_key(generation, *id), value)],
@@ -1556,11 +1563,8 @@ impl SpFreshLayerDbIndex {
             .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
         {
             let mut blocks = lock_mutex(&self.vector_blocks);
-            for (id, vector) in &mutations {
-                if let Err(err) = blocks.append_upsert(*id, vector) {
-                    eprintln!("spfresh-layerdb vector blocks upsert append failed: {err:#}");
-                    break;
-                }
+            if let Err(err) = blocks.append_upsert_batch_with_posting(&mutations, |_| None) {
+                eprintln!("spfresh-layerdb vector blocks upsert append failed: {err:#}");
             }
         }
 
@@ -1661,11 +1665,8 @@ impl SpFreshLayerDbIndex {
                 .store(posting_event_next_seq, Ordering::Relaxed);
             {
                 let mut blocks = lock_mutex(&self.vector_blocks);
-                for id in &mutations {
-                    if let Err(err) = blocks.append_delete(*id) {
-                        eprintln!("spfresh-layerdb vector blocks tombstone append failed: {err:#}");
-                        break;
-                    }
+                if let Err(err) = blocks.append_delete_batch(&mutations) {
+                    eprintln!("spfresh-layerdb vector blocks tombstone append failed: {err:#}");
                 }
             }
 
@@ -1720,11 +1721,8 @@ impl SpFreshLayerDbIndex {
             .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
         {
             let mut blocks = lock_mutex(&self.vector_blocks);
-            for id in &mutations {
-                if let Err(err) = blocks.append_delete(*id) {
-                    eprintln!("spfresh-layerdb vector blocks tombstone append failed: {err:#}");
-                    break;
-                }
+            if let Err(err) = blocks.append_delete_batch(&mutations) {
+                eprintln!("spfresh-layerdb vector blocks tombstone append failed: {err:#}");
             }
         }
 

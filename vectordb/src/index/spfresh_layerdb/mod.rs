@@ -3,6 +3,7 @@ mod rebuilder;
 mod stats;
 mod storage;
 mod sync_utils;
+mod vector_blocks;
 
 #[cfg(test)]
 mod tests;
@@ -28,6 +29,7 @@ use super::spfresh_offheap::SpFreshOffHeapIndex;
 use super::{SpFreshConfig, SpFreshIndex};
 use rebuilder::{rebuild_once, spawn_rebuilder, RebuilderRuntime};
 use stats::SpFreshLayerDbStatsInner;
+use vector_blocks::VectorBlockStore;
 use storage::{
     decode_vector_row_value, decode_vector_row_with_posting, encode_vector_row_value,
     encode_vector_row_value_with_posting, encode_wal_entry, ensure_active_generation,
@@ -292,6 +294,7 @@ pub struct SpFreshLayerDbIndex {
     dirty_ids: Arc<Mutex<HashSet<u64>>>,
     pending_ops: Arc<AtomicUsize>,
     vector_cache: Arc<Mutex<VectorCache>>,
+    vector_blocks: Arc<Mutex<VectorBlockStore>>,
     posting_members_cache: Arc<Mutex<PostingMembersCache>>,
     diskmeta_search_snapshot: Arc<ArcSwapOption<SpFreshDiskMetaIndex>>,
     wal_next_seq: Arc<AtomicU64>,
@@ -364,6 +367,11 @@ impl SpFreshLayerDbIndex {
             RuntimeSpFreshIndex::OffHeapDiskMeta(_) => SpFreshMemoryMode::OffHeapDiskMeta,
         };
         let vector_cache = Arc::new(Mutex::new(VectorCache::new(cfg.offheap_cache_capacity)));
+        let vector_blocks = Arc::new(Mutex::new(VectorBlockStore::open(
+            db_path,
+            cfg.spfresh.dim,
+            manifest_epoch,
+        )?));
         let posting_members_cache = Arc::new(Mutex::new(PostingMembersCache::new(
             cfg.offheap_posting_cache_entries,
             cfg.posting_delta_compact_interval_ops,
@@ -385,6 +393,7 @@ impl SpFreshLayerDbIndex {
                 Self::replay_wal_tail(
                     &db,
                     &vector_cache,
+                    &vector_blocks,
                     generation,
                     &mut index_state,
                     replay_from,
@@ -422,6 +431,7 @@ impl SpFreshLayerDbIndex {
                 dirty_ids: dirty_ids.clone(),
                 pending_ops: pending_ops.clone(),
                 vector_cache: vector_cache.clone(),
+                vector_blocks: vector_blocks.clone(),
                 stats: stats.clone(),
                 stop_worker: stop_worker.clone(),
             },
@@ -438,6 +448,7 @@ impl SpFreshLayerDbIndex {
             dirty_ids,
             pending_ops,
             vector_cache,
+            vector_blocks,
             posting_members_cache,
             diskmeta_search_snapshot,
             wal_next_seq,
@@ -515,6 +526,7 @@ impl SpFreshLayerDbIndex {
     fn replay_wal_tail(
         db: &Db,
         vector_cache: &Arc<Mutex<VectorCache>>,
+        vector_blocks: &Arc<Mutex<VectorBlockStore>>,
         generation: u64,
         index: &mut RuntimeSpFreshIndex,
         from_seq: u64,
@@ -554,6 +566,7 @@ impl SpFreshLayerDbIndex {
                         let mut loader = Self::loader_for(
                             db,
                             vector_cache,
+                            vector_blocks,
                             generation,
                             Some((id, values.clone())),
                         );
@@ -569,7 +582,8 @@ impl SpFreshLayerDbIndex {
                         let _ = index.delete(id);
                     }
                     RuntimeSpFreshIndex::OffHeap(index) => {
-                        let mut loader = Self::loader_for(db, vector_cache, generation, None);
+                        let mut loader =
+                            Self::loader_for(db, vector_cache, vector_blocks, generation, None);
                         let _ = index.delete_with(id, &mut loader)?;
                     }
                     RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
@@ -583,6 +597,7 @@ impl SpFreshLayerDbIndex {
                             let mut loader = Self::loader_for(
                                 db,
                                 vector_cache,
+                                vector_blocks,
                                 generation,
                                 Some((row.id, row.values.clone())),
                             );
@@ -598,7 +613,13 @@ impl SpFreshLayerDbIndex {
                             let _ = index.delete(id);
                         }
                         RuntimeSpFreshIndex::OffHeap(index) => {
-                            let mut loader = Self::loader_for(db, vector_cache, generation, None);
+                            let mut loader = Self::loader_for(
+                                db,
+                                vector_cache,
+                                vector_blocks,
+                                generation,
+                                None,
+                            );
                             let _ = index.delete_with(id, &mut loader)?;
                         }
                         RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
@@ -652,6 +673,7 @@ impl SpFreshLayerDbIndex {
             dirty_ids: self.dirty_ids.clone(),
             pending_ops: self.pending_ops.clone(),
             vector_cache: self.vector_cache.clone(),
+            vector_blocks: self.vector_blocks.clone(),
             stats: self.stats.clone(),
             stop_worker: self.stop_worker.clone(),
         }
@@ -660,10 +682,15 @@ impl SpFreshLayerDbIndex {
     fn load_vector_for_id(
         db: &Db,
         vector_cache: &Arc<Mutex<VectorCache>>,
+        vector_blocks: &Arc<Mutex<VectorBlockStore>>,
         generation: u64,
         id: u64,
     ) -> anyhow::Result<Option<Vec<f32>>> {
         if let Some(values) = lock_mutex(vector_cache).get(id) {
+            return Ok(Some(values));
+        }
+        if let Some(values) = lock_mutex(vector_blocks).get(id) {
+            lock_mutex(vector_cache).put(id, values.clone());
             return Ok(Some(values));
         }
         let Some(row) = load_row(db, generation, id)? else {
@@ -677,26 +704,46 @@ impl SpFreshLayerDbIndex {
     fn load_vectors_for_ids(
         db: &Db,
         vector_cache: &Arc<Mutex<VectorCache>>,
+        vector_blocks: &Arc<Mutex<VectorBlockStore>>,
         generation: u64,
         ids: &[u64],
     ) -> anyhow::Result<Vec<(u64, Vec<f32>)>> {
         let mut out = Vec::with_capacity(ids.len());
-        let mut misses = Vec::new();
+        let mut cache_misses = Vec::new();
         {
             let cache = lock_mutex(vector_cache);
             for id in ids.iter().copied() {
                 if let Some(values) = cache.get(id) {
                     out.push((id, values));
                 } else {
-                    misses.push(id);
+                    cache_misses.push(id);
                 }
             }
         }
-        if misses.is_empty() {
+        if cache_misses.is_empty() {
             return Ok(out);
         }
 
-        let keys: Vec<Bytes> = misses
+        let mut db_misses = Vec::new();
+        {
+            let blocks = lock_mutex(vector_blocks);
+            for id in cache_misses {
+                if let Some(values) = blocks.get(id) {
+                    out.push((id, values));
+                } else {
+                    db_misses.push(id);
+                }
+            }
+        }
+        if db_misses.is_empty() {
+            let mut cache = lock_mutex(vector_cache);
+            for (id, values) in &out {
+                cache.put(*id, values.clone());
+            }
+            return Ok(out);
+        }
+
+        let keys: Vec<Bytes> = db_misses
             .iter()
             .map(|id| Bytes::from(vector_key(generation, *id)))
             .collect();
@@ -704,7 +751,7 @@ impl SpFreshLayerDbIndex {
             .multi_get(&keys, ReadOptions::default())
             .context("diskmeta multi_get vector rows")?;
         let mut fetched = Vec::new();
-        for (id, raw) in misses.into_iter().zip(rows.into_iter()) {
+        for (id, raw) in db_misses.into_iter().zip(rows.into_iter()) {
             let Some(raw) = raw else {
                 continue;
             };
@@ -728,6 +775,7 @@ impl SpFreshLayerDbIndex {
     fn loader_for<'a>(
         db: &'a Db,
         vector_cache: &'a Arc<Mutex<VectorCache>>,
+        vector_blocks: &'a Arc<Mutex<VectorBlockStore>>,
         generation: u64,
         override_row: Option<(u64, Vec<f32>)>,
     ) -> impl FnMut(u64) -> anyhow::Result<Option<Vec<f32>>> + 'a {
@@ -737,7 +785,7 @@ impl SpFreshLayerDbIndex {
                     return Ok(Some(values.clone()));
                 }
             }
-            Self::load_vector_for_id(db, vector_cache, generation, id)
+            Self::load_vector_for_id(db, vector_cache, vector_blocks, generation, id)
         }
     }
 
@@ -987,7 +1035,20 @@ impl SpFreshLayerDbIndex {
         set_active_generation(&self.db, new_generation, self.cfg.write_sync)?;
         self.active_generation
             .store(new_generation, Ordering::Relaxed);
-        self.startup_epoch.fetch_add(1, Ordering::Relaxed);
+        let new_epoch = self.startup_epoch.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        {
+            let mut blocks = lock_mutex(&self.vector_blocks);
+            if let Err(err) = blocks.rotate_epoch(new_epoch) {
+                eprintln!("spfresh-layerdb vector blocks rotate failed: {err:#}");
+            } else {
+                for row in rows {
+                    if let Err(err) = blocks.append_upsert(row.id, &row.values) {
+                        eprintln!("spfresh-layerdb vector blocks bulk append failed: {err:#}");
+                        break;
+                    }
+                }
+            }
+        }
         if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
             set_posting_event_next_seq(&self.db, posting_event_next_seq, self.cfg.write_sync)?;
             self.posting_event_next_seq
@@ -1294,6 +1355,15 @@ impl SpFreshLayerDbIndex {
                 .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
             self.posting_event_next_seq
                 .store(posting_event_next_seq, Ordering::Relaxed);
+            {
+                let mut blocks = lock_mutex(&self.vector_blocks);
+                for (id, vector) in &mutations {
+                    if let Err(err) = blocks.append_upsert(*id, vector) {
+                        eprintln!("spfresh-layerdb vector blocks upsert append failed: {err:#}");
+                        break;
+                    }
+                }
+            }
 
             let snapshot = {
                 let mut index = lock_write(&self.index);
@@ -1349,6 +1419,15 @@ impl SpFreshLayerDbIndex {
         }
         self.stats
             .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
+        {
+            let mut blocks = lock_mutex(&self.vector_blocks);
+            for (id, vector) in &mutations {
+                if let Err(err) = blocks.append_upsert(*id, vector) {
+                    eprintln!("spfresh-layerdb vector blocks upsert append failed: {err:#}");
+                    break;
+                }
+            }
+        }
 
         {
             let mut index = lock_write(&self.index);
@@ -1359,6 +1438,7 @@ impl SpFreshLayerDbIndex {
                         let mut loader = Self::loader_for(
                             &self.db,
                             &self.vector_cache,
+                            &self.vector_blocks,
                             generation,
                             Some((*id, vector.clone())),
                         );
@@ -1443,6 +1523,15 @@ impl SpFreshLayerDbIndex {
                 .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
             self.posting_event_next_seq
                 .store(posting_event_next_seq, Ordering::Relaxed);
+            {
+                let mut blocks = lock_mutex(&self.vector_blocks);
+                for id in &mutations {
+                    if let Err(err) = blocks.append_delete(*id) {
+                        eprintln!("spfresh-layerdb vector blocks tombstone append failed: {err:#}");
+                        break;
+                    }
+                }
+            }
 
             let mut deleted = 0usize;
             let snapshot = {
@@ -1493,6 +1582,15 @@ impl SpFreshLayerDbIndex {
         }
         self.stats
             .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
+        {
+            let mut blocks = lock_mutex(&self.vector_blocks);
+            for id in &mutations {
+                if let Err(err) = blocks.append_delete(*id) {
+                    eprintln!("spfresh-layerdb vector blocks tombstone append failed: {err:#}");
+                    break;
+                }
+            }
+        }
 
         let mut deleted = 0usize;
         {
@@ -1501,8 +1599,13 @@ impl SpFreshLayerDbIndex {
                 let was_deleted = match &mut *index {
                     RuntimeSpFreshIndex::Resident(index) => index.delete(*id),
                     RuntimeSpFreshIndex::OffHeap(index) => {
-                        let mut loader =
-                            Self::loader_for(&self.db, &self.vector_cache, generation, None);
+                        let mut loader = Self::loader_for(
+                            &self.db,
+                            &self.vector_cache,
+                            &self.vector_blocks,
+                            generation,
+                            None,
+                        );
                         index
                             .delete_with(*id, &mut loader)
                             .with_context(|| format!("offheap delete id={id}"))?
@@ -1673,18 +1776,30 @@ impl VectorIndex for SpFreshLayerDbIndex {
                 }
 
                 let mut vectors =
-                    Self::load_vectors_for_ids(&self.db, &self.vector_cache, generation, &selected_ids)
-                        .unwrap_or_else(|err| panic!("offheap-diskmeta load vectors failed: {err:#}"));
+                    Self::load_vectors_for_ids(
+                        &self.db,
+                        &self.vector_cache,
+                        &self.vector_blocks,
+                        generation,
+                        &selected_ids,
+                    )
+                    .unwrap_or_else(|err| panic!("offheap-diskmeta load vectors failed: {err:#}"));
 
                 // If selected candidates miss row payloads, fall back to exact fetch over all
                 // posting members before using residual-only approximate fallback.
                 if vectors.len() < selected_ids.len() {
                     selected_ids = members.iter().map(|m| m.id).collect();
                     vectors =
-                        Self::load_vectors_for_ids(&self.db, &self.vector_cache, generation, &selected_ids)
-                            .unwrap_or_else(|err| {
-                                panic!("offheap-diskmeta exact fallback load vectors failed: {err:#}")
-                            });
+                        Self::load_vectors_for_ids(
+                            &self.db,
+                            &self.vector_cache,
+                            &self.vector_blocks,
+                            generation,
+                            &selected_ids,
+                        )
+                        .unwrap_or_else(|err| {
+                            panic!("offheap-diskmeta exact fallback load vectors failed: {err:#}")
+                        });
                 }
 
                 let mut loaded_ids = HashSet::with_capacity(vectors.len());
@@ -1730,7 +1845,13 @@ impl VectorIndex for SpFreshLayerDbIndex {
             match &*lock_read(&self.index) {
                 RuntimeSpFreshIndex::Resident(index) => index.search(query, k),
                 RuntimeSpFreshIndex::OffHeap(index) => {
-                    let mut loader = Self::loader_for(&self.db, &self.vector_cache, generation, None);
+                    let mut loader = Self::loader_for(
+                        &self.db,
+                        &self.vector_cache,
+                        &self.vector_blocks,
+                        generation,
+                        None,
+                    );
                     match index.search_with(query, k, &mut loader) {
                         Ok(out) => out,
                         Err(err) => panic!("spfresh-layerdb offheap search failed: {err:#}"),

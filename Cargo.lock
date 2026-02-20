@@ -6271,6 +6271,7 @@ dependencies = [
  "futures",
  "lancedb",
  "layerdb",
+ "memmap2",
  "rand 0.8.5",
  "rayon",
  "rkyv",

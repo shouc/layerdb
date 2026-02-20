@@ -11,6 +11,7 @@ use super::RuntimeSpFreshIndex;
 use super::stats::SpFreshLayerDbStatsInner;
 use super::storage::load_row;
 use super::sync_utils::lock_write;
+use super::vector_blocks::VectorBlockStore;
 use super::VectorCache;
 
 pub(crate) struct RebuilderRuntime {
@@ -23,6 +24,7 @@ pub(crate) struct RebuilderRuntime {
     pub dirty_ids: Arc<Mutex<std::collections::HashSet<u64>>>,
     pub pending_ops: Arc<AtomicUsize>,
     pub vector_cache: Arc<Mutex<VectorCache>>,
+    pub vector_blocks: Arc<Mutex<VectorBlockStore>>,
     pub stats: Arc<SpFreshLayerDbStatsInner>,
     pub stop_worker: Arc<AtomicBool>,
 }
@@ -162,6 +164,13 @@ fn load_vector_for_id(
     };
     if cached.is_some() {
         return Ok(cached);
+    }
+    let block_cached = match runtime.vector_blocks.lock() {
+        Ok(guard) => guard.get(id),
+        Err(poisoned) => poisoned.into_inner().get(id),
+    };
+    if block_cached.is_some() {
+        return Ok(block_cached);
     }
     let Some(row) = load_row(&runtime.db, generation, id)? else {
         return Ok(None);

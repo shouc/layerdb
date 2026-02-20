@@ -1487,52 +1487,55 @@ impl VectorIndex for SpFreshLayerDbIndex {
     fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
         let started = Instant::now();
         let generation = self.active_generation.load(Ordering::Relaxed);
-        let out = match &*lock_read(&self.index) {
-            RuntimeSpFreshIndex::Resident(index) => index.search(query, k),
-            RuntimeSpFreshIndex::OffHeap(index) => {
-                let mut loader = Self::loader_for(&self.db, &self.vector_cache, generation, None);
-                match index.search_with(query, k, &mut loader) {
-                    Ok(out) => out,
-                    Err(err) => panic!("spfresh-layerdb offheap search failed: {err:#}"),
+        let diskmeta_snapshot = {
+            let guard = lock_read(&self.index);
+            match &*guard {
+                RuntimeSpFreshIndex::OffHeapDiskMeta(index) => Some(index.clone()),
+                _ => None,
+            }
+        };
+        let out = if let Some(index) = diskmeta_snapshot {
+            let mut top = Vec::with_capacity(k);
+            let postings = index.choose_probe_postings(query, k);
+            for posting_id in postings {
+                let Some(centroid) = index.posting_centroid(posting_id) else {
+                    continue;
+                };
+                let members = self
+                    .load_posting_members_for(generation, posting_id)
+                    .unwrap_or_else(|err| panic!("offheap-diskmeta load members failed: {err:#}"));
+                let candidate_ids =
+                    Self::select_diskmeta_candidates(query, centroid, members.as_ref(), k);
+                if candidate_ids.is_empty() {
+                    continue;
+                }
+                let vectors =
+                    Self::load_vectors_for_ids(&self.db, &self.vector_cache, generation, &candidate_ids)
+                        .unwrap_or_else(|err| panic!("offheap-diskmeta load vectors failed: {err:#}"));
+                for (id, values) in vectors {
+                    Self::push_neighbor_topk(
+                        &mut top,
+                        Neighbor {
+                            id,
+                            distance: crate::linalg::squared_l2(query, &values),
+                        },
+                        k,
+                    );
                 }
             }
-            RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
-                let mut top = Vec::with_capacity(k);
-                let postings = index.choose_probe_postings(query, k);
-                for posting_id in postings {
-                    let Some(centroid) = index.posting_centroid(posting_id) else {
-                        continue;
-                    };
-                    let members = self
-                        .load_posting_members_for(generation, posting_id)
-                        .unwrap_or_else(|err| {
-                            panic!("offheap-diskmeta load members failed: {err:#}")
-                        });
-                    let candidate_ids =
-                        Self::select_diskmeta_candidates(query, centroid, members.as_ref(), k);
-                    if candidate_ids.is_empty() {
-                        continue;
-                    }
-                    let vectors = Self::load_vectors_for_ids(
-                        &self.db,
-                        &self.vector_cache,
-                        generation,
-                        &candidate_ids,
-                    )
-                    .unwrap_or_else(|err| panic!("offheap-diskmeta load vectors failed: {err:#}"));
-                    for (id, values) in vectors {
-                        Self::push_neighbor_topk(
-                            &mut top,
-                            Neighbor {
-                                id,
-                                distance: crate::linalg::squared_l2(query, &values),
-                            },
-                            k,
-                        );
+            top.sort_by(Self::neighbor_cmp);
+            top
+        } else {
+            match &*lock_read(&self.index) {
+                RuntimeSpFreshIndex::Resident(index) => index.search(query, k),
+                RuntimeSpFreshIndex::OffHeap(index) => {
+                    let mut loader = Self::loader_for(&self.db, &self.vector_cache, generation, None);
+                    match index.search_with(query, k, &mut loader) {
+                        Ok(out) => out,
+                        Err(err) => panic!("spfresh-layerdb offheap search failed: {err:#}"),
                     }
                 }
-                top.sort_by(Self::neighbor_cmp);
-                top
+                RuntimeSpFreshIndex::OffHeapDiskMeta(_) => unreachable!("diskmeta handled above"),
             }
         };
         self.stats

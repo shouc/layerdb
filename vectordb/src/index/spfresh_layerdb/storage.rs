@@ -863,50 +863,6 @@ pub(crate) fn load_posting_members(
     })
 }
 
-pub(crate) fn load_posting_assignments(
-    db: &Db,
-    generation: u64,
-) -> anyhow::Result<HashMap<u64, usize>> {
-    let mut out = HashMap::new();
-    let prefix = posting_map_prefix(generation);
-    let prefix_bytes = prefix.as_bytes().to_vec();
-    let end = prefix_exclusive_end(&prefix_bytes)?;
-    let mut iter = db.iter(
-        Range {
-            start: Bound::Included(Bytes::from(prefix_bytes.clone())),
-            end: Bound::Excluded(Bytes::from(end)),
-        },
-        ReadOptions::default(),
-    )?;
-    iter.seek_to_first();
-    for next in iter {
-        let (key, value) = next?;
-        if !key.starts_with(prefix_bytes.as_slice()) {
-            continue;
-        }
-        let Some(value) = value else {
-            continue;
-        };
-        let posting_u64: u64 = bincode::deserialize(value.as_ref()).with_context(|| {
-            format!(
-                "decode posting assignment key={}",
-                String::from_utf8_lossy(&key)
-            )
-        })?;
-        let posting =
-            usize::try_from(posting_u64).context("posting assignment does not fit usize")?;
-        let key_str = String::from_utf8_lossy(&key);
-        let Some(id_suffix) = key_str.rsplit('/').next() else {
-            continue;
-        };
-        let id: u64 = id_suffix
-            .parse()
-            .with_context(|| format!("decode posting assignment id from key={key_str}"))?;
-        out.insert(id, posting);
-    }
-    Ok(out)
-}
-
 pub(crate) fn prefix_exclusive_end(prefix: &[u8]) -> anyhow::Result<Vec<u8>> {
     if prefix.is_empty() {
         anyhow::bail!("prefix for range deletion must not be empty");

@@ -11,10 +11,11 @@ const VECTOR_BLOCK_FILE_EXT: &str = "vb";
 const VECTOR_BLOCK_HEADER_TAG: &[u8] = b"vb1";
 const VECTOR_BLOCK_TOMBSTONE: u8 = 1;
 const VECTOR_BLOCK_LIVE: u8 = 0;
+const VECTOR_BLOCK_HAS_POSTING: u8 = 1 << 1;
 const REMAP_INTERVAL_RECORDS: usize = 1_024;
 
 fn record_size(dim: usize) -> usize {
-    8 + 1 + dim.saturating_mul(4)
+    8 + 1 + 8 + dim.saturating_mul(4)
 }
 
 fn header_size() -> usize {
@@ -35,6 +36,12 @@ pub(crate) struct VectorBlockStore {
     mmap: Option<Mmap>,
     offsets: HashMap<u64, u64>,
     pending_remap_records: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VectorBlockState {
+    pub posting_id: Option<usize>,
+    pub values: Vec<f32>,
 }
 
 impl VectorBlockStore {
@@ -116,7 +123,20 @@ impl VectorBlockStore {
         Ok(())
     }
 
-    pub(crate) fn append_upsert(&mut self, id: u64, values: &[f32]) -> anyhow::Result<()> {
+    pub(crate) fn append_upsert(
+        &mut self,
+        id: u64,
+        values: &[f32],
+    ) -> anyhow::Result<()> {
+        self.append_upsert_with_posting(id, None, values)
+    }
+
+    pub(crate) fn append_upsert_with_posting(
+        &mut self,
+        id: u64,
+        posting_id: Option<usize>,
+        values: &[f32],
+    ) -> anyhow::Result<()> {
         if values.len() != self.dim {
             anyhow::bail!(
                 "vector block upsert dim mismatch: got {}, expected {}",
@@ -128,9 +148,17 @@ impl VectorBlockStore {
             .file
             .seek(SeekFrom::End(0))
             .context("seek vector blocks end")?;
+        let mut flags = VECTOR_BLOCK_LIVE;
+        let posting_u64 = posting_id
+            .map(|pid| u64::try_from(pid).context("vector block posting id does not fit u64"))
+            .transpose()?;
+        if posting_u64.is_some() {
+            flags |= VECTOR_BLOCK_HAS_POSTING;
+        }
         let mut buf = Vec::with_capacity(record_size(self.dim));
         buf.extend_from_slice(&id.to_le_bytes());
-        buf.push(VECTOR_BLOCK_LIVE);
+        buf.push(flags);
+        buf.extend_from_slice(&posting_u64.unwrap_or_default().to_le_bytes());
         for value in values {
             buf.extend_from_slice(&value.to_bits().to_le_bytes());
         }
@@ -151,6 +179,7 @@ impl VectorBlockStore {
         let mut buf = Vec::with_capacity(record_size(self.dim));
         buf.extend_from_slice(&id.to_le_bytes());
         buf.push(VECTOR_BLOCK_TOMBSTONE);
+        buf.extend_from_slice(&0u64.to_le_bytes());
         buf.resize(record_size(self.dim), 0);
         self.file
             .write_all(&buf)
@@ -163,18 +192,32 @@ impl VectorBlockStore {
     }
 
     pub(crate) fn get(&self, id: u64) -> Option<Vec<f32>> {
+        self.get_state(id).map(|state| state.values)
+    }
+
+    pub(crate) fn get_state(&self, id: u64) -> Option<VectorBlockState> {
         let offset = *self.offsets.get(&id)?;
         let mmap = self.mmap.as_ref()?;
         let rec_size = record_size(self.dim);
         let start = usize::try_from(offset).ok()?;
         let end = start.checked_add(rec_size)?;
         let record = mmap.get(start..end)?;
-        let tombstone = *record.get(8)?;
-        if tombstone == VECTOR_BLOCK_TOMBSTONE {
+        let flags = *record.get(8)?;
+        let tombstone = (flags & VECTOR_BLOCK_TOMBSTONE) != 0;
+        if tombstone {
             return None;
         }
+        let posting_id = if (flags & VECTOR_BLOCK_HAS_POSTING) != 0 {
+            let posting_bytes = record.get(9..17)?;
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(posting_bytes);
+            let pid_u64 = u64::from_le_bytes(arr);
+            Some(usize::try_from(pid_u64).ok()?)
+        } else {
+            None
+        };
         let mut values = Vec::with_capacity(self.dim);
-        let mut cursor = 9usize;
+        let mut cursor = 17usize;
         for _ in 0..self.dim {
             let bits_bytes = record.get(cursor..cursor + 4)?;
             let mut arr = [0u8; 4];
@@ -182,7 +225,7 @@ impl VectorBlockStore {
             values.push(f32::from_bits(u32::from_le_bytes(arr)));
             cursor += 4;
         }
-        Some(values)
+        Some(VectorBlockState { posting_id, values })
     }
 
     fn validate_header(&mut self) -> anyhow::Result<()> {

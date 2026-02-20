@@ -36,10 +36,10 @@ use storage::{
     ensure_metadata, ensure_posting_event_next_seq, ensure_wal_exists, ensure_wal_next_seq,
     load_index_checkpoint_bytes,
     load_startup_manifest_bytes,
-    load_metadata, load_posting_assignments, load_posting_members, load_row, load_rows,
+    load_metadata, load_posting_members, load_row, load_rows,
     load_rows_with_posting_assignments,
     load_wal_entries_since, persist_index_checkpoint_bytes, persist_startup_manifest_bytes,
-    posting_map_key, posting_map_prefix, posting_member_event_key,
+    posting_map_prefix, posting_member_event_key,
     posting_member_event_tombstone_value, posting_member_event_upsert_value_with_residual,
     posting_member_event_upsert_value_from_sketch, posting_members_generation_prefix,
     posting_members_prefix, prefix_exclusive_end, prune_wal_before,
@@ -525,13 +525,7 @@ impl SpFreshLayerDbIndex {
                 RuntimeSpFreshIndex::OffHeap(SpFreshOffHeapIndex::build(cfg.spfresh.clone(), &rows))
             }
             SpFreshMemoryMode::OffHeapDiskMeta => {
-                let (rows, mut assignments) = load_rows_with_posting_assignments(db, generation)?;
-                if assignments.len() < rows.len() {
-                    let legacy_assignments = load_posting_assignments(db, generation)?;
-                    for (id, posting) in legacy_assignments {
-                        assignments.entry(id).or_insert(posting);
-                    }
-                }
+                let (rows, assignments) = load_rows_with_posting_assignments(db, generation)?;
                 let (index, _assigned_now) = SpFreshDiskMetaIndex::build_from_rows_with_assignments(
                     cfg.spfresh.clone(),
                     &rows,
@@ -1076,7 +1070,11 @@ impl SpFreshLayerDbIndex {
                 eprintln!("spfresh-layerdb vector blocks rotate failed: {err:#}");
             } else {
                 for row in rows {
-                    if let Err(err) = blocks.append_upsert(row.id, &row.values) {
+                    let posting = disk_assignments
+                        .as_ref()
+                        .and_then(|assignments| assignments.get(&row.id).copied());
+                    if let Err(err) = blocks.append_upsert_with_posting(row.id, posting, &row.values)
+                    {
                         eprintln!("spfresh-layerdb vector blocks bulk append failed: {err:#}");
                         break;
                     }
@@ -1225,18 +1223,36 @@ impl SpFreshLayerDbIndex {
             return Ok(out);
         }
 
-        let row_keys: Vec<Bytes> = ids
+        let mut unresolved = Vec::new();
+        {
+            let blocks = lock_mutex(&self.vector_blocks);
+            for id in ids.iter().copied() {
+                if let Some(state) = blocks.get_state(id) {
+                    if let Some(posting_id) = state.posting_id {
+                        out.insert(id, Some((posting_id, state.values)));
+                    } else {
+                        unresolved.push(id);
+                    }
+                } else {
+                    unresolved.push(id);
+                }
+            }
+        }
+
+        if unresolved.is_empty() {
+            return Ok(out);
+        }
+
+        let row_keys: Vec<Bytes> = unresolved
             .iter()
             .map(|id| Bytes::from(vector_key(generation, *id)))
             .collect();
         let row_values = self
             .db
             .multi_get(&row_keys, ReadOptions::default())
-            .context("diskmeta multi_get vector rows")?;
+            .context("diskmeta multi_get fallback vector rows")?;
 
-        let mut needs_legacy_posting_lookup = Vec::new();
-        let mut pending_rows = HashMap::new();
-        for (id, row_raw) in ids.iter().copied().zip(row_values.into_iter()) {
+        for (id, row_raw) in unresolved.into_iter().zip(row_values.into_iter()) {
             let Some(raw) = row_raw else {
                 out.insert(id, None);
                 continue;
@@ -1250,35 +1266,7 @@ impl SpFreshLayerDbIndex {
             if let Some(posting_id) = decoded.posting_id {
                 out.insert(id, Some((posting_id, decoded.row.values)));
             } else {
-                needs_legacy_posting_lookup.push(id);
-                pending_rows.insert(id, decoded.row.values);
-            }
-        }
-
-        if !needs_legacy_posting_lookup.is_empty() {
-            let posting_keys: Vec<Bytes> = needs_legacy_posting_lookup
-                .iter()
-                .map(|id| Bytes::from(posting_map_key(generation, *id)))
-                .collect();
-            let posting_values = self
-                .db
-                .multi_get(&posting_keys, ReadOptions::default())
-                .context("diskmeta legacy multi_get posting assignments")?;
-            for (id, posting_raw) in needs_legacy_posting_lookup
-                .into_iter()
-                .zip(posting_values.into_iter())
-            {
-                let posting = match posting_raw {
-                    Some(raw) => {
-                        let pid_u64: u64 = bincode::deserialize(raw.as_ref())
-                            .with_context(|| format!("decode posting assignment id={id}"))?;
-                        Some(usize::try_from(pid_u64).context("posting id does not fit usize")?)
-                    }
-                    None => None,
-                };
-                let state = posting
-                    .and_then(|posting| pending_rows.remove(&id).map(|values| (posting, values)));
-                out.insert(id, state);
+                out.insert(id, None);
             }
         }
         Ok(out)
@@ -1386,7 +1374,10 @@ impl SpFreshLayerDbIndex {
             {
                 let mut blocks = lock_mutex(&self.vector_blocks);
                 for (id, vector) in &mutations {
-                    if let Err(err) = blocks.append_upsert(*id, vector) {
+                    let posting = states
+                        .get(id)
+                        .and_then(|state| state.as_ref().map(|(posting, _)| *posting));
+                    if let Err(err) = blocks.append_upsert_with_posting(*id, posting, vector) {
                         eprintln!("spfresh-layerdb vector blocks upsert append failed: {err:#}");
                         break;
                     }

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1.7"
 arrow-array = "57.2"
 arrow-schema = "57.2"
 bincode = "1"

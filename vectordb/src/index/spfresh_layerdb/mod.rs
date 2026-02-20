@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use anyhow::Context;
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use layerdb::{Db, DbOptions, ReadOptions, WriteOptions};
 use serde::{Deserialize, Serialize};
@@ -273,6 +274,7 @@ pub struct SpFreshLayerDbIndex {
     pending_ops: Arc<AtomicUsize>,
     vector_cache: Arc<Mutex<VectorCache>>,
     posting_members_cache: Arc<Mutex<PostingMembersCache>>,
+    diskmeta_search_snapshot: Arc<ArcSwapOption<SpFreshDiskMetaIndex>>,
     wal_next_seq: Arc<AtomicU64>,
     rebuild_tx: mpsc::Sender<()>,
     stop_worker: Arc<AtomicBool>,
@@ -367,6 +369,14 @@ impl SpFreshLayerDbIndex {
             }
         }
         let index = Arc::new(RwLock::new(index_state));
+        let diskmeta_search_snapshot = Arc::new(ArcSwapOption::empty());
+        let initial_snapshot = {
+            let guard = lock_read(&index);
+            Self::extract_diskmeta_snapshot(&guard)
+        };
+        if let Some(snapshot) = initial_snapshot {
+            diskmeta_search_snapshot.store(Some(snapshot));
+        }
         let active_generation = Arc::new(AtomicU64::new(generation));
         let update_gate = Arc::new(RwLock::new(()));
         let dirty_ids = Arc::new(Mutex::new(HashSet::new()));
@@ -404,6 +414,7 @@ impl SpFreshLayerDbIndex {
             pending_ops,
             vector_cache,
             posting_members_cache,
+            diskmeta_search_snapshot,
             wal_next_seq,
             rebuild_tx,
             stop_worker,
@@ -456,6 +467,15 @@ impl SpFreshLayerDbIndex {
             }
         };
         Ok((index, applied_wal_seq))
+    }
+
+    fn extract_diskmeta_snapshot(
+        index: &RuntimeSpFreshIndex,
+    ) -> Option<Arc<SpFreshDiskMetaIndex>> {
+        match index {
+            RuntimeSpFreshIndex::OffHeapDiskMeta(index) => Some(Arc::new(index.clone())),
+            _ => None,
+        }
     }
 
     fn replay_wal_tail(
@@ -933,6 +953,11 @@ impl SpFreshLayerDbIndex {
                 }))
             }
         };
+        let snapshot = {
+            let guard = lock_read(&self.index);
+            Self::extract_diskmeta_snapshot(&guard)
+        };
+        self.diskmeta_search_snapshot.store(snapshot);
         {
             let mut cache = lock_mutex(&self.vector_cache);
             cache.map.clear();
@@ -1173,7 +1198,7 @@ impl SpFreshLayerDbIndex {
             self.stats
                 .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
 
-            {
+            let snapshot = {
                 let mut index = lock_write(&self.index);
                 let RuntimeSpFreshIndex::OffHeapDiskMeta(index) = &mut *index else {
                     anyhow::bail!("diskmeta upsert batch called for non-diskmeta runtime");
@@ -1181,7 +1206,9 @@ impl SpFreshLayerDbIndex {
                 for (_id, old, new_posting, vector) in apply_entries {
                     index.apply_upsert(old, new_posting, vector);
                 }
-            }
+                Some(Arc::new(index.clone()))
+            };
+            self.diskmeta_search_snapshot.store(snapshot);
             {
                 let mut cache = lock_mutex(&self.vector_cache);
                 for (id, vector) in &mutations {
@@ -1316,7 +1343,7 @@ impl SpFreshLayerDbIndex {
                 .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
 
             let mut deleted = 0usize;
-            {
+            let snapshot = {
                 let mut index = lock_write(&self.index);
                 let RuntimeSpFreshIndex::OffHeapDiskMeta(index) = &mut *index else {
                     anyhow::bail!("diskmeta delete batch called for non-diskmeta runtime");
@@ -1326,7 +1353,9 @@ impl SpFreshLayerDbIndex {
                         deleted += 1;
                     }
                 }
-            }
+                Some(Arc::new(index.clone()))
+            };
+            self.diskmeta_search_snapshot.store(snapshot);
             {
                 let mut cache = lock_mutex(&self.vector_cache);
                 for id in &mutations {
@@ -1524,13 +1553,7 @@ impl VectorIndex for SpFreshLayerDbIndex {
     fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
         let started = Instant::now();
         let generation = self.active_generation.load(Ordering::Relaxed);
-        let diskmeta_snapshot = {
-            let guard = lock_read(&self.index);
-            match &*guard {
-                RuntimeSpFreshIndex::OffHeapDiskMeta(index) => Some(index.clone()),
-                _ => None,
-            }
-        };
+        let diskmeta_snapshot = self.diskmeta_search_snapshot.load_full();
         let out = if let Some(index) = diskmeta_snapshot {
             let mut top = Vec::with_capacity(k);
             let postings = index.choose_probe_postings(query, k);

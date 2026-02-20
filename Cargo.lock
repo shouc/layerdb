@@ -6262,6 +6262,7 @@ name = "vectordb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "arrow-array",
  "arrow-schema",
  "bincode",

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use layerdb::DbOptions;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Neighbor, VectorIndex, VectorRecord};
@@ -113,15 +114,37 @@ impl SpFreshLayerDbShardedIndex {
         if k == 0 || all.is_empty() {
             return Vec::new();
         }
-        all.sort_by(|a, b| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        if all.len() > k {
-            all.truncate(k);
+        let mut top = Vec::with_capacity(k);
+        for neighbor in all.drain(..) {
+            Self::push_neighbor_topk(&mut top, neighbor, k);
         }
-        all
+        top.sort_by(Self::neighbor_cmp);
+        top
+    }
+
+    fn neighbor_cmp(a: &Neighbor, b: &Neighbor) -> std::cmp::Ordering {
+        a.distance
+            .total_cmp(&b.distance)
+            .then_with(|| a.id.cmp(&b.id))
+    }
+
+    fn push_neighbor_topk(top: &mut Vec<Neighbor>, candidate: Neighbor, k: usize) {
+        if k == 0 {
+            return;
+        }
+        if top.len() < k {
+            top.push(candidate);
+            return;
+        }
+        let mut worst_idx = 0usize;
+        for idx in 1..top.len() {
+            if Self::neighbor_cmp(&top[idx], &top[worst_idx]).is_gt() {
+                worst_idx = idx;
+            }
+        }
+        if Self::neighbor_cmp(&candidate, &top[worst_idx]).is_lt() {
+            top[worst_idx] = candidate;
+        }
     }
 
     pub fn try_bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
@@ -253,10 +276,11 @@ impl VectorIndex for SpFreshLayerDbShardedIndex {
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
-        let mut all = Vec::with_capacity(self.cfg.shard_count.saturating_mul(k.max(1)));
-        for shard in &self.shards {
-            all.extend(shard.search(query, k));
-        }
+        let all: Vec<Neighbor> = self
+            .shards
+            .par_iter()
+            .flat_map_iter(|shard| shard.search(query, k).into_iter())
+            .collect();
         Self::merge_neighbors(all, k)
     }
 

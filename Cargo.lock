@@ -6271,6 +6271,7 @@ dependencies = [
  "lancedb",
  "layerdb",
  "rand 0.8.5",
+ "rayon",
  "rkyv",
  "serde",
  "serde_json",

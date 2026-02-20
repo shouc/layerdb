@@ -41,6 +41,27 @@ pub use config::{SpFreshLayerDbConfig, SpFreshMemoryMode};
 pub use stats::SpFreshLayerDbStats;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum VectorMutation {
+    Upsert(VectorRecord),
+    Delete { id: u64 },
+}
+
+impl VectorMutation {
+    fn id(&self) -> u64 {
+        match self {
+            Self::Upsert(row) => row.id,
+            Self::Delete { id } => *id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorMutationBatchResult {
+    pub upserts: usize,
+    pub deletes: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum RuntimeSpFreshIndex {
     Resident(SpFreshIndex),
     OffHeap(SpFreshOffHeapIndex),
@@ -814,6 +835,18 @@ impl SpFreshLayerDbIndex {
         out
     }
 
+    fn dedup_last_mutations(mutations: &[VectorMutation]) -> Vec<VectorMutation> {
+        let mut seen = HashSet::with_capacity(mutations.len());
+        let mut out_rev = Vec::with_capacity(mutations.len());
+        for mutation in mutations.iter().rev() {
+            if seen.insert(mutation.id()) {
+                out_rev.push(mutation.clone());
+            }
+        }
+        out_rev.reverse();
+        out_rev
+    }
+
     fn load_diskmeta_states_for_ids(
         &self,
         generation: u64,
@@ -1186,6 +1219,30 @@ impl SpFreshLayerDbIndex {
             }
         }
         Ok(deleted)
+    }
+
+    pub fn try_apply_batch(
+        &mut self,
+        mutations: &[VectorMutation],
+    ) -> anyhow::Result<VectorMutationBatchResult> {
+        if mutations.is_empty() {
+            return Ok(VectorMutationBatchResult::default());
+        }
+        let deduped = Self::dedup_last_mutations(mutations);
+        let mut upserts = Vec::new();
+        let mut deletes = Vec::new();
+        for mutation in deduped {
+            match mutation {
+                VectorMutation::Upsert(row) => upserts.push(row),
+                VectorMutation::Delete { id } => deletes.push(id),
+            }
+        }
+        let upserted = self.try_upsert_batch(&upserts)?;
+        let deleted = self.try_delete_batch(&deletes)?;
+        Ok(VectorMutationBatchResult {
+            upserts: upserted,
+            deletes: deleted,
+        })
     }
 
     pub fn try_upsert(&mut self, id: u64, vector: Vec<f32>) -> anyhow::Result<()> {

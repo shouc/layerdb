@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -7,7 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{Neighbor, VectorIndex, VectorRecord};
 
-use super::spfresh_layerdb::{SpFreshLayerDbConfig, SpFreshLayerDbIndex, SpFreshLayerDbStats};
+use super::spfresh_layerdb::{
+    SpFreshLayerDbConfig, SpFreshLayerDbIndex, SpFreshLayerDbStats, VectorMutation,
+    VectorMutationBatchResult,
+};
 
 #[derive(Clone, Debug)]
 pub struct SpFreshLayerDbShardedConfig {
@@ -242,6 +246,41 @@ impl SpFreshLayerDbShardedIndex {
         Ok(total_deleted)
     }
 
+    pub fn try_apply_batch(
+        &mut self,
+        mutations: &[VectorMutation],
+    ) -> anyhow::Result<VectorMutationBatchResult> {
+        if mutations.is_empty() {
+            return Ok(VectorMutationBatchResult::default());
+        }
+        let mut seen = HashSet::with_capacity(mutations.len());
+        let mut deduped_rev = Vec::with_capacity(mutations.len());
+        for mutation in mutations.iter().rev() {
+            let id = match mutation {
+                VectorMutation::Upsert(row) => row.id,
+                VectorMutation::Delete { id } => *id,
+            };
+            if seen.insert(id) {
+                deduped_rev.push(mutation.clone());
+            }
+        }
+        deduped_rev.reverse();
+        let mut upserts = Vec::new();
+        let mut deletes = Vec::new();
+        for mutation in deduped_rev {
+            match mutation {
+                VectorMutation::Upsert(row) => upserts.push(row),
+                VectorMutation::Delete { id } => deletes.push(id),
+            }
+        }
+        let upserted = self.try_upsert_batch(&upserts)?;
+        let deleted = self.try_delete_batch(&deletes)?;
+        Ok(VectorMutationBatchResult {
+            upserts: upserted,
+            deletes: deleted,
+        })
+    }
+
     pub fn force_rebuild(&self) -> anyhow::Result<()> {
         for (shard_id, shard) in self.shards.iter().enumerate() {
             shard
@@ -361,6 +400,7 @@ impl VectorIndex for SpFreshLayerDbShardedIndex {
 mod tests {
     use tempfile::TempDir;
 
+    use crate::index::VectorMutation;
     use crate::types::VectorIndex;
 
     use super::{SpFreshLayerDbShardedConfig, SpFreshLayerDbShardedIndex};
@@ -453,6 +493,43 @@ mod tests {
         assert_eq!(stats.total_rows, 1);
         assert_eq!(stats.total_upserts, 2);
         assert_eq!(stats.total_deletes, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn sharded_mixed_mutation_batch_last_write_wins() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let cfg = SpFreshLayerDbShardedConfig {
+            shard_count: 4,
+            ..Default::default()
+        };
+        {
+            let mut idx = SpFreshLayerDbShardedIndex::open(dir.path(), cfg.clone())?;
+            let result = idx.try_apply_batch(&[
+                VectorMutation::Upsert(crate::types::VectorRecord::new(
+                    1,
+                    vec![0.1; cfg.shard.spfresh.dim],
+                )),
+                VectorMutation::Upsert(crate::types::VectorRecord::new(
+                    2,
+                    vec![0.2; cfg.shard.spfresh.dim],
+                )),
+                VectorMutation::Delete { id: 1 },
+                VectorMutation::Upsert(crate::types::VectorRecord::new(
+                    1,
+                    vec![0.15; cfg.shard.spfresh.dim],
+                )),
+                VectorMutation::Delete { id: 2 },
+            ])?;
+            assert_eq!(result.upserts, 1);
+            assert_eq!(result.deletes, 0);
+            idx.close()?;
+        }
+
+        let idx = SpFreshLayerDbShardedIndex::open(dir.path(), cfg)?;
+        assert_eq!(idx.len(), 1);
+        let got = idx.search(&vec![0.15; 64], 1);
+        assert_eq!(got[0].id, 1);
         Ok(())
     }
 }

@@ -4,13 +4,14 @@ use std::path::Path;
 use anyhow::Context;
 use bytes::Bytes;
 use layerdb::{Db, Range, ReadOptions, WriteOptions};
+use std::collections::HashMap;
 
 use crate::types::VectorRecord;
 
 use super::config::{
     SpFreshLayerDbConfig, SpFreshPersistedMeta, INDEX_WAL_PREFIX, META_ACTIVE_GENERATION_KEY,
     META_CONFIG_KEY, META_INDEX_CHECKPOINT_KEY, META_INDEX_WAL_NEXT_SEQ_KEY, META_SCHEMA_VERSION,
-    VECTOR_ROOT_PREFIX,
+    POSTING_MAP_ROOT_PREFIX, POSTING_MEMBERS_ROOT_PREFIX, VECTOR_ROOT_PREFIX,
 };
 
 pub(crate) fn validate_config(cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> {
@@ -299,6 +300,133 @@ pub(crate) fn vector_prefix(generation: u64) -> String {
 
 pub(crate) fn vector_key(generation: u64, id: u64) -> String {
     format!("{}{id:020}", vector_prefix(generation))
+}
+
+pub(crate) fn posting_map_prefix(generation: u64) -> String {
+    format!("{POSTING_MAP_ROOT_PREFIX}{generation:016x}/")
+}
+
+pub(crate) fn posting_map_key(generation: u64, id: u64) -> String {
+    format!("{}{id:020}", posting_map_prefix(generation))
+}
+
+pub(crate) fn posting_assignment_value(posting_id: usize) -> anyhow::Result<Vec<u8>> {
+    let pid = u64::try_from(posting_id).context("posting id does not fit u64")?;
+    bincode::serialize(&pid).context("encode posting assignment value")
+}
+
+pub(crate) fn load_posting_assignment(
+    db: &Db,
+    generation: u64,
+    id: u64,
+) -> anyhow::Result<Option<usize>> {
+    let key = posting_map_key(generation, id);
+    let raw = db
+        .get(key.as_bytes(), ReadOptions::default())
+        .with_context(|| format!("load posting assignment id={id} generation={generation}"))?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let posting_u64: u64 = bincode::deserialize(raw.as_ref())
+        .with_context(|| format!("decode posting assignment id={id} generation={generation}"))?;
+    let posting =
+        usize::try_from(posting_u64).context("posting assignment does not fit usize")?;
+    Ok(Some(posting))
+}
+
+pub(crate) fn posting_members_prefix(generation: u64, posting_id: usize) -> String {
+    format!(
+        "{}/{posting_id:010}/",
+        posting_members_generation_prefix(generation)
+    )
+}
+
+pub(crate) fn posting_members_generation_prefix(generation: u64) -> String {
+    format!("{POSTING_MEMBERS_ROOT_PREFIX}{generation:016x}")
+}
+
+pub(crate) fn posting_member_key(generation: u64, posting_id: usize, id: u64) -> String {
+    format!("{}{id:020}", posting_members_prefix(generation, posting_id))
+}
+
+pub(crate) fn posting_member_value(id: u64) -> anyhow::Result<Vec<u8>> {
+    bincode::serialize(&id).context("encode posting member id")
+}
+
+pub(crate) fn load_posting_member_ids(
+    db: &Db,
+    generation: u64,
+    posting_id: usize,
+) -> anyhow::Result<Vec<u64>> {
+    let mut out = Vec::new();
+    let prefix = posting_members_prefix(generation, posting_id);
+    let prefix_bytes = prefix.as_bytes().to_vec();
+    let end = prefix_exclusive_end(&prefix_bytes)?;
+    let mut iter = db.iter(
+        Range {
+            start: Bound::Included(Bytes::from(prefix_bytes.clone())),
+            end: Bound::Excluded(Bytes::from(end)),
+        },
+        ReadOptions::default(),
+    )?;
+    iter.seek_to_first();
+    for next in iter {
+        let (key, value) = next?;
+        if !key.starts_with(prefix_bytes.as_slice()) {
+            continue;
+        }
+        let Some(value) = value else {
+            continue;
+        };
+        let id: u64 = bincode::deserialize(value.as_ref())
+            .with_context(|| format!("decode posting member key={}", String::from_utf8_lossy(&key)))?;
+        out.push(id);
+    }
+    Ok(out)
+}
+
+pub(crate) fn load_posting_assignments(
+    db: &Db,
+    generation: u64,
+) -> anyhow::Result<HashMap<u64, usize>> {
+    let mut out = HashMap::new();
+    let prefix = posting_map_prefix(generation);
+    let prefix_bytes = prefix.as_bytes().to_vec();
+    let end = prefix_exclusive_end(&prefix_bytes)?;
+    let mut iter = db.iter(
+        Range {
+            start: Bound::Included(Bytes::from(prefix_bytes.clone())),
+            end: Bound::Excluded(Bytes::from(end)),
+        },
+        ReadOptions::default(),
+    )?;
+    iter.seek_to_first();
+    for next in iter {
+        let (key, value) = next?;
+        if !key.starts_with(prefix_bytes.as_slice()) {
+            continue;
+        }
+        let Some(value) = value else {
+            continue;
+        };
+        let posting_u64: u64 = bincode::deserialize(value.as_ref()).with_context(|| {
+            format!(
+                "decode posting assignment key={}",
+                String::from_utf8_lossy(&key)
+            )
+        })?;
+        let posting =
+            usize::try_from(posting_u64).context("posting assignment does not fit usize")?;
+        let key_str = String::from_utf8_lossy(&key);
+        let Some(id_suffix) = key_str.rsplit('/').next() else {
+            continue;
+        };
+        let id: u64 = id_suffix
+            .parse()
+            .with_context(|| format!("decode posting assignment id from key={key_str}"))?;
+        out.insert(id, posting);
+    }
+    Ok(out)
 }
 
 pub(crate) fn prefix_exclusive_end(prefix: &[u8]) -> anyhow::Result<Vec<u8>> {

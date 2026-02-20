@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::index::SpFreshConfig;
 
 pub(crate) const VECTOR_ROOT_PREFIX: &str = "spfresh/v/";
+pub(crate) const POSTING_MAP_ROOT_PREFIX: &str = "spfresh/m/";
+pub(crate) const POSTING_MEMBERS_ROOT_PREFIX: &str = "spfresh/p/";
 pub(crate) const META_CONFIG_KEY: &str = "spfresh/meta/config";
 pub(crate) const META_ACTIVE_GENERATION_KEY: &str = "spfresh/meta/active_generation";
 pub(crate) const META_INDEX_CHECKPOINT_KEY: &str = "spfresh/meta/index_checkpoint";
@@ -30,6 +32,7 @@ pub(crate) struct SpFreshPersistedMeta {
 pub enum SpFreshMemoryMode {
     Resident,
     OffHeap,
+    OffHeapDiskMeta,
 }
 
 #[derive(Clone, Debug)]

@@ -1,7 +1,7 @@
 use std::fs;
 use std::collections::HashMap;
 
-use layerdb::{Db, DbOptions, WriteOptions};
+use layerdb::{Db, DbOptions, Op, WriteOptions};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
@@ -276,6 +276,62 @@ fn startup_replays_wal_tail_after_checkpoint() -> anyhow::Result<()> {
 }
 
 #[test]
+fn posting_metadata_helpers_round_trip() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig::default();
+    {
+        let idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.close()?;
+    }
+
+    let db = Db::open(dir.path(), cfg.db_options.clone())?;
+    let generation = super::storage::ensure_active_generation(&db)?;
+    db.write_batch(
+        vec![
+            Op::put(
+                super::storage::posting_map_key(generation, 11),
+                super::storage::posting_assignment_value(7)?,
+            ),
+            Op::put(
+                super::storage::posting_map_key(generation, 12),
+                super::storage::posting_assignment_value(7)?,
+            ),
+            Op::put(
+                super::storage::posting_member_key(generation, 7, 11),
+                super::storage::posting_member_value(11)?,
+            ),
+            Op::put(
+                super::storage::posting_member_key(generation, 7, 12),
+                super::storage::posting_member_value(12)?,
+            ),
+        ],
+        WriteOptions { sync: true },
+    )?;
+
+    assert_eq!(
+        super::storage::load_posting_assignment(&db, generation, 11)?,
+        Some(7)
+    );
+    assert_eq!(
+        super::storage::load_posting_assignment(&db, generation, 999)?,
+        None
+    );
+
+    let mut members = super::storage::load_posting_member_ids(&db, generation, 7)?;
+    members.sort_unstable();
+    assert_eq!(members, vec![11, 12]);
+
+    let map_prefix = super::storage::posting_map_prefix(generation).into_bytes();
+    let map_end = super::storage::prefix_exclusive_end(&map_prefix)?;
+    db.delete_range(map_prefix, map_end, WriteOptions { sync: true })?;
+    assert_eq!(
+        super::storage::load_posting_assignment(&db, generation, 11)?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
 fn randomized_restarts_preserve_model_state() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let mut cfg = SpFreshLayerDbConfig::default();
@@ -360,6 +416,74 @@ fn offheap_randomized_restarts_preserve_model_state() -> anyhow::Result<()> {
     let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
     assert_eq!(idx.memory_mode(), SpFreshMemoryMode::OffHeap);
     assert_index_matches_model(&idx, &expected)?;
+    Ok(())
+}
+
+#[test]
+fn offheap_diskmeta_persists_and_recovers_vectors() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig {
+        memory_mode: SpFreshMemoryMode::OffHeapDiskMeta,
+        spfresh: crate::index::SpFreshConfig {
+            dim: 16,
+            initial_postings: 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        assert_eq!(idx.memory_mode(), SpFreshMemoryMode::OffHeapDiskMeta);
+        idx.try_upsert(1, vec![0.0; cfg.spfresh.dim])?;
+        idx.try_upsert(2, vec![1.0; cfg.spfresh.dim])?;
+        assert!(idx.try_delete(1)?);
+        idx.close()?;
+    }
+
+    let idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+    assert_eq!(idx.memory_mode(), SpFreshMemoryMode::OffHeapDiskMeta);
+    assert_eq!(idx.len(), 1);
+    let got = idx.search(&vec![1.0; cfg.spfresh.dim], 1);
+    assert_eq!(got[0].id, 2);
+
+    let idx_existing = SpFreshLayerDbIndex::open_existing(dir.path(), cfg.db_options.clone())?;
+    assert_eq!(idx_existing.memory_mode(), SpFreshMemoryMode::OffHeapDiskMeta);
+    let got_existing = idx_existing.search(&vec![1.0; cfg.spfresh.dim], 1);
+    assert_eq!(got_existing[0].id, 2);
+    Ok(())
+}
+
+#[test]
+fn offheap_diskmeta_bulk_load_populates_metadata() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig {
+        memory_mode: SpFreshMemoryMode::OffHeapDiskMeta,
+        spfresh: crate::index::SpFreshConfig {
+            dim: 8,
+            initial_postings: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let rows = vec![
+        VectorRecord::new(10, vec![0.1; cfg.spfresh.dim]),
+        VectorRecord::new(11, vec![0.2; cfg.spfresh.dim]),
+        VectorRecord::new(12, vec![0.3; cfg.spfresh.dim]),
+    ];
+
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_bulk_load(&rows)?;
+        idx.close()?;
+    }
+
+    let db = Db::open(dir.path(), cfg.db_options.clone())?;
+    let generation = super::storage::ensure_active_generation(&db)?;
+    for row in rows {
+        let posting = super::storage::load_posting_assignment(&db, generation, row.id)?;
+        assert!(posting.is_some(), "missing posting assignment for id={}", row.id);
+    }
     Ok(())
 }
 

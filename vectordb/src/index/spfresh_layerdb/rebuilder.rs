@@ -104,6 +104,9 @@ pub(crate) fn rebuild_once(runtime: &RebuilderRuntime) -> anyhow::Result<()> {
                         .upsert_with(row.id, row.values, &mut loader)
                         .with_context(|| format!("offheap rebuilder upsert id={id}"))?;
                 }
+                RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
+                    let _ = (index, row);
+                }
             },
             None => match &mut *index {
                 RuntimeSpFreshIndex::Resident(index) => {
@@ -116,12 +119,16 @@ pub(crate) fn rebuild_once(runtime: &RebuilderRuntime) -> anyhow::Result<()> {
                         .delete_with(*id, &mut loader)
                         .with_context(|| format!("offheap rebuilder delete id={id}"))?;
                 }
+                RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
+                    let _ = index;
+                }
             },
         }
     }
     let live_rows = match &*index {
         RuntimeSpFreshIndex::Resident(index) => index.len(),
         RuntimeSpFreshIndex::OffHeap(index) => index.len(),
+        RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.len(),
     };
     drop(index);
 

@@ -354,13 +354,13 @@ impl SpFreshDiskMetaIndex {
         nearest.into_iter().map(|(pid, _)| pid).collect()
     }
 
-    fn remove_from_posting(&mut self, posting_id: usize, old_vector: &[f32]) {
+    fn remove_from_posting(&mut self, posting_id: usize, old_vector: &[f32]) -> bool {
         let Some(posting) = self.postings.get_mut(&posting_id) else {
-            return;
+            return false;
         };
         if posting.size <= 1 {
             posting.size = 0;
-            return;
+            return true;
         }
         let n = posting.size as f64;
         for (i, v) in old_vector.iter().enumerate() {
@@ -368,6 +368,7 @@ impl SpFreshDiskMetaIndex {
                 (((posting.centroid[i] as f64 * n) - *v as f64) / (n - 1.0)) as f32;
         }
         posting.size -= 1;
+        false
     }
 
     fn add_to_posting(&mut self, posting_id: usize, new_vector: &[f32]) {
@@ -404,7 +405,10 @@ impl SpFreshDiskMetaIndex {
                 }
             }
             Some((old_posting, old_vector)) => {
-                self.remove_from_posting(old_posting, old_vector);
+                let emptied = self.remove_from_posting(old_posting, old_vector);
+                if emptied {
+                    self.postings.remove(&old_posting);
+                }
                 self.add_to_posting(new_posting, new_vector);
             }
             None => {
@@ -424,7 +428,6 @@ impl SpFreshDiskMetaIndex {
                 self.total_rows = self.total_rows.saturating_add(1);
             }
         }
-        self.postings.retain(|_, posting| posting.size > 0);
         self.maybe_refresh_coarse_index();
     }
 
@@ -442,9 +445,11 @@ impl SpFreshDiskMetaIndex {
         let Some((old_posting, old_vector)) = old else {
             return false;
         };
-        self.remove_from_posting(old_posting, old_vector);
+        let emptied = self.remove_from_posting(old_posting, old_vector);
+        if emptied {
+            self.postings.remove(&old_posting);
+        }
         self.total_rows = self.total_rows.saturating_sub(1);
-        self.postings.retain(|_, posting| posting.size > 0);
         self.maybe_refresh_coarse_index();
         true
     }
@@ -512,5 +517,34 @@ mod tests {
         }
         assert!(!index.coarse_centroids.is_empty());
         assert!(index.coarse_centroids.len() == before || before == 0);
+    }
+
+    #[test]
+    fn upsert_removes_emptied_old_posting() {
+        let cfg = SpFreshConfig {
+            dim: 4,
+            initial_postings: 1,
+            nprobe: 1,
+            ..Default::default()
+        };
+        let rows = vec![VectorRecord::new(7, vec![0.0, 0.0, 0.0, 0.0])];
+        let (mut index, _assignments) = SpFreshDiskMetaIndex::build_with_assignments(cfg, &rows);
+        let old_vec = rows[0].values.clone();
+        let old_posting = index.choose_posting(&old_vec).unwrap_or_default();
+        let new_posting = index.next_posting_id.saturating_add(11);
+        let bootstrap_vec = vec![8.0, 0.0, 0.0, 0.0];
+        index.apply_upsert(None, new_posting, bootstrap_vec);
+        let moved_vec = vec![9.0, 0.0, 0.0, 0.0];
+
+        index.apply_upsert(Some((old_posting, old_vec)), new_posting, moved_vec);
+
+        assert!(
+            !index.postings.contains_key(&old_posting),
+            "old posting should be removed once emptied"
+        );
+        assert!(
+            index.postings.contains_key(&new_posting),
+            "new posting should exist after upsert"
+        );
     }
 }

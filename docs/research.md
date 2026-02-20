@@ -512,6 +512,29 @@ Latest gate summary after full refactor (`target/vectordb-gate/summary.json`):
   - update_qps: `0.523x`
   - search_qps: `1.494x`
 
+## J) Mmap old-state lookup for diskmeta updates
+
+Implemented:
+- Extended vector-block records to persist optional `posting_id` together with vector payload.
+- Diskmeta `load_diskmeta_states_for_ids(...)` now resolves old `(posting, vector)` primarily from
+  mmap vector blocks and only falls back to LayerDB row reads for unresolved ids.
+- Removed legacy posting-map assignment scan from rebuild and old-state lookup paths.
+
+Outcome on benchmark gate (`target/vectordb-gate/summary.json`):
+- SPFresh-sharded diskmeta:
+  - update_qps: `141291.99`
+  - search_qps: `1100.43`
+  - recall@k: `1.0000`
+- LanceDB IVF-flat:
+  - update_qps: `124231.00`
+  - search_qps: `843.24`
+  - recall@k: `0.4895`
+- Ratios (SPFresh / LanceDB):
+  - update_qps: `1.137x`
+  - search_qps: `1.305x`
+
+This crosses both gate objectives in the same profile: higher update throughput and higher search throughput than LanceDB while retaining recall.
+
 ## Production Readiness Checks Performed
 
 - `cargo clippy -p vectordb --all-targets -- -D warnings`

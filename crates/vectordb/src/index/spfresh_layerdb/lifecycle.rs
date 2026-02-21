@@ -139,26 +139,19 @@ impl VectorIndex for SpFreshLayerDbIndex {
                 .unwrap_or_else(|err| {
                     panic!("offheap-diskmeta load selected distances failed: {err:#}")
                 });
-                let mut exact_loaded_ids = HashSet::with_capacity(selected_ids.len());
                 for (id, distance) in selected_exact {
                     Self::push_neighbor_topk(&mut top, Neighbor { id, distance }, k);
-                    exact_loaded_ids.insert(id);
                 }
 
-                // If selected candidates miss exact payloads, retry exact evaluation across all
-                // members and fail closed if any referenced row remains missing.
+                // If selected candidates miss exact payloads, retry exact evaluation only for the
+                // unresolved ids and fail closed if any referenced row remains missing.
                 if !missing_selected_ids.is_empty() {
-                    let fallback_ids: Vec<u64> = members
-                        .iter()
-                        .map(|member| member.id)
-                        .filter(|id| !exact_loaded_ids.contains(id))
-                        .collect();
                     let (fallback_exact, fallback_missing) = Self::load_distances_for_ids(
                         &self.db,
                         &self.vector_cache,
                         &self.vector_blocks,
                         generation,
-                        &fallback_ids,
+                        &missing_selected_ids,
                         query,
                     )
                     .unwrap_or_else(|err| {
@@ -166,7 +159,6 @@ impl VectorIndex for SpFreshLayerDbIndex {
                     });
                     for (id, distance) in fallback_exact {
                         Self::push_neighbor_topk(&mut top, Neighbor { id, distance }, k);
-                        exact_loaded_ids.insert(id);
                     }
                     if !fallback_missing.is_empty() {
                         panic!(

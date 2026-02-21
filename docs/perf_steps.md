@@ -270,3 +270,25 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7370`
 - `search_qps_ratio=4.0242`
+
+## Step 12 (`diskmeta-fallback-missing-only-reload`)
+
+Change:
+- Removed per-posting `HashSet` tracking in diskmeta search fallback.
+- When exact payloads are missing in the selected candidate set, fallback exact loads now query
+  only `missing_selected_ids` directly, instead of rescanning posting members to rebuild a second id list.
+- Preserved fail-closed behavior when any required exact payload remains unavailable.
+
+SPFresh:
+- `update_qps=195732.23`
+- `search_qps=2834.23`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=114658.35`
+- `search_qps=725.61`
+- `recall_at_k=0.4875`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.7071`
+- `search_qps_ratio=3.9060`

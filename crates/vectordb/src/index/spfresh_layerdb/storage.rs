@@ -664,11 +664,12 @@ pub(crate) struct PostingMember {
     pub residual_code: Option<Vec<i8>>,
 }
 
-fn quantize_residual(values: &[f32], centroid: &[f32]) -> (f32, Vec<i8>) {
+pub(crate) fn posting_member_event_upsert_value_with_residual(
+    id: u64,
+    values: &[f32],
+    centroid: &[f32],
+) -> anyhow::Result<Vec<u8>> {
     debug_assert_eq!(values.len(), centroid.len());
-    if values.is_empty() {
-        return (1.0, Vec::new());
-    }
     let mut max_abs = 0.0f32;
     for (v, c) in values.iter().zip(centroid.iter()) {
         let a = (*v - *c).abs();
@@ -676,26 +677,27 @@ fn quantize_residual(values: &[f32], centroid: &[f32]) -> (f32, Vec<i8>) {
             max_abs = a;
         }
     }
-    let scale = if max_abs <= 1e-9 {
+    let residual_scale = if values.is_empty() {
+        1.0
+    } else if max_abs <= 1e-9 {
         1e-9
     } else {
         max_abs / 127.0
     };
-    let mut code = Vec::with_capacity(values.len());
+    let code_len =
+        u32::try_from(values.len()).context("posting-member residual code len does not fit u32")?;
+    let mut out =
+        Vec::with_capacity(POSTING_MEMBER_EVENT_RKYV_V3_TAG.len() + 1 + 8 + 4 + 4 + values.len());
+    out.extend_from_slice(POSTING_MEMBER_EVENT_RKYV_V3_TAG);
+    out.push(0);
+    out.extend_from_slice(&id.to_le_bytes());
+    out.extend_from_slice(&residual_scale.to_bits().to_le_bytes());
+    out.extend_from_slice(&code_len.to_le_bytes());
     for (v, c) in values.iter().zip(centroid.iter()) {
-        let q = ((*v - *c) / scale).round().clamp(-127.0, 127.0) as i8;
-        code.push(q);
+        let q = ((*v - *c) / residual_scale).round().clamp(-127.0, 127.0) as i8;
+        out.push(q as u8);
     }
-    (scale, code)
-}
-
-pub(crate) fn posting_member_event_upsert_value_with_residual(
-    id: u64,
-    values: &[f32],
-    centroid: &[f32],
-) -> anyhow::Result<Vec<u8>> {
-    let (residual_scale, residual_code) = quantize_residual(values, centroid);
-    posting_member_event_upsert_value_from_sketch(id, residual_scale, &residual_code)
+    Ok(out)
 }
 
 pub(crate) fn posting_member_event_upsert_value_from_sketch(

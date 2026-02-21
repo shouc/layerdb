@@ -227,3 +227,25 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.5161`
 - `search_qps_ratio=4.1094`
+
+## Step 10 (`residual-event-direct-encode`)
+
+Change:
+- Reworked `posting_member_event_upsert_value_with_residual(...)` to encode residual payloads
+  directly into the output byte buffer.
+- Removed intermediate residual-code vector allocation and copy in the hot update path.
+- Preserved on-disk event format and decode behavior.
+
+SPFresh:
+- `update_qps=212905.64`
+- `search_qps=2571.19`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=119387.54`
+- `search_qps=835.34`
+- `recall_at_k=0.4815`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.7833`
+- `search_qps_ratio=3.0780`

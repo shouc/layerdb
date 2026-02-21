@@ -1,0 +1,36 @@
+[package]
+name = "vectordb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+arc-swap = "1.7"
+arrow-array = "57.2"
+arrow-schema = "57.2"
+bincode = "1"
+bytes = "1"
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+lancedb = "0.26.2"
+rand = "0.8"
+rayon = "1.10"
+rkyv = { version = "0.7", features = ["validation"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+layerdb = { path = "../layerdb" }
+memmap2 = "0.9"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[[bin]]
+name = "bench_lancedb"
+path = "../../bins/bench_lancedb.rs"
+
+[[bin]]
+name = "bench_spfresh_sharded"
+path = "../../bins/bench_spfresh_sharded.rs"
+
+[[bin]]
+name = "vectordb-cli"
+path = "../../bins/vectordb-cli.rs"

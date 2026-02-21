@@ -62,5 +62,5 @@ cargo run --bin layerdb -- get --db /tmp/layerdb --key hello
 
 - `docs/LAWS.md`
 - `benchmarks/README.md`
-- `vectordb/README.md`
+- `crates/vectordb/README.md`
 - `benchmarks/vectordb_comparison.md`

@@ -1,0 +1,61 @@
+[package]
+name = "layerdb"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["native-uring"]
+native-uring = ["dep:io-uring"]
+
+[dependencies]
+ahash = "0.8"
+anyhow = "1"
+blake3 = "1.6"
+bytes = { version = "1.10", features = ["serde"] }
+bincode = "1.3"
+bloomfilter = { version = "1.0", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+crc32c = "0.6"
+crossbeam-channel = "0.5"
+crossbeam-skiplist = "0.1"
+futures-util = "0.3"
+lru = "0.16.3"
+memmap2 = "0.9"
+minio = "0.3"
+parking_lot = "0.12"
+rayon = "1.10"
+rocksdb = { version = "0.24", default-features = false }
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+tokio = { version = "1.43", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+thiserror = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.6", optional = true }
+libc = "0.2"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+proptest = "1.6"
+rand = "0.8"
+serde_json = "1"
+
+[[bin]]
+name = "layerdb"
+path = "../../bins/layerdb.rs"
+
+[[bin]]
+name = "engine_bench"
+path = "../../bins/engine_bench.rs"
+
+[[bench]]
+name = "layerdb"
+harness = false
+
+[[bench]]
+name = "regression"
+harness = false
+
+[[bench]]
+name = "nvme"
+harness = false

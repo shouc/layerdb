@@ -545,46 +545,51 @@ impl SpFreshLayerDbIndex {
             }
         }
 
+        let mutation_count = mutations.len();
+        let mut cache_entries = Vec::with_capacity(mutation_count);
+        let mut touched_ids = Vec::with_capacity(mutation_count);
         {
             let mut index = lock_write(&self.index);
-            for (id, vector) in &mutations {
+            for (id, vector) in mutations {
                 match &mut *index {
-                    RuntimeSpFreshIndex::Resident(index) => index.upsert(*id, vector.clone()),
+                    RuntimeSpFreshIndex::Resident(index) => index.upsert(id, vector.clone()),
                     RuntimeSpFreshIndex::OffHeap(index) => {
                         let mut loader = Self::loader_for(
                             &self.db,
                             &self.vector_cache,
                             &self.vector_blocks,
                             generation,
-                            Some((*id, vector.clone())),
+                            Some((id, vector.clone())),
                         );
                         index
-                            .upsert_with(*id, vector.clone(), &mut loader)
+                            .upsert_with(id, vector.clone(), &mut loader)
                             .with_context(|| format!("offheap upsert id={id}"))?;
                     }
                     RuntimeSpFreshIndex::OffHeapDiskMeta(_) => {
                         anyhow::bail!("non-diskmeta upsert batch called for diskmeta runtime");
                     }
                 }
+                touched_ids.push(id);
+                cache_entries.push((id, vector));
             }
         }
         {
             let mut cache = lock_mutex(&self.vector_cache);
-            for (id, vector) in &mutations {
-                cache.put(*id, vector.clone());
+            for (id, vector) in cache_entries {
+                cache.put(id, vector);
             }
         }
-        for (id, _) in &mutations {
-            self.mark_dirty(*id);
+        for id in touched_ids {
+            self.mark_dirty(id);
         }
-        for _ in 0..mutations.len() {
+        for _ in 0..mutation_count {
             self.stats.inc_upserts();
         }
         let pending = self.pending_ops.load(Ordering::Relaxed);
         if pending >= self.cfg.rebuild_pending_ops.max(1) {
             let _ = self.rebuild_tx.send(());
         }
-        Ok(mutations.len())
+        Ok(mutation_count)
     }
 
     pub fn try_delete_batch(&mut self, ids: &[u64]) -> anyhow::Result<usize> {

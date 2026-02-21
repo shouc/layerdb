@@ -47,22 +47,15 @@ impl SpFreshLayerDbIndex {
             return Ok((out, Vec::new()));
         }
 
-        let mut unresolved = Vec::new();
-        let mut fetched_for_cache = Vec::new();
-        {
+        let unresolved = {
             let blocks = lock_mutex(vector_blocks);
-            for id in cache_misses {
-                if let Some(values) = blocks.get(id) {
-                    let distance = squared_l2(query, values.as_slice());
-                    out.push((id, distance));
-                    fetched_for_cache.push((id, values));
-                } else {
-                    unresolved.push(id);
-                }
-            }
-        }
+            let (mut found, missing) = blocks.distances_for_ids(cache_misses.as_slice(), query);
+            out.append(&mut found);
+            missing
+        };
 
         let mut missing = Vec::new();
+        let mut fetched_for_cache = Vec::new();
         if !unresolved.is_empty() {
             let keys: Vec<Bytes> = unresolved
                 .iter()

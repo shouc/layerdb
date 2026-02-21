@@ -161,3 +161,24 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7603`
 - `search_qps_ratio=3.4958`
+
+## Step 7 (`vector-block-zero-copy-distance-scan`)
+
+Change:
+- Added batch distance evaluation directly from mmap-backed vector blocks (`VectorBlockStore::distances_for_ids`) to avoid per-row vector materialization in diskmeta search fallback paths.
+- Wired diskmeta distance loading to use vector-block batch distance scanning first, then only hit LayerDB row payloads for truly unresolved ids.
+- Added focused unit test for live/tombstoned/missing id behavior in block distance scanning.
+
+SPFresh:
+- `update_qps=197469.92`
+- `search_qps=2735.85`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=118456.22`
+- `search_qps=803.78`
+- `recall_at_k=0.4610`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.6670`
+- `search_qps_ratio=3.4037`

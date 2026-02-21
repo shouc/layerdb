@@ -245,6 +245,66 @@ impl VectorBlockStore {
         self.get_state(id).map(|state| state.values)
     }
 
+    pub(crate) fn distances_for_ids(
+        &self,
+        ids: &[u64],
+        query: &[f32],
+    ) -> (Vec<(u64, f32)>, Vec<u64>) {
+        if query.len() != self.dim {
+            return (Vec::new(), ids.to_vec());
+        }
+        let Some(mmap) = self.mmap.as_ref() else {
+            return (Vec::new(), ids.to_vec());
+        };
+        let rec_size = record_size(self.dim);
+        let mut found = Vec::with_capacity(ids.len());
+        let mut missing = Vec::new();
+        for id in ids {
+            let Some(offset) = self.offsets.get(id).copied() else {
+                missing.push(*id);
+                continue;
+            };
+            let Some(start) = usize::try_from(offset).ok() else {
+                missing.push(*id);
+                continue;
+            };
+            let Some(end) = start.checked_add(rec_size) else {
+                missing.push(*id);
+                continue;
+            };
+            let Some(record) = mmap.get(start..end) else {
+                missing.push(*id);
+                continue;
+            };
+            let flags = record[8];
+            if (flags & VECTOR_BLOCK_TOMBSTONE) != 0 {
+                missing.push(*id);
+                continue;
+            }
+
+            let mut distance = 0.0f32;
+            let mut cursor = 17usize;
+            for query_value in query {
+                let Some(bits_bytes) = record.get(cursor..cursor + 4) else {
+                    distance = f32::INFINITY;
+                    break;
+                };
+                let mut bits = [0u8; 4];
+                bits.copy_from_slice(bits_bytes);
+                let value = f32::from_bits(u32::from_le_bytes(bits));
+                let delta = *query_value - value;
+                distance += delta * delta;
+                cursor += 4;
+            }
+            if distance.is_finite() {
+                found.push((*id, distance));
+            } else {
+                missing.push(*id);
+            }
+        }
+        (found, missing)
+    }
+
     pub(crate) fn live_len(&self) -> usize {
         self.offsets.len()
     }
@@ -360,6 +420,30 @@ impl VectorBlockStore {
         let mmap = unsafe { Mmap::map(&self.file) }.context("mmap vector blocks file")?;
         self.mmap = Some(mmap);
         self.pending_remap_records = 0;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::VectorBlockStore;
+
+    #[test]
+    fn distances_for_ids_uses_live_records_and_reports_missing() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let mut store = VectorBlockStore::open(dir.path(), 4, 1)?;
+        store.append_upsert_with_posting(1, None, &[0.0, 1.0, 2.0, 3.0])?;
+        store.append_upsert_with_posting(2, None, &[4.0, 5.0, 6.0, 7.0])?;
+        store.append_delete_batch(&[2])?;
+        store.remap()?;
+
+        let (found, missing) = store.distances_for_ids(&[1, 2, 3], &[0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, 1);
+        assert!((found[0].1 - 0.0).abs() <= f32::EPSILON);
+        assert_eq!(missing, vec![2, 3]);
         Ok(())
     }
 }

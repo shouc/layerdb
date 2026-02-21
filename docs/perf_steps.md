@@ -182,3 +182,25 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.6670`
 - `search_qps_ratio=3.4037`
+
+## Step 8 (`key-builder-single-allocation-hotpath`)
+
+Change:
+- Reworked hot key builders in SPFresh LayerDB storage (`vector_key`, `posting_map_key`,
+  posting-member prefixes/events) to avoid nested `format!` chains and build each key in a
+  single preallocated `String`.
+- Added key-layout unit test coverage to lock in exact key shapes while keeping the lower-allocation path.
+
+SPFresh:
+- `update_qps=217796.71`
+- `search_qps=2998.06`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=122410.26`
+- `search_qps=838.21`
+- `recall_at_k=0.4715`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.7792`
+- `search_qps_ratio=3.5768`

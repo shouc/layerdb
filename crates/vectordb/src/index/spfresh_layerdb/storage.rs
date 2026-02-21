@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::ops::Bound;
 use std::path::Path;
 
@@ -571,19 +572,31 @@ pub(crate) fn prune_wal_before(db: &Db, seq_exclusive: u64, sync: bool) -> anyho
 }
 
 pub(crate) fn vector_prefix(generation: u64) -> String {
-    format!("{VECTOR_ROOT_PREFIX}{generation:016x}/")
+    let mut key = String::with_capacity(VECTOR_ROOT_PREFIX.len() + 16 + 1);
+    key.push_str(VECTOR_ROOT_PREFIX);
+    let _ = write!(&mut key, "{generation:016x}/");
+    key
 }
 
 pub(crate) fn vector_key(generation: u64, id: u64) -> String {
-    format!("{}{id:020}", vector_prefix(generation))
+    let mut key = String::with_capacity(VECTOR_ROOT_PREFIX.len() + 16 + 1 + 20);
+    key.push_str(VECTOR_ROOT_PREFIX);
+    let _ = write!(&mut key, "{generation:016x}/{id:020}");
+    key
 }
 
 pub(crate) fn posting_map_prefix(generation: u64) -> String {
-    format!("{POSTING_MAP_ROOT_PREFIX}{generation:016x}/")
+    let mut key = String::with_capacity(POSTING_MAP_ROOT_PREFIX.len() + 16 + 1);
+    key.push_str(POSTING_MAP_ROOT_PREFIX);
+    let _ = write!(&mut key, "{generation:016x}/");
+    key
 }
 
 pub(crate) fn posting_map_key(generation: u64, id: u64) -> String {
-    format!("{}{id:020}", posting_map_prefix(generation))
+    let mut key = String::with_capacity(POSTING_MAP_ROOT_PREFIX.len() + 16 + 1 + 20);
+    key.push_str(POSTING_MAP_ROOT_PREFIX);
+    let _ = write!(&mut key, "{generation:016x}/{id:020}");
+    key
 }
 
 #[cfg(test)]
@@ -612,14 +625,17 @@ pub(crate) fn load_posting_assignment(
 }
 
 pub(crate) fn posting_members_prefix(generation: u64, posting_id: usize) -> String {
-    format!(
-        "{}/{posting_id:010}/",
-        posting_members_generation_prefix(generation)
-    )
+    let mut key = String::with_capacity(POSTING_MEMBERS_ROOT_PREFIX.len() + 16 + 1 + 10 + 1);
+    key.push_str(POSTING_MEMBERS_ROOT_PREFIX);
+    let _ = write!(&mut key, "{generation:016x}/{posting_id:010}/");
+    key
 }
 
 pub(crate) fn posting_members_generation_prefix(generation: u64) -> String {
-    format!("{POSTING_MEMBERS_ROOT_PREFIX}{generation:016x}")
+    let mut key = String::with_capacity(POSTING_MEMBERS_ROOT_PREFIX.len() + 16);
+    key.push_str(POSTING_MEMBERS_ROOT_PREFIX);
+    let _ = write!(&mut key, "{generation:016x}");
+    key
 }
 
 pub(crate) fn posting_member_event_key(
@@ -628,10 +644,14 @@ pub(crate) fn posting_member_event_key(
     seq: u64,
     id: u64,
 ) -> String {
-    format!(
-        "{}{seq:020}/{id:020}",
-        posting_members_prefix(generation, posting_id)
-    )
+    let mut key =
+        String::with_capacity(POSTING_MEMBERS_ROOT_PREFIX.len() + 16 + 1 + 10 + 1 + 20 + 1 + 20);
+    key.push_str(POSTING_MEMBERS_ROOT_PREFIX);
+    let _ = write!(
+        &mut key,
+        "{generation:016x}/{posting_id:010}/{seq:020}/{id:020}"
+    );
+    key
 }
 
 const POSTING_MEMBER_EVENT_RKYV_V3_TAG: &[u8] = b"pk3";
@@ -837,4 +857,48 @@ pub(crate) fn prefix_exclusive_end(prefix: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
 
     anyhow::bail!("prefix cannot be converted to exclusive range end")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_builders_match_expected_layouts() {
+        let generation = 0x1a2bu64;
+        let id = 987u64;
+        let posting_id = 42usize;
+        let seq = 55u64;
+
+        assert_eq!(
+            vector_prefix(generation),
+            format!("{VECTOR_ROOT_PREFIX}{generation:016x}/")
+        );
+        assert_eq!(
+            vector_key(generation, id),
+            format!("{VECTOR_ROOT_PREFIX}{generation:016x}/{id:020}")
+        );
+        assert_eq!(
+            posting_map_prefix(generation),
+            format!("{POSTING_MAP_ROOT_PREFIX}{generation:016x}/")
+        );
+        assert_eq!(
+            posting_map_key(generation, id),
+            format!("{POSTING_MAP_ROOT_PREFIX}{generation:016x}/{id:020}")
+        );
+        assert_eq!(
+            posting_members_generation_prefix(generation),
+            format!("{POSTING_MEMBERS_ROOT_PREFIX}{generation:016x}")
+        );
+        assert_eq!(
+            posting_members_prefix(generation, posting_id),
+            format!("{POSTING_MEMBERS_ROOT_PREFIX}{generation:016x}/{posting_id:010}/")
+        );
+        assert_eq!(
+            posting_member_event_key(generation, posting_id, seq, id),
+            format!(
+                "{POSTING_MEMBERS_ROOT_PREFIX}{generation:016x}/{posting_id:010}/{seq:020}/{id:020}"
+            )
+        );
+    }
 }

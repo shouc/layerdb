@@ -191,6 +191,20 @@ impl SpFreshLayerDbShardedIndex {
         partitioned_rev
     }
 
+    fn dedup_last_rows_partitioned_owned(&self, rows: Vec<VectorRecord>) -> Vec<Vec<VectorRecord>> {
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut partitioned_rev = vec![Vec::<VectorRecord>::new(); self.cfg.shard_count];
+        for row in rows.into_iter().rev() {
+            if seen.insert(row.id) {
+                partitioned_rev[self.shard_for_id(row.id)].push(row);
+            }
+        }
+        for shard_rows in &mut partitioned_rev {
+            shard_rows.reverse();
+        }
+        partitioned_rev
+    }
+
     fn dedup_ids_partitioned(&self, ids: &[u64]) -> Vec<Vec<u64>> {
         let mut seen = HashSet::with_capacity(ids.len());
         let mut partitioned = vec![Vec::<u64>::new(); self.cfg.shard_count];
@@ -300,7 +314,7 @@ impl SpFreshLayerDbShardedIndex {
                     Ok(0)
                 } else {
                     shard
-                        .try_upsert_batch_owned_with_commit_mode(chunk, commit_mode)
+                        .try_upsert_batch_deduped_owned_with_commit_mode(chunk, commit_mode)
                         .with_context(|| format!("upsert batch shard {}", shard_id))
                 }
             })
@@ -324,10 +338,7 @@ impl SpFreshLayerDbShardedIndex {
         if rows.is_empty() {
             return Ok(0);
         }
-        let mut partitioned = vec![Vec::<VectorRecord>::new(); self.cfg.shard_count];
-        for row in rows {
-            partitioned[self.shard_for_id(row.id)].push(row);
-        }
+        let partitioned = self.dedup_last_rows_partitioned_owned(rows);
         let results: Vec<anyhow::Result<usize>> = self
             .shards
             .par_iter_mut()
@@ -338,7 +349,7 @@ impl SpFreshLayerDbShardedIndex {
                     Ok(0)
                 } else {
                     shard
-                        .try_upsert_batch_owned_with_commit_mode(chunk, commit_mode)
+                        .try_upsert_batch_deduped_owned_with_commit_mode(chunk, commit_mode)
                         .with_context(|| format!("upsert batch shard {}", shard_id))
                 }
             })
@@ -389,7 +400,7 @@ impl SpFreshLayerDbShardedIndex {
                     Ok(0)
                 } else {
                     shard
-                        .try_delete_batch_with_commit_mode(&chunk, commit_mode)
+                        .try_delete_batch_deduped_owned_with_commit_mode(chunk, commit_mode)
                         .with_context(|| format!("delete batch shard {}", shard_id))
                 }
             })
@@ -454,7 +465,7 @@ impl SpFreshLayerDbShardedIndex {
                     Ok(VectorMutationBatchResult::default())
                 } else {
                     shard
-                        .try_apply_batch_owned_with_commit_mode(chunk, commit_mode)
+                        .try_apply_batch_deduped_owned_with_commit_mode(chunk, commit_mode)
                         .with_context(|| format!("apply batch shard {}", shard_id))
                 }
             })

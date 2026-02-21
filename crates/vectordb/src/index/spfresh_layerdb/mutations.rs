@@ -340,6 +340,29 @@ impl SpFreshLayerDbIndex {
         self.try_upsert_batch_mutations(mutations, commit_mode)
     }
 
+    pub(crate) fn try_upsert_batch_deduped_owned_with_commit_mode(
+        &mut self,
+        rows: Vec<VectorRecord>,
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut mutations = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.values.len() != self.cfg.spfresh.dim {
+                anyhow::bail!(
+                    "invalid vector dim for id={}: got {}, expected {}",
+                    row.id,
+                    row.values.len(),
+                    self.cfg.spfresh.dim
+                );
+            }
+            mutations.push((row.id, row.values));
+        }
+        self.try_upsert_batch_mutations(mutations, commit_mode)
+    }
+
     fn try_upsert_batch_mutations(
         &mut self,
         mutations: Vec<(u64, Vec<f32>)>,
@@ -573,6 +596,14 @@ impl SpFreshLayerDbIndex {
             return Ok(0);
         }
         let mutations = Self::dedup_ids(ids);
+        self.try_delete_batch_deduped_owned_with_commit_mode(mutations, commit_mode)
+    }
+
+    pub(crate) fn try_delete_batch_deduped_owned_with_commit_mode(
+        &mut self,
+        mutations: Vec<u64>,
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<usize> {
         if mutations.is_empty() {
             return Ok(0);
         }
@@ -780,7 +811,7 @@ impl SpFreshLayerDbIndex {
             return Ok(VectorMutationBatchResult::default());
         }
         let deduped = Self::dedup_last_mutations(mutations);
-        self.try_apply_batch_deduped_with_commit_mode(deduped, commit_mode)
+        self.try_apply_batch_deduped_owned_with_commit_mode(deduped, commit_mode)
     }
 
     pub fn try_apply_batch_owned(
@@ -799,10 +830,10 @@ impl SpFreshLayerDbIndex {
             return Ok(VectorMutationBatchResult::default());
         }
         let deduped = Self::dedup_last_mutations_owned(mutations);
-        self.try_apply_batch_deduped_with_commit_mode(deduped, commit_mode)
+        self.try_apply_batch_deduped_owned_with_commit_mode(deduped, commit_mode)
     }
 
-    fn try_apply_batch_deduped_with_commit_mode(
+    pub(crate) fn try_apply_batch_deduped_owned_with_commit_mode(
         &mut self,
         deduped: Vec<VectorMutation>,
         commit_mode: MutationCommitMode,
@@ -815,8 +846,9 @@ impl SpFreshLayerDbIndex {
                 VectorMutation::Delete { id } => deletes.push(id),
             }
         }
-        let upserted = self.try_upsert_batch_owned_with_commit_mode(upserts, commit_mode)?;
-        let deleted = self.try_delete_batch_with_commit_mode(&deletes, commit_mode)?;
+        let upserted =
+            self.try_upsert_batch_deduped_owned_with_commit_mode(upserts, commit_mode)?;
+        let deleted = self.try_delete_batch_deduped_owned_with_commit_mode(deletes, commit_mode)?;
         Ok(VectorMutationBatchResult {
             upserts: upserted,
             deletes: deleted,

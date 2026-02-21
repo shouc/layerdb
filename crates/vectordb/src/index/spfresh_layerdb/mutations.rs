@@ -228,6 +228,24 @@ impl SpFreshLayerDbIndex {
         out_rev
     }
 
+    fn validate_mutations_dims(&self, mutations: &[VectorMutation]) -> anyhow::Result<()> {
+        let expected_dim = self.cfg.spfresh.dim;
+        for mutation in mutations {
+            let VectorMutation::Upsert(row) = mutation else {
+                continue;
+            };
+            if row.values.len() != expected_dim {
+                anyhow::bail!(
+                    "invalid vector dim for id={}: got {}, expected {}",
+                    row.id,
+                    row.values.len(),
+                    expected_dim
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn load_diskmeta_states_for_ids(
         &self,
         generation: u64,
@@ -820,6 +838,7 @@ impl SpFreshLayerDbIndex {
         if mutations.is_empty() {
             return Ok(VectorMutationBatchResult::default());
         }
+        self.validate_mutations_dims(mutations)?;
         let deduped = Self::dedup_last_mutations(mutations);
         self.try_apply_batch_deduped_owned_with_commit_mode(deduped, commit_mode)
     }
@@ -839,6 +858,7 @@ impl SpFreshLayerDbIndex {
         if mutations.is_empty() {
             return Ok(VectorMutationBatchResult::default());
         }
+        self.validate_mutations_dims(mutations.as_slice())?;
         let deduped = Self::dedup_last_mutations_owned(mutations);
         self.try_apply_batch_deduped_owned_with_commit_mode(deduped, commit_mode)
     }

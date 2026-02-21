@@ -184,6 +184,25 @@ impl SpFreshLayerDbShardedIndex {
         Ok(())
     }
 
+    fn validate_mutations_dims(&self, mutations: &[VectorMutation]) -> anyhow::Result<()> {
+        for mutation in mutations {
+            let VectorMutation::Upsert(row) = mutation else {
+                continue;
+            };
+            let shard_id = self.shard_for_id(row.id);
+            let expected_dim = self.shards[shard_id].vector_dim();
+            if row.values.len() != expected_dim {
+                anyhow::bail!(
+                    "invalid vector dim for id={}: got {}, expected {}",
+                    row.id,
+                    row.values.len(),
+                    expected_dim
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn dedup_last_mutations_partitioned(
         &self,
         mutations: &[VectorMutation],
@@ -515,6 +534,7 @@ impl SpFreshLayerDbShardedIndex {
         if mutations.is_empty() {
             return Ok(VectorMutationBatchResult::default());
         }
+        self.validate_mutations_dims(mutations)?;
         if mutations.len() == 1 {
             let shard_id = self.shard_for_id(mutations[0].id());
             return self.shards[shard_id]
@@ -540,6 +560,7 @@ impl SpFreshLayerDbShardedIndex {
         if mutations.is_empty() {
             return Ok(VectorMutationBatchResult::default());
         }
+        self.validate_mutations_dims(mutations.as_slice())?;
         if mutations.len() == 1 {
             let shard_id = self.shard_for_id(mutations[0].id());
             return self.shards[shard_id]
@@ -864,6 +885,30 @@ mod tests {
         ];
         assert!(idx.try_upsert_batch(&bad_then_good).is_err());
         assert!(idx.try_upsert_batch_owned(bad_then_good).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sharded_apply_batch_rejects_invalid_upsert_even_if_overwritten() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let cfg = SpFreshLayerDbShardedConfig {
+            shard_count: 4,
+            ..Default::default()
+        };
+        let mut idx = SpFreshLayerDbShardedIndex::open(dir.path(), cfg.clone())?;
+
+        let bad_then_good = vec![
+            VectorMutation::Upsert(crate::types::VectorRecord::new(
+                21,
+                vec![0.1; cfg.shard.spfresh.dim - 1],
+            )),
+            VectorMutation::Upsert(crate::types::VectorRecord::new(
+                21,
+                vec![0.2; cfg.shard.spfresh.dim],
+            )),
+        ];
+        assert!(idx.try_apply_batch(&bad_then_good).is_err());
+        assert!(idx.try_apply_batch_owned(bad_then_good).is_err());
         Ok(())
     }
 

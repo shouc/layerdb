@@ -108,3 +108,18 @@ fn mixed_mutation_batch_owned_last_write_wins() -> anyhow::Result<()> {
     assert_eq!(got[0].id, 1);
     Ok(())
 }
+
+#[test]
+fn mixed_mutation_batch_rejects_invalid_upsert_even_if_overwritten() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig::default();
+
+    let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+    let bad_then_good = vec![
+        VectorMutation::Upsert(VectorRecord::new(1, vec![0.1; cfg.spfresh.dim - 1])),
+        VectorMutation::Upsert(VectorRecord::new(1, vec![0.2; cfg.spfresh.dim])),
+    ];
+    assert!(idx.try_apply_batch(&bad_then_good).is_err());
+    assert!(idx.try_apply_batch_owned(bad_then_good).is_err());
+    Ok(())
+}

@@ -338,8 +338,7 @@ impl EtcdLeaderElector {
 #[derive(Clone)]
 struct AppState {
     node_id: String,
-    self_url: Option<String>,
-    replica_urls: Vec<String>,
+    replica_peers: Vec<String>,
     replication_timeout: Duration,
     index: Arc<RwLock<SpFreshLayerDbShardedIndex>>,
     leader: Arc<EtcdLeaderElector>,
@@ -582,7 +581,7 @@ async fn apply_mutations(
         ));
     }
 
-    let peers = replication_peers(&state);
+    let peers = state.replica_peers.clone();
     let replication_payload = if peers.is_empty() {
         None
     } else {
@@ -678,10 +677,6 @@ fn join_base_url(base: &str, path: &str) -> String {
         base.trim_end_matches('/'),
         path.trim_start_matches('/')
     )
-}
-
-fn replication_peers(state: &AppState) -> Vec<String> {
-    collect_replication_peers(state.self_url.as_deref(), &state.replica_urls)
 }
 
 fn collect_replication_peers(self_url: Option<&str>, replica_urls: &[String]) -> Vec<String> {
@@ -803,11 +798,11 @@ async fn main() -> anyhow::Result<()> {
         EtcdLeaderElector::new(args.node_id.clone(), election_cfg).context("init etcd election")?,
     );
     let leader_task = tokio::spawn(leader.clone().run());
+    let replica_peers = collect_replication_peers(args.self_url.as_deref(), &args.replica_urls);
 
     let state = Arc::new(AppState {
         node_id: args.node_id.clone(),
-        self_url: args.self_url.clone().map(|u| normalize_base_url(&u)),
-        replica_urls: args.replica_urls.clone(),
+        replica_peers: replica_peers.clone(),
         replication_timeout: Duration::from_millis(args.replication_timeout_ms.max(100)),
         index: Arc::new(RwLock::new(index)),
         leader,
@@ -836,7 +831,7 @@ async fn main() -> anyhow::Result<()> {
         args.db_root.display(),
         args.etcd_endpoints.join(","),
         args.etcd_election_key,
-        args.replica_urls.len(),
+        replica_peers.len(),
     );
 
     let server = axum::serve(listener, app);

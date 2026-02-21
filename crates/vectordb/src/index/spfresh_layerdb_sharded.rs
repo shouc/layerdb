@@ -177,6 +177,31 @@ impl SpFreshLayerDbShardedIndex {
         partitioned_rev
     }
 
+    fn dedup_last_rows_partitioned(&self, rows: &[VectorRecord]) -> Vec<Vec<VectorRecord>> {
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut partitioned_rev = vec![Vec::<VectorRecord>::new(); self.cfg.shard_count];
+        for row in rows.iter().rev() {
+            if seen.insert(row.id) {
+                partitioned_rev[self.shard_for_id(row.id)].push(row.clone());
+            }
+        }
+        for shard_rows in &mut partitioned_rev {
+            shard_rows.reverse();
+        }
+        partitioned_rev
+    }
+
+    fn dedup_ids_partitioned(&self, ids: &[u64]) -> Vec<Vec<u64>> {
+        let mut seen = HashSet::with_capacity(ids.len());
+        let mut partitioned = vec![Vec::<u64>::new(); self.cfg.shard_count];
+        for id in ids {
+            if seen.insert(*id) {
+                partitioned[self.shard_for_id(*id)].push(*id);
+            }
+        }
+        partitioned
+    }
+
     fn merge_neighbors(mut all: Vec<Neighbor>, k: usize) -> Vec<Neighbor> {
         if k == 0 || all.is_empty() {
             return Vec::new();
@@ -264,21 +289,18 @@ impl SpFreshLayerDbShardedIndex {
         if rows.is_empty() {
             return Ok(0);
         }
-        let mut partitioned = vec![Vec::<VectorRecord>::new(); self.cfg.shard_count];
-        for row in rows {
-            partitioned[self.shard_for_id(row.id)].push(row.clone());
-        }
+        let partitioned = self.dedup_last_rows_partitioned(rows);
         let results: Vec<anyhow::Result<usize>> = self
             .shards
             .par_iter_mut()
+            .zip(partitioned.into_par_iter())
             .enumerate()
-            .map(|(shard_id, shard)| {
-                let chunk = &partitioned[shard_id];
+            .map(|(shard_id, (shard, chunk))| {
                 if chunk.is_empty() {
                     Ok(0)
                 } else {
                     shard
-                        .try_upsert_batch_with_commit_mode(chunk, commit_mode)
+                        .try_upsert_batch_owned_with_commit_mode(chunk, commit_mode)
                         .with_context(|| format!("upsert batch shard {}", shard_id))
                 }
             })
@@ -356,21 +378,18 @@ impl SpFreshLayerDbShardedIndex {
         if ids.is_empty() {
             return Ok(0);
         }
-        let mut partitioned = vec![Vec::<u64>::new(); self.cfg.shard_count];
-        for id in ids {
-            partitioned[self.shard_for_id(*id)].push(*id);
-        }
+        let partitioned = self.dedup_ids_partitioned(ids);
         let results: Vec<anyhow::Result<usize>> = self
             .shards
             .par_iter_mut()
+            .zip(partitioned.into_par_iter())
             .enumerate()
-            .map(|(shard_id, shard)| {
-                let chunk = &partitioned[shard_id];
+            .map(|(shard_id, (shard, chunk))| {
                 if chunk.is_empty() {
                     Ok(0)
                 } else {
                     shard
-                        .try_delete_batch_with_commit_mode(chunk, commit_mode)
+                        .try_delete_batch_with_commit_mode(&chunk, commit_mode)
                         .with_context(|| format!("delete batch shard {}", shard_id))
                 }
             })

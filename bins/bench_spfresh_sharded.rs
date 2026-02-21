@@ -163,7 +163,7 @@ fn main() -> Result<()> {
 
     let build_start = Instant::now();
     let mut index = SpFreshLayerDbShardedIndex::open(&db_path, cfg)?;
-    index.try_bulk_load(&base_rows)?;
+    index.try_bulk_load_owned(base_rows)?;
     let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
 
     let update_start = Instant::now();

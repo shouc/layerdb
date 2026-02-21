@@ -1530,7 +1530,7 @@ async fn install_snapshot(
             .write()
             .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
         index
-            .try_bulk_load(rows.as_slice())
+            .try_bulk_load_owned(rows)
             .context("apply snapshot rows")
     })
     .await

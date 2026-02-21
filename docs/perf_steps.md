@@ -66,3 +66,24 @@ SPFresh/LanceDB ratio:
 
 Note:
 - This step changes deploy replication behavior, not ANN kernels. Throughput variance here is from host-state noise during repeated benchmark runs.
+
+## Step 3 (`sharded-owned-bulkload-and-partition-prealloc`)
+
+Change:
+- Added `try_bulk_load_owned(Vec<VectorRecord>)` in sharded SPFresh to avoid redundant cloning on owned ingest paths.
+- Updated deploy snapshot install path and sharded benchmark builder to use owned bulk load.
+- Reworked sharded partition/dedup helpers to pre-count by shard and preallocate per-shard `Vec`/`FxHashSet`, reducing hot-path allocation and hash pressure for large update batches.
+
+SPFresh:
+- `update_qps=178182.31` (`+19.54%` vs step2)
+- `search_qps=2809.52` (`+8.55%` vs step2)
+- `recall_at_k=0.6030` (`no change`)
+
+LanceDB:
+- `update_qps=130629.31`
+- `search_qps=922.84`
+- `recall_at_k=0.4690`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.3640`
+- `search_qps_ratio=3.0444`

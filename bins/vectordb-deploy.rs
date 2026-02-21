@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -8,13 +8,16 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use etcd_client::{
     Client as EtcdClient, Compare, CompareOp, ConnectOptions, PutOptions, Txn, TxnOp,
 };
 use futures::future::join_all;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use vectordb::index::{
     MutationCommitMode, SpFreshConfig, SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig,
     SpFreshLayerDbShardedIndex, SpFreshLayerDbShardedStats, SpFreshMemoryMode, VectorMutation,
@@ -338,7 +341,7 @@ struct AppState {
     self_url: Option<String>,
     replica_urls: Vec<String>,
     replication_timeout: Duration,
-    index: Arc<Mutex<SpFreshLayerDbShardedIndex>>,
+    index: Arc<RwLock<SpFreshLayerDbShardedIndex>>,
     leader: Arc<EtcdLeaderElector>,
     http: Client,
 }
@@ -374,12 +377,12 @@ enum MutationInput {
 }
 
 impl MutationInput {
-    fn to_runtime(&self) -> VectorMutation {
+    fn into_runtime(self) -> VectorMutation {
         match self {
             MutationInput::Upsert { id, values } => {
-                VectorMutation::Upsert(VectorRecord::new(*id, values.clone()))
+                VectorMutation::Upsert(VectorRecord::new(id, values))
             }
-            MutationInput::Delete { id } => VectorMutation::Delete { id: *id },
+            MutationInput::Delete { id } => VectorMutation::Delete { id },
         }
     }
 }
@@ -457,7 +460,7 @@ async fn health(State(state): State<Arc<AppState>>) -> ApiResult<HealthResponse>
     let index = state.index.clone();
     let stats = tokio::task::spawn_blocking(move || {
         let index = index
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
         index.health_check()
     })
@@ -494,12 +497,11 @@ async fn search(
         ));
     }
 
-    let query = req.query.clone();
-    let k = req.k;
+    let SearchRequest { query, k } = req;
     let index = state.index.clone();
     let neighbors = tokio::task::spawn_blocking(move || {
         let index = index
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
         Ok::<_, anyhow::Error>(index.search(&query, k))
     })
@@ -523,7 +525,7 @@ async fn force_rebuild(State(state): State<Arc<AppState>>) -> ApiResult<serde_js
     let index = state.index.clone();
     tokio::task::spawn_blocking(move || {
         let index = index
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
         index.force_rebuild()
     })
@@ -550,7 +552,7 @@ async fn sync_to_s3(
     let index = state.index.clone();
     let moved = tokio::task::spawn_blocking(move || {
         let index = index
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
         index.sync_to_s3(req.max_files_per_shard)
     })
@@ -580,8 +582,28 @@ async fn apply_mutations(
         ));
     }
 
-    let applied = apply_local_mutations(state.clone(), req.clone()).await?;
-    let replicated = replicate_to_followers(state.clone(), req).await;
+    let peers = replication_peers(&state);
+    let replication_payload = if peers.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_vec(&req).map(Bytes::from).map_err(|err| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("encode replication payload: {err}"),
+            )
+        })?)
+    };
+
+    let applied = apply_local_mutations(state.clone(), req).await?;
+    let replicated = if let Some(payload) = replication_payload {
+        replicate_to_followers(state.clone(), peers, payload).await
+    } else {
+        ReplicationSummary {
+            attempted: 0,
+            succeeded: 0,
+            failed: Vec::new(),
+        }
+    };
 
     Ok(Json(ApplyMutationsResponse {
         applied_upserts: applied.upserts,
@@ -617,17 +639,20 @@ async fn apply_local_mutations(
     state: Arc<AppState>,
     req: ApplyMutationsRequest,
 ) -> Result<VectorMutationBatchResult, ApiError> {
-    let mode = req.commit_mode.unwrap_or(CommitModeArg::Durable).into();
-    let mutations: Vec<VectorMutation> = req
-        .mutations
-        .iter()
-        .map(MutationInput::to_runtime)
+    let ApplyMutationsRequest {
+        mutations,
+        commit_mode,
+    } = req;
+    let mode = commit_mode.unwrap_or(CommitModeArg::Durable).into();
+    let mutations: Vec<VectorMutation> = mutations
+        .into_iter()
+        .map(MutationInput::into_runtime)
         .collect();
     let index = state.index.clone();
 
     tokio::task::spawn_blocking(move || {
         let mut index = index
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
         index.try_apply_batch_with_commit_mode(&mutations, mode)
     })
@@ -655,21 +680,14 @@ fn join_base_url(base: &str, path: &str) -> String {
     )
 }
 
-async fn replicate_to_followers(
-    state: Arc<AppState>,
-    req: ApplyMutationsRequest,
-) -> ReplicationSummary {
-    if state.replica_urls.is_empty() {
-        return ReplicationSummary {
-            attempted: 0,
-            succeeded: 0,
-            failed: Vec::new(),
-        };
-    }
+fn replication_peers(state: &AppState) -> Vec<String> {
+    collect_replication_peers(state.self_url.as_deref(), &state.replica_urls)
+}
 
-    let self_base = state.self_url.as_deref().map(normalize_base_url);
-    let peers: Vec<String> = state
-        .replica_urls
+fn collect_replication_peers(self_url: Option<&str>, replica_urls: &[String]) -> Vec<String> {
+    let self_base = self_url.map(normalize_base_url);
+    let mut seen = HashSet::new();
+    replica_urls
         .iter()
         .map(|url| normalize_base_url(url))
         .filter(|url| {
@@ -678,8 +696,15 @@ async fn replicate_to_followers(
                 .map(|self_url| self_url != url)
                 .unwrap_or(true)
         })
-        .collect();
+        .filter(|url| seen.insert(url.clone()))
+        .collect()
+}
 
+async fn replicate_to_followers(
+    state: Arc<AppState>,
+    peers: Vec<String>,
+    payload: Bytes,
+) -> ReplicationSummary {
     if peers.is_empty() {
         return ReplicationSummary {
             attempted: 0,
@@ -691,14 +716,15 @@ async fn replicate_to_followers(
     let futures = peers.iter().map(|peer| {
         let endpoint = join_base_url(peer, "/v1/internal/replicate");
         let peer_name = peer.clone();
-        let body = req.clone();
+        let body = payload.clone();
         let client = state.http.clone();
         let timeout = state.replication_timeout;
         async move {
             let response = client
                 .post(&endpoint)
                 .timeout(timeout)
-                .json(&body)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body)
                 .send()
                 .await;
             match response {
@@ -783,7 +809,7 @@ async fn main() -> anyhow::Result<()> {
         self_url: args.self_url.clone().map(|u| normalize_base_url(&u)),
         replica_urls: args.replica_urls.clone(),
         replication_timeout: Duration::from_millis(args.replication_timeout_ms.max(100)),
-        index: Arc::new(Mutex::new(index)),
+        index: Arc::new(RwLock::new(index)),
         leader,
         http: Client::new(),
     });
@@ -830,4 +856,27 @@ async fn main() -> anyhow::Result<()> {
     let _ = leader_task.await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_replication_peers;
+
+    #[test]
+    fn collect_replication_peers_dedups_and_skips_self() {
+        let peers = vec![
+            "http://127.0.0.1:8081/".to_string(),
+            "http://127.0.0.1:8081".to_string(),
+            "http://127.0.0.1:8080".to_string(),
+            "http://127.0.0.1:8082/".to_string(),
+        ];
+        let out = collect_replication_peers(Some("http://127.0.0.1:8080/"), &peers);
+        assert_eq!(
+            out,
+            vec![
+                "http://127.0.0.1:8081".to_string(),
+                "http://127.0.0.1:8082".to_string()
+            ]
+        );
+    }
 }

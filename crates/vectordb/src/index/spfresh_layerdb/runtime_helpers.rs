@@ -112,7 +112,7 @@ impl SpFreshLayerDbIndex {
         &self,
         generation: u64,
         posting_id: usize,
-    ) -> anyhow::Result<Arc<Vec<PostingMemberSketch>>> {
+    ) -> anyhow::Result<Arc<Vec<u64>>> {
         if self.use_nondurable_fast_path() {
             if let Some(members) = self.load_ephemeral_posting_members_for(posting_id) {
                 return Ok(members);
@@ -138,13 +138,14 @@ impl SpFreshLayerDbIndex {
                 );
             }
         }
-        let mut sketches = Vec::with_capacity(loaded.members.len());
+        let mut ids = Vec::with_capacity(loaded.members.len());
         for member in loaded.members {
-            sketches.push(PostingMemberSketch::from_loaded(&member));
+            ids.push(member.id);
         }
-        let sketches = Arc::new(sketches);
-        lock_mutex(&self.posting_members_cache).put_arc(generation, posting_id, sketches.clone());
-        Ok(sketches)
+        ids.sort_unstable();
+        let ids = Arc::new(ids);
+        lock_mutex(&self.posting_members_cache).put_arc(generation, posting_id, ids.clone());
+        Ok(ids)
     }
 
     fn compact_posting_members_log(
@@ -198,9 +199,10 @@ impl SpFreshLayerDbIndex {
             for posting_id in snapshot.posting_ids() {
                 let loaded = load_posting_members(&self.db, generation, posting_id)
                     .with_context(|| format!("load posting members for posting={posting_id}"))?;
-                let mut posting_members = HashMap::with_capacity(loaded.members.len());
+                let mut posting_members =
+                    FxHashSet::with_capacity_and_hasher(loaded.members.len(), Default::default());
                 for member in loaded.members {
-                    posting_members.insert(member.id, PostingMemberSketch::from_loaded(&member));
+                    posting_members.insert(member.id);
                 }
                 refreshed.insert(posting_id, posting_members);
             }
@@ -297,8 +299,8 @@ impl SpFreshLayerDbIndex {
             }
             postings
                 .entry(new_posting)
-                .or_insert_with(HashMap::new)
-                .insert(id, PostingMemberSketch { id });
+                .or_insert_with(FxHashSet::default)
+                .insert(id);
         }
     }
 
@@ -322,15 +324,12 @@ impl SpFreshLayerDbIndex {
         }
     }
 
-    fn load_ephemeral_posting_members_for(
-        &self,
-        posting_id: usize,
-    ) -> Option<Arc<Vec<PostingMemberSketch>>> {
+    fn load_ephemeral_posting_members_for(&self, posting_id: usize) -> Option<Arc<Vec<u64>>> {
         let guard = lock_mutex(&self.ephemeral_posting_members);
         let postings = guard.as_ref()?;
         let members = postings.get(&posting_id)?;
-        let mut out: Vec<PostingMemberSketch> = members.values().cloned().collect();
-        out.sort_by_key(|m| m.id);
+        let mut out: Vec<u64> = members.iter().copied().collect();
+        out.sort_unstable();
         Some(Arc::new(out))
     }
 
@@ -357,13 +356,6 @@ impl SpFreshLayerDbIndex {
         if Self::neighbor_cmp(&candidate, &top[worst_idx]).is_lt() {
             top[worst_idx] = candidate;
         }
-    }
-
-    pub(super) fn select_diskmeta_candidates(members: &[PostingMemberSketch]) -> Vec<u64> {
-        if members.is_empty() {
-            return Vec::new();
-        }
-        members.iter().map(|m| m.id).collect()
     }
 
     pub(super) fn mark_dirty(&self, id: u64) {

@@ -24,6 +24,7 @@ use anyhow::Context;
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use layerdb::{Db, DbOptions, ReadOptions, WriteOptions};
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::linalg::squared_l2;
@@ -82,7 +83,7 @@ pub enum MutationCommitMode {
 
 type DiskMetaRowState = Option<(usize, Vec<f32>)>;
 type DiskMetaStateMap = HashMap<u64, DiskMetaRowState>;
-type EphemeralPostingMembers = HashMap<usize, HashMap<u64, PostingMemberSketch>>;
+type EphemeralPostingMembers = HashMap<usize, FxHashSet<u64>>;
 type EphemeralRowStates = HashMap<u64, (usize, Vec<f32>)>;
 type DistanceRow = (u64, f32);
 type DistanceLoadResult = (Vec<DistanceRow>, Vec<u64>);
@@ -166,21 +167,10 @@ impl VectorCache {
     }
 }
 
-#[derive(Clone, Debug)]
-struct PostingMemberSketch {
-    id: u64,
-}
-
-impl PostingMemberSketch {
-    fn from_loaded(member: &PostingMember) -> Self {
-        Self { id: member.id }
-    }
-}
-
 #[derive(Debug)]
 struct PostingMembersCache {
     capacity: usize,
-    map: HashMap<(u64, usize), Arc<Vec<PostingMemberSketch>>>,
+    map: HashMap<(u64, usize), Arc<Vec<u64>>>,
     order: VecDeque<(u64, usize)>,
 }
 
@@ -193,7 +183,7 @@ impl PostingMembersCache {
         }
     }
 
-    fn get(&self, generation: u64, posting_id: usize) -> Option<Arc<Vec<PostingMemberSketch>>> {
+    fn get(&self, generation: u64, posting_id: usize) -> Option<Arc<Vec<u64>>> {
         self.map.get(&(generation, posting_id)).cloned()
     }
 
@@ -201,12 +191,7 @@ impl PostingMembersCache {
         self.capacity
     }
 
-    fn put_arc(
-        &mut self,
-        generation: u64,
-        posting_id: usize,
-        members: Arc<Vec<PostingMemberSketch>>,
-    ) {
+    fn put_arc(&mut self, generation: u64, posting_id: usize, members: Arc<Vec<u64>>) {
         if self.capacity == 0 {
             return;
         }

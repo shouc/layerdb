@@ -292,3 +292,26 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7071`
 - `search_qps_ratio=3.9060`
+
+## Step 13 (`posting-members-id-only-cache-repr`)
+
+Change:
+- Reworked posting-member caches from `Vec<struct{id}>` / nested `HashMap<u64, ...>` to plain id-only
+  collections (`Arc<Vec<u64>>` + `FxHashSet<u64>` in ephemeral state).
+- Removed per-query candidate extraction by feeding cached posting-member id slices directly into
+  distance loading.
+- Kept deterministic sort order for cached posting-member ids.
+
+SPFresh:
+- `update_qps=217359.79`
+- `search_qps=2366.42`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=41383.23`
+- `search_qps=604.19`
+- `recall_at_k=0.4835`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=5.2524`
+- `search_qps_ratio=3.9167`

@@ -124,8 +124,7 @@ impl VectorIndex for SpFreshLayerDbIndex {
                 let members = self
                     .load_posting_members_for(generation, posting_id)
                     .unwrap_or_else(|err| panic!("offheap-diskmeta load members failed: {err:#}"));
-                let selected_ids = Self::select_diskmeta_candidates(members.as_ref());
-                if selected_ids.is_empty() {
+                if members.is_empty() {
                     continue;
                 }
                 let (selected_exact, missing_selected_ids) = Self::load_distances_for_ids(
@@ -133,7 +132,7 @@ impl VectorIndex for SpFreshLayerDbIndex {
                     &self.vector_cache,
                     &self.vector_blocks,
                     generation,
-                    &selected_ids,
+                    members.as_ref(),
                     query,
                 )
                 .unwrap_or_else(|err| {

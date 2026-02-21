@@ -38,6 +38,12 @@ services:
       - "200"
       - --replication-timeout-ms
       - "1500"
+      - --replication-snapshot-timeout-ms
+      - "12000"
+      - --replication-log-max-entries
+      - "16"
+      - --replication-catchup-batch
+      - "16"
       - --shards
       - "4"
       - --dim
@@ -85,6 +91,12 @@ services:
       - "200"
       - --replication-timeout-ms
       - "1500"
+      - --replication-snapshot-timeout-ms
+      - "12000"
+      - --replication-log-max-entries
+      - "16"
+      - --replication-catchup-batch
+      - "16"
       - --shards
       - "4"
       - --dim
@@ -132,6 +144,12 @@ services:
       - "200"
       - --replication-timeout-ms
       - "1500"
+      - --replication-snapshot-timeout-ms
+      - "12000"
+      - --replication-log-max-entries
+      - "16"
+      - --replication-catchup-batch
+      - "16"
       - --shards
       - "4"
       - --dim

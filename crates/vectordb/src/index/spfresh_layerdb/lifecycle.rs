@@ -72,6 +72,14 @@ impl SpFreshLayerDbIndex {
     pub fn frozen_objects(&self) -> Vec<layerdb::version::FrozenObjectMeta> {
         self.db.frozen_objects()
     }
+
+    pub fn snapshot_rows(&self) -> anyhow::Result<Vec<VectorRecord>> {
+        let _update_guard = lock_write(&self.update_gate);
+        self.flush_pending_commits()?;
+        let generation = self.active_generation.load(Ordering::Relaxed);
+        load_rows(&self.db, generation)
+            .with_context(|| format!("load snapshot rows generation={generation}"))
+    }
 }
 
 impl Drop for SpFreshLayerDbIndex {

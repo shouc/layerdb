@@ -16,6 +16,7 @@ NODE_URLS=("${NODE1_URL}" "${NODE2_URL}" "${NODE3_URL}")
 
 VEC_A='[0.11,0.11,0.11,0.11,0.11,0.11,0.11,0.11]'
 VEC_B='[0.33,0.33,0.33,0.33,0.33,0.33,0.33,0.33]'
+VEC_C='[0.77,0.77,0.77,0.77,0.77,0.77,0.77,0.77]'
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -240,6 +241,67 @@ rm -f "${tmp_out}"
 
 for url in "${NODE_URLS[@]}"; do
   assert_search_top_id "${url}" 202 "${VEC_B}"
+done
+
+lagging_url="${NODE1_URL}"
+if [[ "${lagging_url}" == "${stable_leader_url}" ]]; then
+  lagging_url="${NODE2_URL}"
+fi
+if [[ "${lagging_url}" == "${stable_leader_url}" ]]; then
+  lagging_url="${NODE3_URL}"
+fi
+lagging_service="$(service_for_url "${lagging_url}")"
+
+echo "stopping lagging follower to force snapshot catch-up: ${lagging_service}"
+docker compose -p "${PROJECT}" -f "${COMPOSE_FILE}" stop "${lagging_service}" >/dev/null
+
+for id in $(seq 300 339); do
+  payload="{\"mutations\":[{\"kind\":\"upsert\",\"id\":${id},\"values\":${VEC_A}}],\"commit_mode\":\"durable\"}"
+  tmp_out="$(mktemp)"
+  status="$(post_json "${stable_leader_url}/v1/mutations" "${payload}" "${tmp_out}")"
+  if [[ "${status}" != "200" ]]; then
+    echo "leader write during lag scenario failed for id=${id} status=${status}" >&2
+    cat "${tmp_out}" >&2
+    rm -f "${tmp_out}"
+    exit 1
+  fi
+  if ! grep -Eq '"attempted"[[:space:]]*:[[:space:]]*2' "${tmp_out}" \
+    || ! grep -Eq '"succeeded"[[:space:]]*:[[:space:]]*1' "${tmp_out}"; then
+    echo "unexpected replication summary while follower is stopped (id=${id})" >&2
+    cat "${tmp_out}" >&2
+    rm -f "${tmp_out}"
+    exit 1
+  fi
+  rm -f "${tmp_out}"
+done
+
+docker compose -p "${PROJECT}" -f "${COMPOSE_FILE}" start "${lagging_service}" >/dev/null
+if ! wait_for_http "${lagging_url}/v1/health" "${TIMEOUT_SECS}"; then
+  echo "timed out waiting for restarted lagging node ${lagging_service}" >&2
+  docker compose -p "${PROJECT}" -f "${COMPOSE_FILE}" logs --tail 200 "${lagging_service}" >&2 || true
+  exit 1
+fi
+
+snapshot_write_payload="{\"mutations\":[{\"kind\":\"upsert\",\"id\":999,\"values\":${VEC_C}}],\"commit_mode\":\"durable\"}"
+tmp_out="$(mktemp)"
+snapshot_status="$(post_json "${stable_leader_url}/v1/mutations" "${snapshot_write_payload}" "${tmp_out}")"
+if [[ "${snapshot_status}" != "200" ]]; then
+  echo "snapshot catch-up write failed with status ${snapshot_status}" >&2
+  cat "${tmp_out}" >&2
+  rm -f "${tmp_out}"
+  exit 1
+fi
+if ! grep -Eq '"attempted"[[:space:]]*:[[:space:]]*2' "${tmp_out}" \
+  || ! grep -Eq '"succeeded"[[:space:]]*:[[:space:]]*2' "${tmp_out}"; then
+  echo "unexpected replication summary after snapshot catch-up write" >&2
+  cat "${tmp_out}" >&2
+  rm -f "${tmp_out}"
+  exit 1
+fi
+rm -f "${tmp_out}"
+
+for url in "${NODE_URLS[@]}"; do
+  assert_search_top_id "${url}" 999 "${VEC_C}"
 done
 
 echo "docker integration test passed"

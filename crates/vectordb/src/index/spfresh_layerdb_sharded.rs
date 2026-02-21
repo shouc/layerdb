@@ -616,6 +616,17 @@ impl SpFreshLayerDbShardedIndex {
         Ok(())
     }
 
+    pub fn snapshot_rows(&self) -> anyhow::Result<Vec<VectorRecord>> {
+        let mut out = Vec::new();
+        for (shard_id, shard) in self.shards.iter().enumerate() {
+            let mut shard_rows = shard
+                .snapshot_rows()
+                .with_context(|| format!("snapshot rows shard {}", shard_id))?;
+            out.append(&mut shard_rows);
+        }
+        Ok(out)
+    }
+
     pub fn close(mut self) -> anyhow::Result<()> {
         for shard in self.shards.drain(..) {
             shard.close()?;

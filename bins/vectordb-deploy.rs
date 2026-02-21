@@ -75,6 +75,9 @@ struct Args {
     #[arg(long, default_value_t = 1_500)]
     replication_timeout_ms: u64,
 
+    #[arg(long, default_value_t = 120_000)]
+    replication_snapshot_timeout_ms: u64,
+
     #[arg(long, default_value_t = 500_000)]
     replication_log_max_entries: usize,
 
@@ -150,6 +153,7 @@ impl From<CommitModeArg> for MutationCommitMode {
 
 const REPLICATION_JOURNAL_SCHEMA_VERSION: u32 = 1;
 const REPLICATION_PAYLOAD_SCHEMA_VERSION: u32 = 1;
+const SNAPSHOT_PAYLOAD_SCHEMA_VERSION: u32 = 1;
 const LOG_RANGE_FRAME_MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -198,6 +202,47 @@ impl ReplicationPayload {
 
     fn commit_mode(&self) -> anyhow::Result<MutationCommitMode> {
         decode_commit_mode(self.commit_mode)
+    }
+}
+
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+struct WireSnapshotRow {
+    id: u64,
+    values: Vec<f32>,
+}
+
+impl From<VectorRecord> for WireSnapshotRow {
+    fn from(value: VectorRecord) -> Self {
+        Self {
+            id: value.id,
+            values: value.values,
+        }
+    }
+}
+
+impl WireSnapshotRow {
+    fn into_runtime(self) -> VectorRecord {
+        VectorRecord::new(self.id, self.values)
+    }
+}
+
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+struct SnapshotPayload {
+    schema_version: u32,
+    applied_seq: u64,
+    term: u64,
+    rows: Vec<WireSnapshotRow>,
+}
+
+impl SnapshotPayload {
+    fn to_runtime_rows(&self) -> Vec<VectorRecord> {
+        self.rows
+            .clone()
+            .into_iter()
+            .map(WireSnapshotRow::into_runtime)
+            .collect()
     }
 }
 
@@ -426,6 +471,26 @@ impl ReplicationJournal {
         self.persist_meta(sync)
     }
 
+    fn reset_to_applied(&mut self, applied_seq: u64, term: u64, sync: bool) -> anyhow::Result<()> {
+        self.file
+            .set_len(0)
+            .context("truncate replication log during snapshot reset")?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewind replication log during snapshot reset")?;
+        if sync {
+            self.file
+                .sync_data()
+                .context("sync replication log during snapshot reset")?;
+        }
+        self.index.clear();
+        self.meta.first_seq = applied_seq.saturating_add(1).max(1);
+        self.meta.next_seq = applied_seq.saturating_add(1).max(1);
+        self.meta.last_applied_seq = applied_seq;
+        self.meta.max_term_seen = term.max(self.meta.max_term_seen);
+        self.persist_meta(sync)
+    }
+
     fn read_entry(&mut self, seq: u64) -> anyhow::Result<Option<Bytes>> {
         let Some(entry) = self.index.get(&seq).copied() else {
             return Ok(None);
@@ -634,6 +699,64 @@ fn decode_replication_payload(raw: &[u8]) -> anyhow::Result<ReplicationPayload> 
             "replication payload schema mismatch: got {}, expected {}",
             payload.schema_version,
             REPLICATION_PAYLOAD_SCHEMA_VERSION
+        );
+    }
+    Ok(payload)
+}
+
+fn encode_snapshot_payload(payload: &SnapshotPayload) -> anyhow::Result<Bytes> {
+    let payload_bytes = rkyv::to_bytes::<_, 4096>(payload).context("serialize snapshot payload")?;
+    let checksum = checksum_fnv1a64(payload_bytes.as_ref());
+    let mut out = Vec::with_capacity(12 + payload_bytes.len());
+    out.extend_from_slice(&checksum.to_le_bytes());
+    let len = u32::try_from(payload_bytes.len()).context("snapshot payload too large")?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(payload_bytes.as_ref());
+    Ok(Bytes::from(out))
+}
+
+fn decode_snapshot_payload(raw: &[u8]) -> anyhow::Result<SnapshotPayload> {
+    if raw.len() < 12 {
+        anyhow::bail!("snapshot payload too short: {}", raw.len());
+    }
+    let checksum = u64::from_le_bytes(
+        raw[0..8]
+            .try_into()
+            .expect("checked exact checksum header length"),
+    );
+    let len = u32::from_le_bytes(
+        raw[8..12]
+            .try_into()
+            .expect("checked exact payload length header"),
+    ) as usize;
+    if raw.len() != 12 + len {
+        anyhow::bail!(
+            "snapshot payload length mismatch: raw={}, header_len={}",
+            raw.len(),
+            len
+        );
+    }
+    let payload_bytes = &raw[12..];
+    let actual_checksum = checksum_fnv1a64(payload_bytes);
+    if checksum != actual_checksum {
+        anyhow::bail!(
+            "snapshot checksum mismatch: got {}, expected {}",
+            checksum,
+            actual_checksum
+        );
+    }
+    let mut aligned = rkyv::AlignedVec::with_capacity(payload_bytes.len());
+    aligned.extend_from_slice(payload_bytes);
+    let archived = rkyv::check_archived_root::<SnapshotPayload>(aligned.as_ref())
+        .map_err(|err| anyhow::anyhow!("validate archived snapshot payload: {err}"))?;
+    let payload: SnapshotPayload = archived
+        .deserialize(&mut Infallible)
+        .map_err(|err| anyhow::anyhow!("deserialize snapshot payload: {err}"))?;
+    if payload.schema_version != SNAPSHOT_PAYLOAD_SCHEMA_VERSION {
+        anyhow::bail!(
+            "snapshot payload schema mismatch: got {}, expected {}",
+            payload.schema_version,
+            SNAPSHOT_PAYLOAD_SCHEMA_VERSION
         );
     }
     Ok(payload)
@@ -899,6 +1022,7 @@ struct AppState {
     replica_peers: Vec<String>,
     quorum_size: usize,
     replication_timeout: Duration,
+    replication_snapshot_timeout: Duration,
     replication_catchup_batch: usize,
     index: Arc<RwLock<SpFreshLayerDbShardedIndex>>,
     leader: Arc<EtcdLeaderElector>,
@@ -960,6 +1084,12 @@ struct ApplyMutationsResponse {
     applied_upserts: usize,
     applied_deletes: usize,
     replicated: ReplicationSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct SnapshotInstallResponse {
+    applied_seq: u64,
+    rows: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1364,6 +1494,80 @@ async fn apply_replication(
     }))
 }
 
+async fn install_snapshot(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> ApiResult<SnapshotInstallResponse> {
+    let payload = decode_snapshot_payload(body.as_ref()).map_err(|err| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("decode snapshot payload: {err:#}"),
+        )
+    })?;
+    let rows = payload.to_runtime_rows();
+    let row_count = rows.len();
+    let _gate = state.mutation_gate.lock().await;
+    {
+        let journal = state
+            .journal
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
+        if payload.term < journal.max_term_seen() {
+            return Err(replication_reject_error(
+                format!(
+                    "stale snapshot term {} < max_term_seen {}",
+                    payload.term,
+                    journal.max_term_seen()
+                ),
+                &journal,
+            ));
+        }
+    }
+
+    let index = state.index.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut index = index
+            .write()
+            .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
+        index
+            .try_bulk_load(rows.as_slice())
+            .context("apply snapshot rows")
+    })
+    .await
+    .map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("join snapshot apply task: {err}"),
+        )
+    })
+    .and_then(|result| {
+        result.map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+    })?;
+
+    {
+        let mut journal = state
+            .journal
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
+        journal
+            .reset_to_applied(payload.applied_seq, payload.term, true)
+            .map_err(|err| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "reset replication journal to seq={}: {err:#}",
+                        payload.applied_seq
+                    ),
+                )
+            })?;
+    }
+
+    Ok(Json(SnapshotInstallResponse {
+        applied_seq: payload.applied_seq,
+        rows: row_count,
+    }))
+}
+
 async fn replication_log_range(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LogRangeRequest>,
@@ -1513,6 +1717,74 @@ async fn send_replication_payload(
     )))
 }
 
+async fn build_snapshot_payload(
+    state: Arc<AppState>,
+    applied_seq: u64,
+    term: u64,
+) -> Result<Bytes, String> {
+    let index = state.index.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        let index = index
+            .read()
+            .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
+        index.snapshot_rows()
+    })
+    .await
+    .map_err(|err| format!("join snapshot build task: {err}"))?
+    .map_err(|err| format!("build snapshot rows: {err:#}"))?;
+    let payload = SnapshotPayload {
+        schema_version: SNAPSHOT_PAYLOAD_SCHEMA_VERSION,
+        applied_seq,
+        term,
+        rows: rows.into_iter().map(WireSnapshotRow::from).collect(),
+    };
+    encode_snapshot_payload(&payload).map_err(|err| format!("encode snapshot payload: {err:#}"))
+}
+
+async fn install_snapshot_on_peer(
+    state: Arc<AppState>,
+    peer: &str,
+    applied_seq: u64,
+    leader_term: u64,
+) -> Result<(), String> {
+    let endpoint = join_base_url(peer, "/v1/internal/install-snapshot");
+    let payload = build_snapshot_payload(state.clone(), applied_seq, leader_term).await?;
+    let response = state
+        .http
+        .post(&endpoint)
+        .timeout(state.replication_snapshot_timeout)
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(payload)
+        .send()
+        .await
+        .map_err(|err| format!("{peer}: snapshot install request failed: {err}"))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response
+        .bytes()
+        .await
+        .unwrap_or_else(|_| Bytes::from_static(b""));
+    if status == StatusCode::CONFLICT {
+        if let Some(reject) = parse_replication_reject(body.as_ref()) {
+            return Err(format!(
+                "{peer}: snapshot rejected expected_seq={} first_available_seq={} max_term_seen={} reason={}",
+                reject.expected_seq, reject.first_available_seq, reject.max_term_seen, reject.error
+            ));
+        }
+    }
+    let body_snippet = String::from_utf8_lossy(body.as_ref());
+    let body_snippet = body_snippet
+        .chars()
+        .take(256)
+        .collect::<String>()
+        .replace('\n', "\\n");
+    Err(format!(
+        "{peer}: snapshot install http {status} body={body_snippet}"
+    ))
+}
+
 async fn catch_up_peer(
     state: Arc<AppState>,
     peer: &str,
@@ -1646,6 +1918,17 @@ async fn replicate_to_peer(
             if reject.expected_seq == seq.saturating_add(1) {
                 return Ok(());
             }
+            let local_first_seq = {
+                let journal = state
+                    .journal
+                    .lock()
+                    .map_err(|_| format!("{peer}: journal lock poisoned"))?;
+                journal.first_seq()
+            };
+            if reject.expected_seq < local_first_seq {
+                install_snapshot_on_peer(state.clone(), &peer, seq, leader_term).await?;
+                return Ok(());
+            }
             catch_up_peer(
                 state.clone(),
                 &peer,
@@ -1767,6 +2050,9 @@ async fn main() -> anyhow::Result<()> {
         replica_peers: replica_peers.clone(),
         quorum_size,
         replication_timeout: Duration::from_millis(args.replication_timeout_ms.max(100)),
+        replication_snapshot_timeout: Duration::from_millis(
+            args.replication_snapshot_timeout_ms.max(1_000),
+        ),
         replication_catchup_batch: args.replication_catchup_batch,
         index: Arc::new(RwLock::new(index)),
         leader,
@@ -1781,6 +2067,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/search", post(search))
         .route("/v1/mutations", post(apply_mutations))
         .route("/v1/internal/replicate", post(apply_replication))
+        .route("/v1/internal/install-snapshot", post(install_snapshot))
         .route("/v1/internal/log-range", post(replication_log_range))
         .route("/v1/force-rebuild", post(force_rebuild))
         .route("/v1/sync-to-s3", post(sync_to_s3))
@@ -1824,9 +2111,11 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::{
         collect_replication_peers, decode_payload_frame, decode_replication_payload,
-        encode_commit_mode, encode_payload_frame, encode_replication_payload,
-        parse_replication_reject, ErrorResponse, ReplicationJournal, ReplicationPayload,
-        ReplicationRejectResponse, WireMutation, REPLICATION_PAYLOAD_SCHEMA_VERSION,
+        decode_snapshot_payload, encode_commit_mode, encode_payload_frame,
+        encode_replication_payload, encode_snapshot_payload, parse_replication_reject,
+        ErrorResponse, ReplicationJournal, ReplicationPayload, ReplicationRejectResponse,
+        SnapshotPayload, WireMutation, WireSnapshotRow, REPLICATION_PAYLOAD_SCHEMA_VERSION,
+        SNAPSHOT_PAYLOAD_SCHEMA_VERSION,
     };
     use bytes::Bytes;
     use vectordb::index::MutationCommitMode;
@@ -1860,6 +2149,25 @@ mod tests {
         encode_replication_payload(&payload).expect("encode payload")
     }
 
+    fn build_snapshot_payload(applied_seq: u64, term: u64) -> Bytes {
+        let payload = SnapshotPayload {
+            schema_version: SNAPSHOT_PAYLOAD_SCHEMA_VERSION,
+            applied_seq,
+            term,
+            rows: vec![
+                WireSnapshotRow {
+                    id: 1,
+                    values: vec![0.1, 0.2, 0.3],
+                },
+                WireSnapshotRow {
+                    id: 2,
+                    values: vec![0.4, 0.5, 0.6],
+                },
+            ],
+        };
+        encode_snapshot_payload(&payload).expect("encode snapshot")
+    }
+
     #[test]
     fn replication_payload_detects_checksum_corruption() {
         let encoded = build_payload(1, 10);
@@ -1875,6 +2183,17 @@ mod tests {
         let encoded = encode_payload_frame(&entries).expect("encode frame");
         let decoded = decode_payload_frame(encoded.as_ref()).expect("decode frame");
         assert_eq!(entries, decoded);
+    }
+
+    #[test]
+    fn snapshot_payload_roundtrip() {
+        let encoded = build_snapshot_payload(3, 7);
+        let decoded = decode_snapshot_payload(encoded.as_ref()).expect("decode snapshot payload");
+        assert_eq!(decoded.applied_seq, 3);
+        assert_eq!(decoded.term, 7);
+        assert_eq!(decoded.rows.len(), 2);
+        assert_eq!(decoded.rows[0].id, 1);
+        assert_eq!(decoded.rows[1].values, vec![0.4, 0.5, 0.6]);
     }
 
     #[test]
@@ -1958,5 +2277,31 @@ mod tests {
         assert!(journal.read_entry(1).expect("read seq 1").is_none());
         assert!(journal.read_entry(2).expect("read seq 2").is_some());
         assert!(journal.read_entry(3).expect("read seq 3").is_some());
+    }
+
+    #[test]
+    fn replication_journal_reset_to_applied() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let payload_1 = build_payload(1, 1);
+        let payload_2 = build_payload(2, 1);
+
+        let mut journal = ReplicationJournal::open(root, 8).expect("open journal");
+        journal
+            .append_entry(1, payload_1.as_ref(), true)
+            .expect("append seq 1");
+        journal.mark_applied(1, 1, true).expect("mark seq 1");
+        journal
+            .append_entry(2, payload_2.as_ref(), true)
+            .expect("append seq 2");
+        journal.mark_applied(2, 1, true).expect("mark seq 2");
+
+        journal.reset_to_applied(9, 3, true).expect("reset journal");
+        assert_eq!(journal.first_seq(), 10);
+        assert_eq!(journal.next_seq(), 10);
+        assert_eq!(journal.last_applied_seq(), 9);
+        assert_eq!(journal.max_term_seen(), 3);
+        assert!(journal.read_entry(1).expect("read seq 1").is_none());
+        assert!(journal.read_entry(2).expect("read seq 2").is_none());
     }
 }

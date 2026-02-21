@@ -42,3 +42,27 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7632`
 - `search_qps_ratio=3.1921`
+
+## Step 2 (`replication-snapshot-fallback`)
+
+Change:
+- Added follower snapshot install fallback when replication catch-up falls behind compacted journal window.
+- Added deterministic journal reset-to-applied after snapshot install.
+- Added integration scenario that stops a follower, forces log compaction, then validates snapshot recovery and correct query results on all replicas.
+
+SPFresh:
+- `update_qps=159289.57`
+- `search_qps=2584.68`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=125083.06`
+- `search_qps=871.81`
+- `recall_at_k=0.4765`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.2735`
+- `search_qps_ratio=2.9647`
+
+Note:
+- This step changes deploy replication behavior, not ANN kernels. Throughput variance here is from host-state noise during repeated benchmark runs.

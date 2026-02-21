@@ -1,3 +1,7 @@
+use std::sync::OnceLock;
+
+type BinaryKernel = fn(&[f32], &[f32]) -> f32;
+
 #[inline]
 fn squared_l2_scalar(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -52,47 +56,13 @@ fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 pub fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            // SAFETY: guarded by runtime feature detection.
-            return unsafe { squared_l2_avx2_fma(a, b) };
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            // SAFETY: guarded by runtime feature detection.
-            return unsafe { squared_l2_neon(a, b) };
-        }
-    }
-
-    squared_l2_scalar(a, b)
+    squared_l2_dispatch()(a, b)
 }
 
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            // SAFETY: guarded by runtime feature detection.
-            return unsafe { dot_avx2_fma(a, b) };
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            // SAFETY: guarded by runtime feature detection.
-            return unsafe { dot_neon(a, b) };
-        }
-    }
-
-    dot_scalar(a, b)
+    dot_dispatch()(a, b)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -134,6 +104,44 @@ unsafe fn squared_l2_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn squared_l2_avx2(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        __m256, _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+        _mm256_sub_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        __m256, _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+        _mm256_sub_ps,
+    };
+
+    let mut i = 0usize;
+    let mut sum: __m256 = _mm256_setzero_ps();
+    while i + 8 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+        let d = _mm256_sub_ps(va, vb);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(d, d));
+        i += 8;
+    }
+
+    let mut lanes = [0f32; 8];
+    // SAFETY: writing exactly 8 f32 lanes to a properly sized stack array.
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), sum) };
+    let mut out = lanes.iter().sum::<f32>();
+    while i < a.len() {
+        let d = a[i] - b[i];
+        out += d * d;
+        i += 1;
+    }
+    out
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86")]
@@ -153,6 +161,40 @@ unsafe fn dot_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
         // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
         let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
         sum = _mm256_fmadd_ps(va, vb, sum);
+        i += 8;
+    }
+
+    let mut lanes = [0f32; 8];
+    // SAFETY: writing exactly 8 f32 lanes to a properly sized stack array.
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), sum) };
+    let mut out = lanes.iter().sum::<f32>();
+    while i < a.len() {
+        out += a[i] * b[i];
+        i += 1;
+    }
+    out
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        __m256, _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        __m256, _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+
+    let mut i = 0usize;
+    let mut sum: __m256 = _mm256_setzero_ps();
+    while i + 8 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
         i += 8;
     }
 
@@ -215,6 +257,100 @@ unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
         i += 1;
     }
     out
+}
+
+#[inline]
+fn squared_l2_dispatch() -> BinaryKernel {
+    static DISPATCH: OnceLock<BinaryKernel> = OnceLock::new();
+    *DISPATCH.get_or_init(resolve_squared_l2_dispatch)
+}
+
+#[inline]
+fn dot_dispatch() -> BinaryKernel {
+    static DISPATCH: OnceLock<BinaryKernel> = OnceLock::new();
+    *DISPATCH.get_or_init(resolve_dot_dispatch)
+}
+
+#[inline]
+fn resolve_squared_l2_dispatch() -> BinaryKernel {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return squared_l2_avx2_fma_entry;
+        }
+        if std::is_x86_feature_detected!("avx2") {
+            return squared_l2_avx2_entry;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return squared_l2_neon_entry;
+        }
+    }
+    squared_l2_scalar
+}
+
+#[inline]
+fn resolve_dot_dispatch() -> BinaryKernel {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return dot_avx2_fma_entry;
+        }
+        if std::is_x86_feature_detected!("avx2") {
+            return dot_avx2_entry;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return dot_neon_entry;
+        }
+    }
+    dot_scalar
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn squared_l2_avx2_fma_entry(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: dispatch resolver only selects this entrypoint when CPU supports avx2+fma.
+    unsafe { squared_l2_avx2_fma(a, b) }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn squared_l2_avx2_entry(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: dispatch resolver only selects this entrypoint when CPU supports avx2.
+    unsafe { squared_l2_avx2(a, b) }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn dot_avx2_fma_entry(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: dispatch resolver only selects this entrypoint when CPU supports avx2+fma.
+    unsafe { dot_avx2_fma(a, b) }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn dot_avx2_entry(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: dispatch resolver only selects this entrypoint when CPU supports avx2.
+    unsafe { dot_avx2(a, b) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn squared_l2_neon_entry(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: dispatch resolver only selects this entrypoint when CPU supports neon.
+    unsafe { squared_l2_neon(a, b) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_neon_entry(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: dispatch resolver only selects this entrypoint when CPU supports neon.
+    unsafe { dot_neon(a, b) }
 }
 
 pub fn norm2(v: &[f32]) -> f32 {

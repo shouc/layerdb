@@ -82,3 +82,29 @@ fn mixed_mutation_batch_last_write_wins() -> anyhow::Result<()> {
     assert_eq!(got[0].id, 1);
     Ok(())
 }
+
+#[test]
+fn mixed_mutation_batch_owned_last_write_wins() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig::default();
+
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        let result = idx.try_apply_batch_owned(vec![
+            VectorMutation::Upsert(VectorRecord::new(1, vec![0.1; cfg.spfresh.dim])),
+            VectorMutation::Upsert(VectorRecord::new(2, vec![0.2; cfg.spfresh.dim])),
+            VectorMutation::Delete { id: 1 },
+            VectorMutation::Upsert(VectorRecord::new(1, vec![0.15; cfg.spfresh.dim])),
+            VectorMutation::Delete { id: 2 },
+        ])?;
+        assert_eq!(result.upserts, 1);
+        assert_eq!(result.deletes, 0);
+        idx.close()?;
+    }
+
+    let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
+    assert_eq!(idx.len(), 1);
+    let got = idx.search(&vec![0.15; 64], 1);
+    assert_eq!(got[0].id, 1);
+    Ok(())
+}

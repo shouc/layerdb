@@ -215,6 +215,18 @@ impl SpFreshLayerDbIndex {
         out_rev
     }
 
+    fn dedup_last_mutations_owned(mutations: Vec<VectorMutation>) -> Vec<VectorMutation> {
+        let mut seen = HashSet::with_capacity(mutations.len());
+        let mut out_rev = Vec::with_capacity(mutations.len());
+        for mutation in mutations.into_iter().rev() {
+            if seen.insert(mutation.id()) {
+                out_rev.push(mutation);
+            }
+        }
+        out_rev.reverse();
+        out_rev
+    }
+
     fn load_diskmeta_states_for_ids(
         &self,
         generation: u64,
@@ -768,6 +780,33 @@ impl SpFreshLayerDbIndex {
             return Ok(VectorMutationBatchResult::default());
         }
         let deduped = Self::dedup_last_mutations(mutations);
+        self.try_apply_batch_deduped_with_commit_mode(deduped, commit_mode)
+    }
+
+    pub fn try_apply_batch_owned(
+        &mut self,
+        mutations: Vec<VectorMutation>,
+    ) -> anyhow::Result<VectorMutationBatchResult> {
+        self.try_apply_batch_owned_with_commit_mode(mutations, MutationCommitMode::Durable)
+    }
+
+    pub fn try_apply_batch_owned_with_commit_mode(
+        &mut self,
+        mutations: Vec<VectorMutation>,
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<VectorMutationBatchResult> {
+        if mutations.is_empty() {
+            return Ok(VectorMutationBatchResult::default());
+        }
+        let deduped = Self::dedup_last_mutations_owned(mutations);
+        self.try_apply_batch_deduped_with_commit_mode(deduped, commit_mode)
+    }
+
+    fn try_apply_batch_deduped_with_commit_mode(
+        &mut self,
+        deduped: Vec<VectorMutation>,
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<VectorMutationBatchResult> {
         let mut upserts = Vec::new();
         let mut deletes = Vec::new();
         for mutation in deduped {
@@ -776,7 +815,7 @@ impl SpFreshLayerDbIndex {
                 VectorMutation::Delete { id } => deletes.push(id),
             }
         }
-        let upserted = self.try_upsert_batch_with_commit_mode(&upserts, commit_mode)?;
+        let upserted = self.try_upsert_batch_owned_with_commit_mode(upserts, commit_mode)?;
         let deleted = self.try_delete_batch_with_commit_mode(&deletes, commit_mode)?;
         Ok(VectorMutationBatchResult {
             upserts: upserted,

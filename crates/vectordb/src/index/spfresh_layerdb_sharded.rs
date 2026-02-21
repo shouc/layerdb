@@ -141,6 +141,42 @@ impl SpFreshLayerDbShardedIndex {
         (id as usize) % self.cfg.shard_count
     }
 
+    fn dedup_last_mutations_partitioned(
+        &self,
+        mutations: &[VectorMutation],
+    ) -> Vec<Vec<VectorMutation>> {
+        let mut seen = HashSet::with_capacity(mutations.len());
+        let mut partitioned_rev = vec![Vec::<VectorMutation>::new(); self.cfg.shard_count];
+        for mutation in mutations.iter().rev() {
+            let id = mutation.id();
+            if seen.insert(id) {
+                partitioned_rev[self.shard_for_id(id)].push(mutation.clone());
+            }
+        }
+        for shard_mutations in &mut partitioned_rev {
+            shard_mutations.reverse();
+        }
+        partitioned_rev
+    }
+
+    fn dedup_last_mutations_partitioned_owned(
+        &self,
+        mutations: Vec<VectorMutation>,
+    ) -> Vec<Vec<VectorMutation>> {
+        let mut seen = HashSet::with_capacity(mutations.len());
+        let mut partitioned_rev = vec![Vec::<VectorMutation>::new(); self.cfg.shard_count];
+        for mutation in mutations.into_iter().rev() {
+            let id = mutation.id();
+            if seen.insert(id) {
+                partitioned_rev[self.shard_for_id(id)].push(mutation);
+            }
+        }
+        for shard_mutations in &mut partitioned_rev {
+            shard_mutations.reverse();
+        }
+        partitioned_rev
+    }
+
     fn merge_neighbors(mut all: Vec<Neighbor>, k: usize) -> Vec<Neighbor> {
         if k == 0 || all.is_empty() {
             return Vec::new();
@@ -361,32 +397,57 @@ impl SpFreshLayerDbShardedIndex {
         if mutations.is_empty() {
             return Ok(VectorMutationBatchResult::default());
         }
-        let mut seen = HashSet::with_capacity(mutations.len());
-        let mut deduped_rev = Vec::with_capacity(mutations.len());
-        for mutation in mutations.iter().rev() {
-            let id = match mutation {
-                VectorMutation::Upsert(row) => row.id,
-                VectorMutation::Delete { id } => *id,
-            };
-            if seen.insert(id) {
-                deduped_rev.push(mutation.clone());
-            }
+        let partitioned = self.dedup_last_mutations_partitioned(mutations);
+        self.try_apply_batch_partitioned_with_commit_mode(partitioned, commit_mode)
+    }
+
+    pub fn try_apply_batch_owned(
+        &mut self,
+        mutations: Vec<VectorMutation>,
+    ) -> anyhow::Result<VectorMutationBatchResult> {
+        self.try_apply_batch_owned_with_commit_mode(mutations, MutationCommitMode::Durable)
+    }
+
+    pub fn try_apply_batch_owned_with_commit_mode(
+        &mut self,
+        mutations: Vec<VectorMutation>,
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<VectorMutationBatchResult> {
+        if mutations.is_empty() {
+            return Ok(VectorMutationBatchResult::default());
         }
-        deduped_rev.reverse();
-        let mut upserts = Vec::new();
-        let mut deletes = Vec::new();
-        for mutation in deduped_rev {
-            match mutation {
-                VectorMutation::Upsert(row) => upserts.push(row),
-                VectorMutation::Delete { id } => deletes.push(id),
-            }
+        let partitioned = self.dedup_last_mutations_partitioned_owned(mutations);
+        self.try_apply_batch_partitioned_with_commit_mode(partitioned, commit_mode)
+    }
+
+    fn try_apply_batch_partitioned_with_commit_mode(
+        &mut self,
+        partitioned: Vec<Vec<VectorMutation>>,
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<VectorMutationBatchResult> {
+        let results: Vec<anyhow::Result<VectorMutationBatchResult>> = self
+            .shards
+            .par_iter_mut()
+            .zip(partitioned.into_par_iter())
+            .enumerate()
+            .map(|(shard_id, (shard, chunk))| {
+                if chunk.is_empty() {
+                    Ok(VectorMutationBatchResult::default())
+                } else {
+                    shard
+                        .try_apply_batch_owned_with_commit_mode(chunk, commit_mode)
+                        .with_context(|| format!("apply batch shard {}", shard_id))
+                }
+            })
+            .collect();
+
+        let mut aggregated = VectorMutationBatchResult::default();
+        for result in results {
+            let shard = result?;
+            aggregated.upserts += shard.upserts;
+            aggregated.deletes += shard.deletes;
         }
-        let upserted = self.try_upsert_batch_with_commit_mode(&upserts, commit_mode)?;
-        let deleted = self.try_delete_batch_with_commit_mode(&deletes, commit_mode)?;
-        Ok(VectorMutationBatchResult {
-            upserts: upserted,
-            deletes: deleted,
-        })
+        Ok(aggregated)
     }
 
     pub fn force_rebuild(&self) -> anyhow::Result<()> {
@@ -614,6 +675,43 @@ mod tests {
         {
             let mut idx = SpFreshLayerDbShardedIndex::open(dir.path(), cfg.clone())?;
             let result = idx.try_apply_batch(&[
+                VectorMutation::Upsert(crate::types::VectorRecord::new(
+                    1,
+                    vec![0.1; cfg.shard.spfresh.dim],
+                )),
+                VectorMutation::Upsert(crate::types::VectorRecord::new(
+                    2,
+                    vec![0.2; cfg.shard.spfresh.dim],
+                )),
+                VectorMutation::Delete { id: 1 },
+                VectorMutation::Upsert(crate::types::VectorRecord::new(
+                    1,
+                    vec![0.15; cfg.shard.spfresh.dim],
+                )),
+                VectorMutation::Delete { id: 2 },
+            ])?;
+            assert_eq!(result.upserts, 1);
+            assert_eq!(result.deletes, 0);
+            idx.close()?;
+        }
+
+        let idx = SpFreshLayerDbShardedIndex::open(dir.path(), cfg)?;
+        assert_eq!(idx.len(), 1);
+        let got = idx.search(&vec![0.15; 64], 1);
+        assert_eq!(got[0].id, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn sharded_mixed_mutation_batch_owned_last_write_wins() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let cfg = SpFreshLayerDbShardedConfig {
+            shard_count: 4,
+            ..Default::default()
+        };
+        {
+            let mut idx = SpFreshLayerDbShardedIndex::open(dir.path(), cfg.clone())?;
+            let result = idx.try_apply_batch_owned(vec![
                 VectorMutation::Upsert(crate::types::VectorRecord::new(
                     1,
                     vec![0.1; cfg.shard.spfresh.dim],

@@ -60,7 +60,7 @@ pub enum VectorMutation {
 }
 
 impl VectorMutation {
-    fn id(&self) -> u64 {
+    pub(crate) fn id(&self) -> u64 {
         match self {
             Self::Upsert(row) => row.id,
             Self::Delete { id } => *id,

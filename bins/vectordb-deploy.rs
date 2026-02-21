@@ -653,7 +653,7 @@ async fn apply_local_mutations(
         let mut index = index
             .write()
             .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
-        index.try_apply_batch_with_commit_mode(&mutations, mode)
+        index.try_apply_batch_owned_with_commit_mode(mutations, mode)
     })
     .await
     .map_err(|err| {

@@ -169,8 +169,9 @@ impl SpFreshLayerDbShardedIndex {
     }
 
     fn validate_rows_dims(&self, rows: &[VectorRecord]) -> anyhow::Result<()> {
-        let expected_dim = self.cfg.shard.spfresh.dim;
         for row in rows {
+            let shard_id = self.shard_for_id(row.id);
+            let expected_dim = self.shards[shard_id].vector_dim();
             if row.values.len() != expected_dim {
                 anyhow::bail!(
                     "invalid vector dim for id={}: got {}, expected {}",
@@ -712,6 +713,7 @@ impl VectorIndex for SpFreshLayerDbShardedIndex {
 
 #[cfg(test)]
 mod tests {
+    use layerdb::DbOptions;
     use tempfile::TempDir;
 
     use crate::index::VectorMutation;
@@ -862,6 +864,33 @@ mod tests {
         ];
         assert!(idx.try_upsert_batch(&bad_then_good).is_err());
         assert!(idx.try_upsert_batch_owned(bad_then_good).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sharded_open_existing_uses_persisted_dim_for_validation() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let mut cfg = SpFreshLayerDbShardedConfig {
+            shard_count: 2,
+            ..Default::default()
+        };
+        cfg.shard.spfresh.dim = 16;
+
+        {
+            let mut idx = SpFreshLayerDbShardedIndex::open(dir.path(), cfg.clone())?;
+            idx.try_upsert(1, vec![0.1; cfg.shard.spfresh.dim])?;
+            idx.close()?;
+        }
+
+        let mut idx =
+            SpFreshLayerDbShardedIndex::open_existing(dir.path(), 2, DbOptions::default())?;
+        assert_eq!(
+            idx.try_upsert_batch(&[crate::types::VectorRecord::new(2, vec![0.2; 16])])?,
+            1
+        );
+        assert!(idx
+            .try_upsert_batch(&[crate::types::VectorRecord::new(3, vec![0.3; 64])])
+            .is_err());
         Ok(())
     }
 

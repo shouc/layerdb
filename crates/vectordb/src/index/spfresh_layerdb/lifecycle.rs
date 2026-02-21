@@ -30,6 +30,10 @@ impl SpFreshLayerDbIndex {
         self.cfg.memory_mode
     }
 
+    pub(crate) fn vector_dim(&self) -> usize {
+        self.cfg.spfresh.dim
+    }
+
     pub fn health_check(&self) -> anyhow::Result<SpFreshLayerDbStats> {
         ensure_wal_exists(&self.db_path)?;
         ensure_metadata(&self.db, &self.cfg)?;

@@ -168,6 +168,21 @@ impl SpFreshLayerDbShardedIndex {
         (id as usize) % self.cfg.shard_count
     }
 
+    fn validate_rows_dims(&self, rows: &[VectorRecord]) -> anyhow::Result<()> {
+        let expected_dim = self.cfg.shard.spfresh.dim;
+        for row in rows {
+            if row.values.len() != expected_dim {
+                anyhow::bail!(
+                    "invalid vector dim for id={}: got {}, expected {}",
+                    row.id,
+                    row.values.len(),
+                    expected_dim
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn dedup_last_mutations_partitioned(
         &self,
         mutations: &[VectorMutation],
@@ -337,6 +352,7 @@ impl SpFreshLayerDbShardedIndex {
         if rows.is_empty() {
             return Ok(0);
         }
+        self.validate_rows_dims(rows)?;
         if rows.len() == 1 {
             let shard_id = self.shard_for_id(rows[0].id);
             return self.shards[shard_id]
@@ -384,6 +400,7 @@ impl SpFreshLayerDbShardedIndex {
         if rows.is_empty() {
             return Ok(0);
         }
+        self.validate_rows_dims(rows.as_slice())?;
         if rows.len() == 1 {
             let row = rows.into_iter().next().expect("rows.len() == 1");
             let shard_id = self.shard_for_id(row.id);
@@ -827,6 +844,24 @@ mod tests {
 
         let got = idx.search(&vec![0.75; 64], 1);
         assert_eq!(got[0].id, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn sharded_upsert_batch_rejects_invalid_row_even_if_overwritten() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let cfg = SpFreshLayerDbShardedConfig {
+            shard_count: 4,
+            ..Default::default()
+        };
+        let mut idx = SpFreshLayerDbShardedIndex::open(dir.path(), cfg.clone())?;
+
+        let bad_then_good = vec![
+            crate::types::VectorRecord::new(11, vec![0.1; cfg.shard.spfresh.dim - 1]),
+            crate::types::VectorRecord::new(11, vec![0.2; cfg.shard.spfresh.dim]),
+        ];
+        assert!(idx.try_upsert_batch(&bad_then_good).is_err());
+        assert!(idx.try_upsert_batch_owned(bad_then_good).is_err());
         Ok(())
     }
 

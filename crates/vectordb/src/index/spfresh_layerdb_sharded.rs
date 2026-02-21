@@ -1,3 +1,4 @@
+use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -49,6 +50,32 @@ pub struct SpFreshLayerDbShardedIndex {
     root: PathBuf,
     cfg: SpFreshLayerDbShardedConfig,
     shards: Vec<SpFreshLayerDbIndex>,
+}
+
+#[derive(Clone, Debug)]
+struct HeapNeighbor(Neighbor);
+
+impl PartialEq for HeapNeighbor {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id && self.0.distance.to_bits() == other.0.distance.to_bits()
+    }
+}
+
+impl Eq for HeapNeighbor {}
+
+impl PartialOrd for HeapNeighbor {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapNeighbor {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .distance
+            .total_cmp(&other.0.distance)
+            .then_with(|| self.0.id.cmp(&other.0.id))
+    }
 }
 
 impl SpFreshLayerDbShardedIndex {
@@ -220,10 +247,22 @@ impl SpFreshLayerDbShardedIndex {
         if k == 0 || all.is_empty() {
             return Vec::new();
         }
-        let mut top = Vec::with_capacity(k);
+        let mut heap = BinaryHeap::with_capacity(k);
         for neighbor in all.drain(..) {
-            Self::push_neighbor_topk(&mut top, neighbor, k);
+            if heap.len() < k {
+                heap.push(HeapNeighbor(neighbor));
+                continue;
+            }
+            let replace = heap
+                .peek()
+                .map(|worst| Self::neighbor_cmp(&neighbor, &worst.0).is_lt())
+                .unwrap_or(true);
+            if replace {
+                let _ = heap.pop();
+                heap.push(HeapNeighbor(neighbor));
+            }
         }
+        let mut top: Vec<Neighbor> = heap.into_iter().map(|entry| entry.0).collect();
         top.sort_by(Self::neighbor_cmp);
         top
     }
@@ -232,25 +271,6 @@ impl SpFreshLayerDbShardedIndex {
         a.distance
             .total_cmp(&b.distance)
             .then_with(|| a.id.cmp(&b.id))
-    }
-
-    fn push_neighbor_topk(top: &mut Vec<Neighbor>, candidate: Neighbor, k: usize) {
-        if k == 0 {
-            return;
-        }
-        if top.len() < k {
-            top.push(candidate);
-            return;
-        }
-        let mut worst_idx = 0usize;
-        for idx in 1..top.len() {
-            if Self::neighbor_cmp(&top[idx], &top[worst_idx]).is_gt() {
-                worst_idx = idx;
-            }
-        }
-        if Self::neighbor_cmp(&candidate, &top[worst_idx]).is_lt() {
-            top[worst_idx] = candidate;
-        }
     }
 
     pub fn try_bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
@@ -600,9 +620,37 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::index::VectorMutation;
-    use crate::types::VectorIndex;
+    use crate::types::{Neighbor, VectorIndex};
 
     use super::{SpFreshLayerDbShardedConfig, SpFreshLayerDbShardedIndex};
+
+    #[test]
+    fn merge_neighbors_keeps_best_k() {
+        let merged = SpFreshLayerDbShardedIndex::merge_neighbors(
+            vec![
+                Neighbor {
+                    id: 4,
+                    distance: 0.4,
+                },
+                Neighbor {
+                    id: 2,
+                    distance: 0.2,
+                },
+                Neighbor {
+                    id: 3,
+                    distance: 0.3,
+                },
+                Neighbor {
+                    id: 1,
+                    distance: 0.1,
+                },
+            ],
+            2,
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, 1);
+        assert_eq!(merged[1].id, 2);
+    }
 
     #[test]
     fn sharded_index_round_trip_across_restart() -> anyhow::Result<()> {

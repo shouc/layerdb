@@ -113,16 +113,31 @@ impl SpFreshLayerDbIndex {
             return Ok(());
         }
         let start_seq = self.wal_next_seq.load(Ordering::Relaxed);
+        let entry_count = entries.len();
         let mut next_seq = start_seq;
-        let mut ops = Vec::new();
-        for (entry, mut row_ops) in entries {
+        let mut ops = if entry_count == 1 {
+            let mut iter = entries.into_iter();
+            let (entry, mut row_ops) = iter.next().expect("entry_count checked non-zero");
+            let mut out = Vec::with_capacity(row_ops.len() + 1 + trailer_ops.len() + 1);
             let wal_value = encode_wal_entry(&entry)?;
             row_ops.push(layerdb::Op::put(wal_key(next_seq), wal_value));
-            ops.extend(row_ops);
+            out.append(&mut row_ops);
             next_seq = next_seq
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("spfresh wal sequence overflow"))?;
-        }
+            out
+        } else {
+            let mut out = Vec::new();
+            for (entry, mut row_ops) in entries {
+                let wal_value = encode_wal_entry(&entry)?;
+                row_ops.push(layerdb::Op::put(wal_key(next_seq), wal_value));
+                out.append(&mut row_ops);
+                next_seq = next_seq
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("spfresh wal sequence overflow"))?;
+            }
+            out
+        };
         let wal_next = bincode::serialize(&next_seq).context("encode spfresh wal next seq")?;
         ops.push(layerdb::Op::put(
             config::META_INDEX_WAL_NEXT_SEQ_KEY,

@@ -249,3 +249,24 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7833`
 - `search_qps_ratio=3.0780`
+
+## Step 11 (`wal-single-entry-persist-fastpath`)
+
+Change:
+- Added a single-entry fast path in `persist_with_wal_batch_ops(...)` for the dominant
+  update/delete case where one WAL entry wraps one row-op batch.
+- Preallocates the exact operation buffer size and avoids generic multi-entry merge overhead.
+
+SPFresh:
+- `update_qps=208344.18`
+- `search_qps=2761.28`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=119948.12`
+- `search_qps=686.17`
+- `recall_at_k=0.4800`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.7370`
+- `search_qps_ratio=4.0242`

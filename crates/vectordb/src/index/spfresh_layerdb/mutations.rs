@@ -410,7 +410,11 @@ impl SpFreshLayerDbIndex {
             };
             let mut posting_event_next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(3));
-            let mut touched_ids = Vec::with_capacity(mutations.len());
+            let touched_ids = if use_fast_path {
+                Vec::new()
+            } else {
+                ids.clone()
+            };
             let mut new_postings = HashMap::with_capacity(mutations.len());
             let mut dirty_postings = FxHashSet::with_capacity_and_hasher(
                 mutations.len().saturating_mul(2),
@@ -455,7 +459,6 @@ impl SpFreshLayerDbIndex {
                             ));
                         }
                     }
-                    touched_ids.push(*id);
                 } else {
                     ephemeral_deltas.push((*id, old_posting, new_posting));
                 }
@@ -513,12 +516,7 @@ impl SpFreshLayerDbIndex {
                 Some(Arc::new(index.clone()))
             };
             self.diskmeta_search_snapshot.store(snapshot);
-            {
-                let mut cache = lock_mutex(&self.vector_cache);
-                for (id, vector) in &mutations {
-                    cache.put(*id, vector.clone());
-                }
-            }
+            let mutation_count = mutations.len();
             {
                 let mut members_cache = lock_mutex(&self.posting_members_cache);
                 for posting_id in dirty_postings {
@@ -526,13 +524,22 @@ impl SpFreshLayerDbIndex {
                 }
             }
             if use_fast_path {
+                let mut cache = lock_mutex(&self.vector_cache);
+                for (id, vector) in &mutations {
+                    cache.put(*id, vector.clone());
+                }
                 self.apply_ephemeral_row_upserts(&mutations, &new_postings);
                 self.apply_ephemeral_posting_upsert_deltas(ephemeral_deltas);
+            } else {
+                let mut cache = lock_mutex(&self.vector_cache);
+                for (id, vector) in mutations {
+                    cache.put(id, vector);
+                }
             }
-            for _ in 0..mutations.len() {
+            for _ in 0..mutation_count {
                 self.stats.inc_upserts();
             }
-            return Ok(mutations.len());
+            return Ok(mutation_count);
         }
 
         if !self.use_nondurable_fast_path() {
@@ -652,7 +659,11 @@ impl SpFreshLayerDbIndex {
                 _ => anyhow::bail!("diskmeta delete batch called for non-diskmeta index"),
             };
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(2));
-            let mut touched_ids = Vec::with_capacity(mutations.len());
+            let touched_ids = if use_fast_path {
+                Vec::new()
+            } else {
+                mutations.clone()
+            };
             let mut deleted = 0usize;
             let mut dirty_postings =
                 FxHashSet::with_capacity_and_hasher(mutations.len(), Default::default());
@@ -680,9 +691,6 @@ impl SpFreshLayerDbIndex {
                             posting_member_event_tombstone_value(*id)?,
                         ));
                     }
-                }
-                if !use_fast_path {
-                    touched_ids.push(*id);
                 }
                 if shadow.apply_delete(old) {
                     deleted = deleted.saturating_add(1);

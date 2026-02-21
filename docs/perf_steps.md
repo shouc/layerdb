@@ -204,3 +204,26 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7792`
 - `search_qps_ratio=3.5768`
+
+## Step 9 (`diskmeta-upsert-delete-hotloop-allocation-trim`)
+
+Change:
+- In diskmeta upsert/delete mutation paths, removed per-row `touched_ids.push(...)` work by
+  reusing prebuilt id vectors for WAL touch-batch payloads.
+- In diskmeta upsert path, removed one full vector clone pass on the common durable/acknowledged
+  path by moving mutation vectors directly into cache insertion once persistence succeeds.
+- Kept fast-path behavior unchanged and validated with full SPFresh test suite and strict clippy.
+
+SPFresh:
+- `update_qps=173760.68`
+- `search_qps=2723.82`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=114612.36`
+- `search_qps=662.83`
+- `recall_at_k=0.4680`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.5161`
+- `search_qps_ratio=4.1094`

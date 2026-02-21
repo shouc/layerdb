@@ -64,7 +64,7 @@ fn offheap_diskmeta_ignores_unsafe_fast_path_and_keeps_restart_durability() -> a
 
     let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
     assert_eq!(idx.len(), 1);
-    let got = idx.search(&vec![1.0; 16], 1);
+    let got = idx.search(&[1.0; 16], 1);
     assert_eq!(got[0].id, 2);
     Ok(())
 }
@@ -72,9 +72,14 @@ fn offheap_diskmeta_ignores_unsafe_fast_path_and_keeps_restart_durability() -> a
 #[test]
 fn acknowledged_commit_mode_round_trip_on_clean_restart() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
-    let mut cfg = SpFreshLayerDbConfig::default();
-    cfg.write_sync = false;
-    cfg.db_options.fsync_writes = false;
+    let cfg = SpFreshLayerDbConfig {
+        write_sync: false,
+        db_options: layerdb::DbOptions {
+            fsync_writes: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
     {
         let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
@@ -95,7 +100,7 @@ fn acknowledged_commit_mode_round_trip_on_clean_restart() -> anyhow::Result<()> 
 
     let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
     assert_eq!(idx.len(), 1);
-    let got = idx.search(&vec![0.2; 64], 1);
+    let got = idx.search(&[0.2; 64], 1);
     assert_eq!(got[0].id, 2);
     Ok(())
 }

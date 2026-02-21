@@ -1,9 +1,9 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use layerdb::DbOptions;
 use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Neighbor, VectorIndex, VectorRecord};
@@ -145,7 +145,7 @@ impl SpFreshLayerDbShardedIndex {
         &self,
         mutations: &[VectorMutation],
     ) -> Vec<Vec<VectorMutation>> {
-        let mut seen = HashSet::with_capacity(mutations.len());
+        let mut seen = FxHashSet::with_capacity_and_hasher(mutations.len(), Default::default());
         let mut partitioned_rev = vec![Vec::<VectorMutation>::new(); self.cfg.shard_count];
         for mutation in mutations.iter().rev() {
             let id = mutation.id();
@@ -163,7 +163,7 @@ impl SpFreshLayerDbShardedIndex {
         &self,
         mutations: Vec<VectorMutation>,
     ) -> Vec<Vec<VectorMutation>> {
-        let mut seen = HashSet::with_capacity(mutations.len());
+        let mut seen = FxHashSet::with_capacity_and_hasher(mutations.len(), Default::default());
         let mut partitioned_rev = vec![Vec::<VectorMutation>::new(); self.cfg.shard_count];
         for mutation in mutations.into_iter().rev() {
             let id = mutation.id();
@@ -178,7 +178,7 @@ impl SpFreshLayerDbShardedIndex {
     }
 
     fn dedup_last_rows_partitioned(&self, rows: &[VectorRecord]) -> Vec<Vec<VectorRecord>> {
-        let mut seen = HashSet::with_capacity(rows.len());
+        let mut seen = FxHashSet::with_capacity_and_hasher(rows.len(), Default::default());
         let mut partitioned_rev = vec![Vec::<VectorRecord>::new(); self.cfg.shard_count];
         for row in rows.iter().rev() {
             if seen.insert(row.id) {
@@ -192,7 +192,7 @@ impl SpFreshLayerDbShardedIndex {
     }
 
     fn dedup_last_rows_partitioned_owned(&self, rows: Vec<VectorRecord>) -> Vec<Vec<VectorRecord>> {
-        let mut seen = HashSet::with_capacity(rows.len());
+        let mut seen = FxHashSet::with_capacity_and_hasher(rows.len(), Default::default());
         let mut partitioned_rev = vec![Vec::<VectorRecord>::new(); self.cfg.shard_count];
         for row in rows.into_iter().rev() {
             if seen.insert(row.id) {
@@ -206,7 +206,7 @@ impl SpFreshLayerDbShardedIndex {
     }
 
     fn dedup_ids_partitioned(&self, ids: &[u64]) -> Vec<Vec<u64>> {
-        let mut seen = HashSet::with_capacity(ids.len());
+        let mut seen = FxHashSet::with_capacity_and_hasher(ids.len(), Default::default());
         let mut partitioned = vec![Vec::<u64>::new(); self.cfg.shard_count];
         for id in ids {
             if seen.insert(*id) {

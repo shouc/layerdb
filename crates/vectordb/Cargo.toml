@@ -19,6 +19,7 @@ rand = "0.8"
 rayon = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rkyv = { version = "0.7", features = ["validation"] }
+rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 layerdb = { path = "../layerdb" }

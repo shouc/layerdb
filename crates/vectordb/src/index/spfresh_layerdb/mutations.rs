@@ -1,4 +1,5 @@
 use super::*;
+use rustc_hash::FxHashSet;
 
 impl SpFreshLayerDbIndex {
     pub fn bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
@@ -169,7 +170,7 @@ impl SpFreshLayerDbIndex {
         Ok(())
     }
     fn dedup_last_upserts(rows: &[VectorRecord]) -> Vec<(u64, Vec<f32>)> {
-        let mut seen = HashSet::with_capacity(rows.len());
+        let mut seen = FxHashSet::with_capacity_and_hasher(rows.len(), Default::default());
         let mut out_rev = Vec::with_capacity(rows.len());
         for row in rows.iter().rev() {
             if seen.insert(row.id) {
@@ -181,7 +182,7 @@ impl SpFreshLayerDbIndex {
     }
 
     fn dedup_last_upserts_owned(rows: Vec<VectorRecord>) -> Vec<(u64, Vec<f32>)> {
-        let mut seen = HashSet::with_capacity(rows.len());
+        let mut seen = FxHashSet::with_capacity_and_hasher(rows.len(), Default::default());
         let mut out_rev = Vec::with_capacity(rows.len());
         for row in rows.into_iter().rev() {
             if seen.insert(row.id) {
@@ -193,7 +194,7 @@ impl SpFreshLayerDbIndex {
     }
 
     fn dedup_ids(ids: &[u64]) -> Vec<u64> {
-        let mut seen = HashSet::with_capacity(ids.len());
+        let mut seen = FxHashSet::with_capacity_and_hasher(ids.len(), Default::default());
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             if seen.insert(*id) {
@@ -204,7 +205,7 @@ impl SpFreshLayerDbIndex {
     }
 
     fn dedup_last_mutations(mutations: &[VectorMutation]) -> Vec<VectorMutation> {
-        let mut seen = HashSet::with_capacity(mutations.len());
+        let mut seen = FxHashSet::with_capacity_and_hasher(mutations.len(), Default::default());
         let mut out_rev = Vec::with_capacity(mutations.len());
         for mutation in mutations.iter().rev() {
             if seen.insert(mutation.id()) {
@@ -216,7 +217,7 @@ impl SpFreshLayerDbIndex {
     }
 
     fn dedup_last_mutations_owned(mutations: Vec<VectorMutation>) -> Vec<VectorMutation> {
-        let mut seen = HashSet::with_capacity(mutations.len());
+        let mut seen = FxHashSet::with_capacity_and_hasher(mutations.len(), Default::default());
         let mut out_rev = Vec::with_capacity(mutations.len());
         for mutation in mutations.into_iter().rev() {
             if seen.insert(mutation.id()) {
@@ -393,7 +394,10 @@ impl SpFreshLayerDbIndex {
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(3));
             let mut touched_ids = Vec::with_capacity(mutations.len());
             let mut new_postings = HashMap::with_capacity(mutations.len());
-            let mut dirty_postings = HashSet::with_capacity(mutations.len().saturating_mul(2));
+            let mut dirty_postings = FxHashSet::with_capacity_and_hasher(
+                mutations.len().saturating_mul(2),
+                Default::default(),
+            );
             let mut ephemeral_deltas = Vec::with_capacity(mutations.len());
             for (id, vector) in &mutations {
                 let old = states.get(id).and_then(|state| state.as_ref());
@@ -627,7 +631,8 @@ impl SpFreshLayerDbIndex {
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(2));
             let mut touched_ids = Vec::with_capacity(mutations.len());
             let mut deleted = 0usize;
-            let mut dirty_postings = HashSet::with_capacity(mutations.len());
+            let mut dirty_postings =
+                FxHashSet::with_capacity_and_hasher(mutations.len(), Default::default());
             let mut ephemeral_deletions = Vec::with_capacity(mutations.len());
             let mut posting_event_next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
             for id in &mutations {

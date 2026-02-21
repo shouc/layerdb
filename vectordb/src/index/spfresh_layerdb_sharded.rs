@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::types::{Neighbor, VectorIndex, VectorRecord};
 
 use super::spfresh_layerdb::{
-    SpFreshLayerDbConfig, SpFreshLayerDbIndex, SpFreshLayerDbStats, VectorMutation,
-    VectorMutationBatchResult,
+    MutationCommitMode, SpFreshLayerDbConfig, SpFreshLayerDbIndex, SpFreshLayerDbStats,
+    VectorMutation, VectorMutationBatchResult,
 };
 
 #[derive(Clone, Debug)]
@@ -198,13 +198,31 @@ impl SpFreshLayerDbShardedIndex {
     }
 
     pub fn try_upsert(&mut self, id: u64, vector: Vec<f32>) -> anyhow::Result<()> {
+        self.try_upsert_with_commit_mode(id, vector, MutationCommitMode::Durable)
+    }
+
+    pub fn try_upsert_with_commit_mode(
+        &mut self,
+        id: u64,
+        vector: Vec<f32>,
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<()> {
         let shard = self.shard_for_id(id);
         self.shards[shard]
-            .try_upsert(id, vector)
+            .try_upsert_batch_with_commit_mode(&[VectorRecord::new(id, vector)], commit_mode)
+            .map(|_| ())
             .with_context(|| format!("upsert shard {}", shard))
     }
 
     pub fn try_upsert_batch(&mut self, rows: &[VectorRecord]) -> anyhow::Result<usize> {
+        self.try_upsert_batch_with_commit_mode(rows, MutationCommitMode::Durable)
+    }
+
+    pub fn try_upsert_batch_with_commit_mode(
+        &mut self,
+        rows: &[VectorRecord],
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<usize> {
         if rows.is_empty() {
             return Ok(0);
         }
@@ -222,7 +240,7 @@ impl SpFreshLayerDbShardedIndex {
                     Ok(0)
                 } else {
                     shard
-                        .try_upsert_batch(chunk)
+                        .try_upsert_batch_with_commit_mode(chunk, commit_mode)
                         .with_context(|| format!("upsert batch shard {}", shard_id))
                 }
             })
@@ -235,6 +253,14 @@ impl SpFreshLayerDbShardedIndex {
     }
 
     pub fn try_upsert_batch_owned(&mut self, rows: Vec<VectorRecord>) -> anyhow::Result<usize> {
+        self.try_upsert_batch_owned_with_commit_mode(rows, MutationCommitMode::Durable)
+    }
+
+    pub fn try_upsert_batch_owned_with_commit_mode(
+        &mut self,
+        rows: Vec<VectorRecord>,
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<usize> {
         if rows.is_empty() {
             return Ok(0);
         }
@@ -252,7 +278,7 @@ impl SpFreshLayerDbShardedIndex {
                     Ok(0)
                 } else {
                     shard
-                        .try_upsert_batch_owned(chunk)
+                        .try_upsert_batch_owned_with_commit_mode(chunk, commit_mode)
                         .with_context(|| format!("upsert batch shard {}", shard_id))
                 }
             })
@@ -265,13 +291,30 @@ impl SpFreshLayerDbShardedIndex {
     }
 
     pub fn try_delete(&mut self, id: u64) -> anyhow::Result<bool> {
+        self.try_delete_with_commit_mode(id, MutationCommitMode::Durable)
+    }
+
+    pub fn try_delete_with_commit_mode(
+        &mut self,
+        id: u64,
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<bool> {
         let shard = self.shard_for_id(id);
         self.shards[shard]
-            .try_delete(id)
+            .try_delete_batch_with_commit_mode(&[id], commit_mode)
+            .map(|deleted| deleted > 0)
             .with_context(|| format!("delete shard {}", shard))
     }
 
     pub fn try_delete_batch(&mut self, ids: &[u64]) -> anyhow::Result<usize> {
+        self.try_delete_batch_with_commit_mode(ids, MutationCommitMode::Durable)
+    }
+
+    pub fn try_delete_batch_with_commit_mode(
+        &mut self,
+        ids: &[u64],
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<usize> {
         if ids.is_empty() {
             return Ok(0);
         }
@@ -289,7 +332,7 @@ impl SpFreshLayerDbShardedIndex {
                     Ok(0)
                 } else {
                     shard
-                        .try_delete_batch(chunk)
+                        .try_delete_batch_with_commit_mode(chunk, commit_mode)
                         .with_context(|| format!("delete batch shard {}", shard_id))
                 }
             })
@@ -304,6 +347,14 @@ impl SpFreshLayerDbShardedIndex {
     pub fn try_apply_batch(
         &mut self,
         mutations: &[VectorMutation],
+    ) -> anyhow::Result<VectorMutationBatchResult> {
+        self.try_apply_batch_with_commit_mode(mutations, MutationCommitMode::Durable)
+    }
+
+    pub fn try_apply_batch_with_commit_mode(
+        &mut self,
+        mutations: &[VectorMutation],
+        commit_mode: MutationCommitMode,
     ) -> anyhow::Result<VectorMutationBatchResult> {
         if mutations.is_empty() {
             return Ok(VectorMutationBatchResult::default());
@@ -328,8 +379,8 @@ impl SpFreshLayerDbShardedIndex {
                 VectorMutation::Delete { id } => deletes.push(id),
             }
         }
-        let upserted = self.try_upsert_batch(&upserts)?;
-        let deleted = self.try_delete_batch(&deletes)?;
+        let upserted = self.try_upsert_batch_with_commit_mode(&upserts, commit_mode)?;
+        let deleted = self.try_delete_batch_with_commit_mode(&deletes, commit_mode)?;
         Ok(VectorMutationBatchResult {
             upserts: upserted,
             deletes: deleted,

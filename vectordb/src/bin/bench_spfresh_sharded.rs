@@ -9,8 +9,8 @@ use clap::Parser;
 use serde::Deserialize;
 use vectordb::ground_truth::recall_at_k;
 use vectordb::index::{
-    SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig, SpFreshLayerDbShardedIndex,
-    SpFreshMemoryMode,
+    MutationCommitMode, SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig,
+    SpFreshLayerDbShardedIndex, SpFreshMemoryMode,
 };
 use vectordb::types::{VectorIndex, VectorRecord};
 
@@ -140,10 +140,14 @@ fn main() -> Result<()> {
     } else {
         SpFreshMemoryMode::Resident
     };
+    let commit_mode = if args.durable {
+        MutationCommitMode::Durable
+    } else {
+        MutationCommitMode::Acknowledged
+    };
     if !args.durable {
         shard_cfg.write_sync = false;
         shard_cfg.db_options.fsync_writes = false;
-        shard_cfg.unsafe_nondurable_fast_path = true;
     }
     let memory_mode = shard_cfg.memory_mode;
     let cfg = SpFreshLayerDbShardedConfig {
@@ -168,7 +172,7 @@ fn main() -> Result<()> {
             .iter()
             .map(|(id, v)| VectorRecord::new(*id, v.clone()))
             .collect();
-        let _ = index.try_upsert_batch_owned(rows)?;
+        let _ = index.try_upsert_batch_owned_with_commit_mode(rows, commit_mode)?;
     }
     let update_s = update_start.elapsed().as_secs_f64().max(1e-9);
     let update_qps = dataset.updates.len() as f64 / update_s;

@@ -69,6 +69,12 @@ pub struct VectorMutationBatchResult {
     pub deletes: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MutationCommitMode {
+    Durable,
+    Acknowledged,
+}
+
 type DiskMetaRowState = Option<(usize, Vec<f32>)>;
 type DiskMetaStateMap = HashMap<u64, DiskMetaRowState>;
 type EphemeralPostingMembers = HashMap<usize, HashMap<u64, PostingMemberSketch>>;
@@ -265,8 +271,14 @@ pub struct SpFreshLayerDbIndex {
 }
 
 impl SpFreshLayerDbIndex {
-    pub fn open(path: impl AsRef<Path>, cfg: SpFreshLayerDbConfig) -> anyhow::Result<Self> {
+    pub fn open(path: impl AsRef<Path>, mut cfg: SpFreshLayerDbConfig) -> anyhow::Result<Self> {
         validate_config(&cfg)?;
+        if cfg.unsafe_nondurable_fast_path {
+            eprintln!(
+                "spfresh-layerdb: unsafe_nondurable_fast_path is ignored; durable path is always enforced"
+            );
+            cfg.unsafe_nondurable_fast_path = false;
+        }
         let db_path = path.as_ref();
         let db = Db::open(db_path, cfg.db_options.clone()).context("open layerdb for spfresh")?;
         ensure_wal_exists(db_path)?;
@@ -582,7 +594,7 @@ impl SpFreshLayerDbIndex {
             index: snapshot,
         };
         let bytes = bincode::serialize(&checkpoint).context("encode spfresh index checkpoint")?;
-        persist_index_checkpoint_bytes(&self.db, bytes, self.cfg.write_sync)?;
+        persist_index_checkpoint_bytes(&self.db, bytes, true)?;
         let manifest = PersistedStartupManifest {
             schema_version: STARTUP_MANIFEST_SCHEMA_VERSION,
             generation,
@@ -592,7 +604,7 @@ impl SpFreshLayerDbIndex {
         };
         let manifest_bytes =
             bincode::serialize(&manifest).context("encode spfresh startup manifest")?;
-        persist_startup_manifest_bytes(&self.db, manifest_bytes, self.cfg.write_sync)?;
+        persist_startup_manifest_bytes(&self.db, manifest_bytes, true)?;
         if let Err(err) = prune_wal_before(&self.db, next_wal_seq, false) {
             eprintln!("spfresh-layerdb wal prune failed: {err:#}");
         }
@@ -968,7 +980,7 @@ impl SpFreshLayerDbIndex {
     }
 
     fn use_nondurable_fast_path(&self) -> bool {
-        self.cfg.unsafe_nondurable_fast_path && !self.cfg.write_sync
+        false
     }
 
     fn handle_commit_result(&self, result: anyhow::Result<()>) -> anyhow::Result<()> {
@@ -1210,10 +1222,10 @@ impl SpFreshLayerDbIndex {
                     ops.push(layerdb::Op::put(vector_key(new_generation, row.id), value));
                 }
             }
-            self.submit_commit(ops, self.cfg.write_sync, true)
+            self.submit_commit(ops, true, true)
                 .context("persist spfresh bulk rows")?;
         }
-        set_active_generation(&self.db, new_generation, self.cfg.write_sync)?;
+        set_active_generation(&self.db, new_generation, true)?;
         self.active_generation
             .store(new_generation, Ordering::Relaxed);
         let new_epoch = self.startup_epoch.fetch_add(1, Ordering::Relaxed).saturating_add(1);
@@ -1235,7 +1247,7 @@ impl SpFreshLayerDbIndex {
             }
         }
         if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
-            set_posting_event_next_seq(&self.db, posting_event_next_seq, self.cfg.write_sync)?;
+            set_posting_event_next_seq(&self.db, posting_event_next_seq, true)?;
             self.posting_event_next_seq
                 .store(posting_event_next_seq, Ordering::Relaxed);
         }
@@ -1321,6 +1333,7 @@ impl SpFreshLayerDbIndex {
         &self,
         entries: Vec<(IndexWalEntry, Vec<layerdb::Op>)>,
         mut trailer_ops: Vec<layerdb::Op>,
+        commit_mode: MutationCommitMode,
     ) -> anyhow::Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -1342,7 +1355,8 @@ impl SpFreshLayerDbIndex {
             wal_next,
         ));
         ops.append(&mut trailer_ops);
-        self.submit_commit(ops, self.cfg.write_sync, self.cfg.write_sync)
+        let sync = matches!(commit_mode, MutationCommitMode::Durable);
+        self.submit_commit(ops, sync, true)
             .with_context(|| {
                 format!(
                     "persist vector+wal batch count={} seq_start={} seq_end={}",
@@ -1462,6 +1476,14 @@ impl SpFreshLayerDbIndex {
     }
 
     pub fn try_upsert_batch(&mut self, rows: &[VectorRecord]) -> anyhow::Result<usize> {
+        self.try_upsert_batch_with_commit_mode(rows, MutationCommitMode::Durable)
+    }
+
+    pub fn try_upsert_batch_with_commit_mode(
+        &mut self,
+        rows: &[VectorRecord],
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<usize> {
         if rows.is_empty() {
             return Ok(0);
         }
@@ -1478,10 +1500,18 @@ impl SpFreshLayerDbIndex {
 
         // Last-write-wins dedup keeps persistence/apply work proportional to unique ids.
         let mutations = Self::dedup_last_upserts(rows);
-        self.try_upsert_batch_mutations(mutations)
+        self.try_upsert_batch_mutations(mutations, commit_mode)
     }
 
     pub fn try_upsert_batch_owned(&mut self, rows: Vec<VectorRecord>) -> anyhow::Result<usize> {
+        self.try_upsert_batch_owned_with_commit_mode(rows, MutationCommitMode::Durable)
+    }
+
+    pub fn try_upsert_batch_owned_with_commit_mode(
+        &mut self,
+        rows: Vec<VectorRecord>,
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<usize> {
         if rows.is_empty() {
             return Ok(0);
         }
@@ -1496,12 +1526,13 @@ impl SpFreshLayerDbIndex {
             }
         }
         let mutations = Self::dedup_last_upserts_owned(rows);
-        self.try_upsert_batch_mutations(mutations)
+        self.try_upsert_batch_mutations(mutations, commit_mode)
     }
 
     fn try_upsert_batch_mutations(
         &mut self,
         mutations: Vec<(u64, Vec<f32>)>,
+        commit_mode: MutationCommitMode,
     ) -> anyhow::Result<usize> {
         if mutations.is_empty() {
             return Ok(0);
@@ -1592,7 +1623,9 @@ impl SpFreshLayerDbIndex {
                     IndexWalEntry::TouchBatch { ids: touched_ids },
                     batch_ops,
                 )];
-                if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, trailer_ops) {
+                if let Err(err) =
+                    self.persist_with_wal_batch_ops(persist_entries, trailer_ops, commit_mode)
+                {
                     self.stats
                         .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
                     self.stats.inc_persist_errors();
@@ -1656,7 +1689,9 @@ impl SpFreshLayerDbIndex {
                 IndexWalEntry::TouchBatch { ids: touched_ids },
                 batch_ops,
             )];
-            if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, Vec::new()) {
+            if let Err(err) =
+                self.persist_with_wal_batch_ops(persist_entries, Vec::new(), commit_mode)
+            {
                 self.stats
                     .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
                 self.stats.inc_persist_errors();
@@ -1715,6 +1750,14 @@ impl SpFreshLayerDbIndex {
     }
 
     pub fn try_delete_batch(&mut self, ids: &[u64]) -> anyhow::Result<usize> {
+        self.try_delete_batch_with_commit_mode(ids, MutationCommitMode::Durable)
+    }
+
+    pub fn try_delete_batch_with_commit_mode(
+        &mut self,
+        ids: &[u64],
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<usize> {
         if ids.is_empty() {
             return Ok(0);
         }
@@ -1790,7 +1833,9 @@ impl SpFreshLayerDbIndex {
                     IndexWalEntry::TouchBatch { ids: touched_ids },
                     batch_ops,
                 )];
-                if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, trailer_ops) {
+                if let Err(err) =
+                    self.persist_with_wal_batch_ops(persist_entries, trailer_ops, commit_mode)
+                {
                     self.stats
                         .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
                     self.stats.inc_persist_errors();
@@ -1850,7 +1895,9 @@ impl SpFreshLayerDbIndex {
                 IndexWalEntry::TouchBatch { ids: touched_ids },
                 batch_ops,
             )];
-            if let Err(err) = self.persist_with_wal_batch_ops(persist_entries, Vec::new()) {
+            if let Err(err) =
+                self.persist_with_wal_batch_ops(persist_entries, Vec::new(), commit_mode)
+            {
                 self.stats
                     .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
                 self.stats.inc_persist_errors();
@@ -1916,6 +1963,14 @@ impl SpFreshLayerDbIndex {
         &mut self,
         mutations: &[VectorMutation],
     ) -> anyhow::Result<VectorMutationBatchResult> {
+        self.try_apply_batch_with_commit_mode(mutations, MutationCommitMode::Durable)
+    }
+
+    pub fn try_apply_batch_with_commit_mode(
+        &mut self,
+        mutations: &[VectorMutation],
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<VectorMutationBatchResult> {
         if mutations.is_empty() {
             return Ok(VectorMutationBatchResult::default());
         }
@@ -1928,8 +1983,8 @@ impl SpFreshLayerDbIndex {
                 VectorMutation::Delete { id } => deletes.push(id),
             }
         }
-        let upserted = self.try_upsert_batch(&upserts)?;
-        let deleted = self.try_delete_batch(&deletes)?;
+        let upserted = self.try_upsert_batch_with_commit_mode(&upserts, commit_mode)?;
+        let deleted = self.try_delete_batch_with_commit_mode(&deletes, commit_mode)?;
         Ok(VectorMutationBatchResult {
             upserts: upserted,
             deletes: deleted,
@@ -1938,12 +1993,12 @@ impl SpFreshLayerDbIndex {
 
     pub fn try_upsert(&mut self, id: u64, vector: Vec<f32>) -> anyhow::Result<()> {
         let row = VectorRecord::new(id, vector);
-        let _ = self.try_upsert_batch(&[row])?;
+        let _ = self.try_upsert_batch_with_commit_mode(&[row], MutationCommitMode::Durable)?;
         Ok(())
     }
 
     pub fn try_delete(&mut self, id: u64) -> anyhow::Result<bool> {
-        Ok(self.try_delete_batch(&[id])? > 0)
+        Ok(self.try_delete_batch_with_commit_mode(&[id], MutationCommitMode::Durable)? > 0)
     }
 
     pub fn close(mut self) -> anyhow::Result<()> {

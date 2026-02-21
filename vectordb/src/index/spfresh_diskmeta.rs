@@ -337,42 +337,13 @@ impl SpFreshDiskMetaIndex {
         if query.len() != self.cfg.dim || k == 0 {
             return Vec::new();
         }
-        let max_probe = self
-            .cfg
-            .nprobe
-            .max(1)
-            .saturating_mul(8)
-            .min(self.postings.len().max(1));
-        let min_probe = self
-            .cfg
-            .nprobe
-            .max(1)
-            .saturating_mul(4)
-            .min(max_probe.max(1));
+        let max_probe = self.postings.len().max(1);
         let mut nearest = self.nearest_postings(query, max_probe);
         if nearest.is_empty() {
             return Vec::new();
         }
-
-        let probe_count = if nearest.len() < 2 || min_probe == max_probe {
-            max_probe
-        } else {
-            // Adaptive probing: confident queries (clear first/second-centroid gap) probe fewer postings.
-            let d0 = nearest[0].1.max(1e-12);
-            let d1 = nearest[1].1.max(d0);
-            let ratio = d1 / d0;
-            if ratio >= 4.0 {
-                min_probe
-            } else if ratio >= 2.0 {
-                min_probe.saturating_add((max_probe.saturating_sub(min_probe)) / 3)
-            } else if ratio >= 1.4 {
-                min_probe.saturating_add((max_probe.saturating_sub(min_probe) * 2) / 3)
-            } else {
-                max_probe
-            }
-        };
-
-        nearest.truncate(probe_count.max(1));
+        let probe_count = self.cfg.nprobe.max(1).min(nearest.len());
+        nearest.truncate(probe_count);
         nearest.into_iter().map(|(pid, _)| pid).collect()
     }
 

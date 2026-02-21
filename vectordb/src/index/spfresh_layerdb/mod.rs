@@ -75,7 +75,6 @@ type EphemeralPostingMembers = HashMap<usize, HashMap<u64, PostingMemberSketch>>
 type EphemeralRowStates = HashMap<u64, (usize, Vec<f32>)>;
 type DistanceRow = (u64, f32);
 type DistanceLoadResult = (Vec<DistanceRow>, Vec<u64>);
-const DISKMETA_RERANK_FACTOR: usize = 8;
 const POSTING_LOG_COMPACT_MIN_EVENTS: usize = 512;
 const POSTING_LOG_COMPACT_FACTOR: usize = 3;
 const ASYNC_COMMIT_MAX_INFLIGHT: usize = 8;
@@ -159,17 +158,11 @@ impl VectorCache {
 #[derive(Clone, Debug)]
 struct PostingMemberSketch {
     id: u64,
-    residual_scale: Option<f32>,
-    residual_code: Option<Vec<i8>>,
 }
 
 impl PostingMemberSketch {
     fn from_loaded(member: &PostingMember) -> Self {
-        Self {
-            id: member.id,
-            residual_scale: member.residual_scale,
-            residual_code: member.residual_code.clone(),
-        }
+        Self { id: member.id }
     }
 }
 
@@ -923,11 +916,7 @@ impl SpFreshLayerDbIndex {
                 .or_insert_with(HashMap::new)
                 .insert(
                     id,
-                    PostingMemberSketch {
-                        id,
-                        residual_scale: None,
-                        residual_code: None,
-                    },
+                    PostingMemberSketch { id },
                 );
         }
     }
@@ -1090,55 +1079,13 @@ impl SpFreshLayerDbIndex {
         }
     }
 
-    fn approx_distance_from_residual(
-        query: &[f32],
-        centroid: &[f32],
-        member: &PostingMemberSketch,
-    ) -> Option<f32> {
-        let scale = member.residual_scale?;
-        let code = member.residual_code.as_ref()?;
-        if centroid.len() != query.len() || code.len() != query.len() {
-            return None;
-        }
-        let mut sum = 0.0f32;
-        for i in 0..query.len() {
-            let approx = centroid[i] + scale * code[i] as f32;
-            let d = query[i] - approx;
-            sum += d * d;
-        }
-        Some(sum)
-    }
-
     fn select_diskmeta_candidates(
-        query: &[f32],
-        centroid: &[f32],
         members: &[PostingMemberSketch],
-        k: usize,
     ) -> Vec<u64> {
-        if k == 0 || members.is_empty() {
+        if members.is_empty() {
             return Vec::new();
         }
-        if members
-            .iter()
-            .any(|m| m.residual_scale.is_none() || m.residual_code.is_none())
-        {
-            return members.iter().map(|m| m.id).collect();
-        }
-        let rerank = k
-            .saturating_mul(DISKMETA_RERANK_FACTOR)
-            .max(k)
-            .min(members.len());
-        let mut scored: Vec<(u64, f32)> = members
-            .iter()
-            .map(|member| {
-                let approx = Self::approx_distance_from_residual(query, centroid, member)
-                    .unwrap_or(f32::INFINITY);
-                (member.id, approx)
-            })
-            .collect();
-        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        scored.truncate(rerank.max(1));
-        scored.into_iter().map(|(id, _)| id).collect()
+        members.iter().map(|m| m.id).collect()
     }
 
     fn mark_dirty(&self, id: u64) {
@@ -2104,14 +2051,13 @@ impl VectorIndex for SpFreshLayerDbIndex {
             let mut top = Vec::with_capacity(k);
             let postings = index.choose_probe_postings(query, k);
             for posting_id in postings {
-                let Some(centroid) = index.posting_centroid(posting_id) else {
+                if index.posting_centroid(posting_id).is_none() {
                     continue;
-                };
+                }
                 let members = self
                     .load_posting_members_for(generation, posting_id)
                     .unwrap_or_else(|err| panic!("offheap-diskmeta load members failed: {err:#}"));
-                let selected_ids =
-                    Self::select_diskmeta_candidates(query, centroid, members.as_ref(), k);
+                let selected_ids = Self::select_diskmeta_candidates(members.as_ref());
                 if selected_ids.is_empty() {
                     continue;
                 }
@@ -2133,7 +2079,7 @@ impl VectorIndex for SpFreshLayerDbIndex {
                 }
 
                 // If selected candidates miss exact payloads, retry exact evaluation across all
-                // members before falling back to residual-only distance estimates.
+                // members and fail closed if any referenced row remains missing.
                 if !missing_selected_ids.is_empty() {
                     let fallback_ids: Vec<u64> = members
                         .iter()
@@ -2156,19 +2102,11 @@ impl VectorIndex for SpFreshLayerDbIndex {
                         exact_loaded_ids.insert(id);
                     }
                     if !fallback_missing.is_empty() {
-                        let lookup: HashMap<u64, &PostingMemberSketch> =
-                            members.iter().map(|member| (member.id, member)).collect();
-                        for id in fallback_missing {
-                            let Some(member) = lookup.get(&id) else {
-                                continue;
-                            };
-                            let Some(distance) =
-                                Self::approx_distance_from_residual(query, centroid, member)
-                            else {
-                                continue;
-                            };
-                            Self::push_neighbor_topk(&mut top, Neighbor { id, distance }, k);
-                        }
+                        panic!(
+                            "offheap-diskmeta search missing exact vector payloads for {} ids in posting {}",
+                            fallback_missing.len(),
+                            posting_id
+                        );
                     }
                 }
             }

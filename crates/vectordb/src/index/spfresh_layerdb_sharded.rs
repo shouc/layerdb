@@ -602,12 +602,22 @@ impl VectorIndex for SpFreshLayerDbShardedIndex {
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
-        let all: Vec<Neighbor> = self
-            .shards
+        if k == 0 {
+            return Vec::new();
+        }
+        self.shards
             .par_iter()
-            .flat_map_iter(|shard| shard.search(query, k).into_iter())
-            .collect();
-        Self::merge_neighbors(all, k)
+            .map(|shard| shard.search(query, k))
+            .reduce(Vec::new, |mut left, mut right| {
+                if left.is_empty() {
+                    return right;
+                }
+                if right.is_empty() {
+                    return left;
+                }
+                left.append(&mut right);
+                Self::merge_neighbors(left, k)
+            })
     }
 
     fn len(&self) -> usize {

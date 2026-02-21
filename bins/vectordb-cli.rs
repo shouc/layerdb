@@ -526,6 +526,7 @@ fn bench_spfresh_layerdb_sharded(
             rebuild_interval: Duration::from_millis(args.spfresh_rebuild_interval_ms.max(1)),
             ..Default::default()
         },
+        exact_shard_prune: false,
     };
     let mut cfg = cfg;
     cfg.shard.memory_mode = if args.spfresh_diskmeta {

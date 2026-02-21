@@ -18,6 +18,7 @@ use super::spfresh_layerdb::{
 pub struct SpFreshLayerDbShardedConfig {
     pub shard_count: usize,
     pub shard: SpFreshLayerDbConfig,
+    pub exact_shard_prune: bool,
 }
 
 impl Default for SpFreshLayerDbShardedConfig {
@@ -25,6 +26,7 @@ impl Default for SpFreshLayerDbShardedConfig {
         Self {
             shard_count: 4,
             shard: SpFreshLayerDbConfig::default(),
+            exact_shard_prune: false,
         }
     }
 }
@@ -76,6 +78,27 @@ impl Ord for HeapNeighbor {
             .distance
             .total_cmp(&other.0.distance)
             .then_with(|| self.0.id.cmp(&other.0.id))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ShardCursor {
+    shard_id: usize,
+    neighbor_idx: usize,
+}
+
+impl Ord for ShardCursor {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Ordering is supplied at call-site through heap payload tuple.
+        self.shard_id
+            .cmp(&other.shard_id)
+            .then_with(|| self.neighbor_idx.cmp(&other.neighbor_idx))
+    }
+}
+
+impl PartialOrd for ShardCursor {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -163,6 +186,7 @@ impl SpFreshLayerDbShardedIndex {
                     db_options,
                     ..Default::default()
                 },
+                exact_shard_prune: false,
             },
             shard_mask,
             shards,
@@ -368,6 +392,7 @@ impl SpFreshLayerDbShardedIndex {
         found
     }
 
+    #[cfg(test)]
     fn merge_neighbors(mut all: Vec<Neighbor>, k: usize) -> Vec<Neighbor> {
         if k == 0 || all.is_empty() {
             return Vec::new();
@@ -390,6 +415,106 @@ impl SpFreshLayerDbShardedIndex {
         let mut top: Vec<Neighbor> = heap.into_iter().map(|entry| entry.0).collect();
         top.sort_by(Self::neighbor_cmp);
         top
+    }
+
+    fn merge_sorted_neighbors(per_shard: &[Vec<Neighbor>], k: usize) -> Vec<Neighbor> {
+        if k == 0 || per_shard.is_empty() {
+            return Vec::new();
+        }
+        // BinaryHeap is max-heap; wrap ordering to pop smallest distance first.
+        let mut heap: BinaryHeap<(std::cmp::Reverse<HeapNeighbor>, ShardCursor)> =
+            BinaryHeap::new();
+        for (shard_id, neighbors) in per_shard.iter().enumerate() {
+            if let Some(first) = neighbors.first() {
+                heap.push((
+                    std::cmp::Reverse(HeapNeighbor(first.clone())),
+                    ShardCursor {
+                        shard_id,
+                        neighbor_idx: 0,
+                    },
+                ));
+            }
+        }
+        let mut out = Vec::with_capacity(k.min(heap.len()));
+        while let Some((std::cmp::Reverse(HeapNeighbor(neighbor)), cursor)) = heap.pop() {
+            out.push(neighbor);
+            if out.len() >= k {
+                break;
+            }
+            let next_idx = cursor.neighbor_idx.saturating_add(1);
+            if let Some(next_neighbor) = per_shard[cursor.shard_id].get(next_idx) {
+                heap.push((
+                    std::cmp::Reverse(HeapNeighbor(next_neighbor.clone())),
+                    ShardCursor {
+                        shard_id: cursor.shard_id,
+                        neighbor_idx: next_idx,
+                    },
+                ));
+            }
+        }
+        out
+    }
+
+    fn search_all_shards_parallel(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
+        let per_shard: Vec<Vec<Neighbor>> = self
+            .shards
+            .par_iter()
+            .map(|shard| shard.search(query, k))
+            .collect();
+        Self::merge_sorted_neighbors(per_shard.as_slice(), k)
+    }
+
+    fn search_with_exact_shard_prune(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
+        let mut lower_bounds: Vec<(usize, f32)> = self
+            .shards
+            .par_iter()
+            .enumerate()
+            .map(|(shard_id, shard)| {
+                let best = shard
+                    .search(query, 1)
+                    .into_iter()
+                    .next()
+                    .map(|n| n.distance)
+                    .unwrap_or(f32::INFINITY);
+                (shard_id, best)
+            })
+            .collect();
+        lower_bounds.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut top: Vec<Neighbor> = Vec::with_capacity(k);
+        for (shard_id, lower_bound) in lower_bounds {
+            if top.len() >= k {
+                let worst = top.last().map(|n| n.distance).unwrap_or(f32::INFINITY);
+                if lower_bound >= worst {
+                    break;
+                }
+            }
+            let shard_neighbors = self.shards[shard_id].search(query, k);
+            for neighbor in shard_neighbors {
+                Self::push_neighbor_topk(&mut top, neighbor, k);
+            }
+            top.sort_by(Self::neighbor_cmp);
+        }
+        top
+    }
+
+    fn push_neighbor_topk(top: &mut Vec<Neighbor>, candidate: Neighbor, k: usize) {
+        if k == 0 {
+            return;
+        }
+        if top.len() < k {
+            top.push(candidate);
+            return;
+        }
+        let mut worst_idx = 0usize;
+        for idx in 1..top.len() {
+            if Self::neighbor_cmp(&top[idx], &top[worst_idx]).is_gt() {
+                worst_idx = idx;
+            }
+        }
+        if Self::neighbor_cmp(&candidate, &top[worst_idx]).is_lt() {
+            top[worst_idx] = candidate;
+        }
     }
 
     fn neighbor_cmp(a: &Neighbor, b: &Neighbor) -> std::cmp::Ordering {
@@ -811,19 +936,11 @@ impl VectorIndex for SpFreshLayerDbShardedIndex {
         if k == 0 {
             return Vec::new();
         }
-        self.shards
-            .par_iter()
-            .map(|shard| shard.search(query, k))
-            .reduce(Vec::new, |mut left, mut right| {
-                if left.is_empty() {
-                    return right;
-                }
-                if right.is_empty() {
-                    return left;
-                }
-                left.append(&mut right);
-                Self::merge_neighbors(left, k)
-            })
+        if self.cfg.exact_shard_prune {
+            self.search_with_exact_shard_prune(query, k)
+        } else {
+            self.search_all_shards_parallel(query, k)
+        }
     }
 
     fn len(&self) -> usize {
@@ -867,6 +984,93 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, 1);
         assert_eq!(merged[1].id, 2);
+    }
+
+    #[test]
+    fn merge_sorted_neighbors_keeps_global_order() {
+        let merged = SpFreshLayerDbShardedIndex::merge_sorted_neighbors(
+            &[
+                vec![
+                    Neighbor {
+                        id: 11,
+                        distance: 0.11,
+                    },
+                    Neighbor {
+                        id: 14,
+                        distance: 0.40,
+                    },
+                ],
+                vec![
+                    Neighbor {
+                        id: 21,
+                        distance: 0.09,
+                    },
+                    Neighbor {
+                        id: 22,
+                        distance: 0.30,
+                    },
+                ],
+                vec![Neighbor {
+                    id: 31,
+                    distance: 0.20,
+                }],
+            ],
+            4,
+        );
+        let ids: Vec<u64> = merged.into_iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![21, 11, 31, 22]);
+    }
+
+    #[test]
+    fn exact_shard_prune_matches_full_shard_search() -> anyhow::Result<()> {
+        let dir_full = TempDir::new()?;
+        let dir_pruned = TempDir::new()?;
+        let mut cfg_full = SpFreshLayerDbShardedConfig {
+            shard_count: 8,
+            ..Default::default()
+        };
+        cfg_full.exact_shard_prune = false;
+        let mut cfg_pruned = cfg_full.clone();
+        cfg_pruned.exact_shard_prune = true;
+
+        let mut full = SpFreshLayerDbShardedIndex::open(dir_full.path(), cfg_full.clone())?;
+        let mut pruned = SpFreshLayerDbShardedIndex::open(dir_pruned.path(), cfg_pruned.clone())?;
+        let mut rows = Vec::new();
+        for id in 0..4_000u64 {
+            let mut v = vec![0.0f32; cfg_full.shard.spfresh.dim];
+            v[0] = (id as f32 * 0.013).sin();
+            v[1] = (id as f32 * 0.017).cos();
+            v[2] = (id % 97) as f32 / 97.0;
+            rows.push(crate::types::VectorRecord::new(id, v));
+        }
+        assert_eq!(full.try_upsert_batch_owned(rows.clone())?, rows.len());
+        assert_eq!(pruned.try_upsert_batch_owned(rows.clone())?, rows.len());
+
+        let mut queries = Vec::new();
+        for i in 0..24usize {
+            let mut q = vec![0.0f32; cfg_full.shard.spfresh.dim];
+            q[0] = (i as f32 * 0.071).sin();
+            q[1] = (i as f32 * 0.047).cos();
+            q[2] = (i % 13) as f32 / 13.0;
+            queries.push(q);
+        }
+
+        for query in queries {
+            let got_full = full.search(query.as_slice(), 10);
+            let got_pruned = pruned.search(query.as_slice(), 10);
+            assert_eq!(got_full.len(), got_pruned.len());
+            for (a, b) in got_full.iter().zip(got_pruned.iter()) {
+                assert_eq!(a.id, b.id);
+                assert!(
+                    (a.distance - b.distance).abs() <= 1e-6,
+                    "distance mismatch id={} {} vs {}",
+                    a.id,
+                    a.distance,
+                    b.distance
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

@@ -153,6 +153,7 @@ fn main() -> Result<()> {
     let cfg = SpFreshLayerDbShardedConfig {
         shard_count: args.shards,
         shard: shard_cfg,
+        exact_shard_prune: false,
     };
 
     let base_rows: Vec<VectorRecord> = dataset

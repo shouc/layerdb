@@ -2008,6 +2008,7 @@ fn build_index(args: &Args) -> anyhow::Result<SpFreshLayerDbShardedIndex> {
     let cfg = SpFreshLayerDbShardedConfig {
         shard_count: args.shards,
         shard: shard_cfg,
+        exact_shard_prune: false,
     };
 
     SpFreshLayerDbShardedIndex::open(&args.db_root, cfg)

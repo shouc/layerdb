@@ -140,3 +140,24 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=2.1576`
 - `search_qps_ratio=4.3639`
+
+## Step 6 (`exact-kway-merge-and-shard-prune-routing`)
+
+Change:
+- Replaced sharded top-k merge with exact k-way merge over per-shard sorted neighbor streams, reducing merge overhead from scanning all shard candidates.
+- Added an optional exact shard-pruning search mode (`exact_shard_prune`) that computes per-shard lower bounds and short-circuits shards that cannot improve current top-k, without recall loss.
+- Added deterministic correctness test proving `exact_shard_prune` returns identical results to full-shard search.
+
+SPFresh:
+- `update_qps=202319.94`
+- `search_qps=2748.48`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=114932.07`
+- `search_qps=786.22`
+- `recall_at_k=0.4860`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.7603`
+- `search_qps_ratio=3.4958`

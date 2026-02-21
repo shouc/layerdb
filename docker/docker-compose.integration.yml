@@ -1,0 +1,159 @@
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.13
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd0
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd-data
+    ports:
+      - "${VDB_ETCD_PORT:-22379}:2379"
+
+  node1:
+    build:
+      context: ..
+      dockerfile: docker/vectordb-deploy.Dockerfile
+    image: layerdb/vectordb-deploy:integration
+    depends_on:
+      - etcd
+    command:
+      - --db-root
+      - /var/lib/vectordb
+      - --listen
+      - 0.0.0.0:8080
+      - --node-id
+      - node1
+      - --self-url
+      - http://node1:8080
+      - --replica-urls
+      - http://node1:8080,http://node2:8080,http://node3:8080
+      - --etcd-endpoints
+      - http://etcd:2379
+      - --etcd-election-key
+      - /vectordb/integration/leader
+      - --etcd-lease-ttl-secs
+      - "5"
+      - --etcd-retry-ms
+      - "200"
+      - --replication-timeout-ms
+      - "1500"
+      - --shards
+      - "4"
+      - --dim
+      - "8"
+      - --initial-postings
+      - "8"
+      - --split-limit
+      - "64"
+      - --merge-limit
+      - "8"
+      - --reassign-range
+      - "8"
+      - --nprobe
+      - "4"
+      - --kmeans-iters
+      - "4"
+    ports:
+      - "${VDB_NODE1_PORT:-18080}:8080"
+    volumes:
+      - node1-data:/var/lib/vectordb
+
+  node2:
+    image: layerdb/vectordb-deploy:integration
+    depends_on:
+      - etcd
+      - node1
+    command:
+      - --db-root
+      - /var/lib/vectordb
+      - --listen
+      - 0.0.0.0:8080
+      - --node-id
+      - node2
+      - --self-url
+      - http://node2:8080
+      - --replica-urls
+      - http://node1:8080,http://node2:8080,http://node3:8080
+      - --etcd-endpoints
+      - http://etcd:2379
+      - --etcd-election-key
+      - /vectordb/integration/leader
+      - --etcd-lease-ttl-secs
+      - "5"
+      - --etcd-retry-ms
+      - "200"
+      - --replication-timeout-ms
+      - "1500"
+      - --shards
+      - "4"
+      - --dim
+      - "8"
+      - --initial-postings
+      - "8"
+      - --split-limit
+      - "64"
+      - --merge-limit
+      - "8"
+      - --reassign-range
+      - "8"
+      - --nprobe
+      - "4"
+      - --kmeans-iters
+      - "4"
+    ports:
+      - "${VDB_NODE2_PORT:-18081}:8080"
+    volumes:
+      - node2-data:/var/lib/vectordb
+
+  node3:
+    image: layerdb/vectordb-deploy:integration
+    depends_on:
+      - etcd
+      - node1
+    command:
+      - --db-root
+      - /var/lib/vectordb
+      - --listen
+      - 0.0.0.0:8080
+      - --node-id
+      - node3
+      - --self-url
+      - http://node3:8080
+      - --replica-urls
+      - http://node1:8080,http://node2:8080,http://node3:8080
+      - --etcd-endpoints
+      - http://etcd:2379
+      - --etcd-election-key
+      - /vectordb/integration/leader
+      - --etcd-lease-ttl-secs
+      - "5"
+      - --etcd-retry-ms
+      - "200"
+      - --replication-timeout-ms
+      - "1500"
+      - --shards
+      - "4"
+      - --dim
+      - "8"
+      - --initial-postings
+      - "8"
+      - --split-limit
+      - "64"
+      - --merge-limit
+      - "8"
+      - --reassign-range
+      - "8"
+      - --nprobe
+      - "4"
+      - --kmeans-iters
+      - "4"
+    ports:
+      - "${VDB_NODE3_PORT:-18082}:8080"
+    volumes:
+      - node3-data:/var/lib/vectordb
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

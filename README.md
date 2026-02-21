@@ -49,6 +49,26 @@ Deployment API (JSON):
 - `POST /v1/mutations` (leader only)
 - `POST /v1/internal/replicate` (peer replication endpoint)
 
+Docker integration test (etcd + 3 deploy nodes):
+
+```bash
+# direct script
+./scripts/vectordb_deploy_integration.sh
+
+# cargo-gated integration test
+VDB_DOCKER_INTEGRATION=1 cargo test -p vectordb --test deploy_docker -- --nocapture
+```
+
+Docker cluster load test:
+
+```bash
+# direct script (tune via VDB_LOAD_* env vars)
+./scripts/vectordb_deploy_load_test.sh
+
+# cargo-gated load test
+VDB_DOCKER_LOAD_TEST=1 cargo test -p vectordb --test deploy_docker_load -- --nocapture
+```
+
 ## Crate Usage
 
 Add dependency (path for local workspace usage):

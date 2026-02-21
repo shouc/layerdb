@@ -80,6 +80,18 @@ cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
   --merge-limit 64 --reassign-range 64 --nprobe 8 --kmeans-iters 8
 ```
 
+Docker integration test for the sharded deployment server (etcd + 3 nodes):
+```bash
+./scripts/vectordb_deploy_integration.sh
+VDB_DOCKER_INTEGRATION=1 cargo test -p vectordb --test deploy_docker -- --nocapture
+```
+
+Docker cluster load test (parallel write/search pressure + replication validation):
+```bash
+./scripts/vectordb_deploy_load_test.sh
+VDB_DOCKER_LOAD_TEST=1 cargo test -p vectordb --test deploy_docker_load -- --nocapture
+```
+
 ## Production Notes (LayerDB-backed SPFresh)
 - `SpFreshLayerDbConfig::default()` is durability-first:
   - `db_options.fsync_writes=true`

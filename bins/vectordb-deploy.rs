@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -16,8 +19,9 @@ use etcd_client::{
 use futures::future::join_all;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Infallible, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use tokio::sync::Mutex as AsyncMutex;
 use vectordb::index::{
     MutationCommitMode, SpFreshConfig, SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig,
     SpFreshLayerDbShardedIndex, SpFreshLayerDbShardedStats, SpFreshMemoryMode, VectorMutation,
@@ -70,6 +74,12 @@ struct Args {
 
     #[arg(long, default_value_t = 1_500)]
     replication_timeout_ms: u64,
+
+    #[arg(long, default_value_t = 500_000)]
+    replication_log_max_entries: usize,
+
+    #[arg(long, default_value_t = 512)]
+    replication_catchup_batch: usize,
 
     #[arg(long, default_value_t = 4)]
     shards: usize,
@@ -136,6 +146,546 @@ impl From<CommitModeArg> for MutationCommitMode {
             CommitModeArg::Acknowledged => MutationCommitMode::Acknowledged,
         }
     }
+}
+
+const REPLICATION_JOURNAL_SCHEMA_VERSION: u32 = 1;
+const REPLICATION_PAYLOAD_SCHEMA_VERSION: u32 = 1;
+const LOG_RANGE_FRAME_MAX_ENTRIES: usize = 4096;
+
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+enum WireMutation {
+    Upsert { id: u64, values: Vec<f32> },
+    Delete { id: u64 },
+}
+
+impl WireMutation {
+    fn into_runtime(self) -> VectorMutation {
+        match self {
+            Self::Upsert { id, values } => VectorMutation::Upsert(VectorRecord::new(id, values)),
+            Self::Delete { id } => VectorMutation::Delete { id },
+        }
+    }
+}
+
+impl From<MutationInput> for WireMutation {
+    fn from(value: MutationInput) -> Self {
+        match value {
+            MutationInput::Upsert { id, values } => Self::Upsert { id, values },
+            MutationInput::Delete { id } => Self::Delete { id },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+struct ReplicationPayload {
+    schema_version: u32,
+    seq: u64,
+    term: u64,
+    commit_mode: u8,
+    mutations: Vec<WireMutation>,
+}
+
+impl ReplicationPayload {
+    fn to_runtime_mutations(&self) -> Vec<VectorMutation> {
+        self.mutations
+            .clone()
+            .into_iter()
+            .map(WireMutation::into_runtime)
+            .collect()
+    }
+
+    fn commit_mode(&self) -> anyhow::Result<MutationCommitMode> {
+        decode_commit_mode(self.commit_mode)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplicationRejectResponse {
+    error: String,
+    expected_seq: u64,
+    first_available_seq: u64,
+    last_available_seq: u64,
+    max_term_seen: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LogRangeRequest {
+    from_seq: u64,
+    max_entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReplicationState {
+    first_seq: u64,
+    next_seq: u64,
+    last_applied_seq: u64,
+    max_term_seen: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplicationJournalMeta {
+    schema_version: u32,
+    first_seq: u64,
+    next_seq: u64,
+    last_applied_seq: u64,
+    max_term_seen: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JournalIndexEntry {
+    offset: u64,
+    len: u32,
+}
+
+struct ReplicationJournal {
+    dir: PathBuf,
+    log_path: PathBuf,
+    meta_path: PathBuf,
+    file: File,
+    index: BTreeMap<u64, JournalIndexEntry>,
+    meta: ReplicationJournalMeta,
+    max_entries: usize,
+}
+
+impl ReplicationJournal {
+    fn open(root: &Path, max_entries: usize) -> anyhow::Result<Self> {
+        if max_entries == 0 {
+            anyhow::bail!("replication log max entries must be > 0");
+        }
+        let dir = root.join("replication");
+        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let log_path = dir.join("ops.log");
+        let meta_path = dir.join("meta.json");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&log_path)
+            .with_context(|| format!("open {}", log_path.display()))?;
+
+        let mut index = BTreeMap::new();
+        let mut offset = 0u64;
+        loop {
+            let mut len_buf = [0u8; 4];
+            match file.read_exact(&mut len_buf) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("read {}", log_path.display()))
+                }
+            }
+            let len = u32::from_le_bytes(len_buf);
+            let mut raw = vec![0u8; len as usize];
+            file.read_exact(&mut raw)
+                .with_context(|| format!("read {} payload len={}", log_path.display(), len))?;
+            let payload = decode_replication_payload(&raw)?;
+            index.insert(
+                payload.seq,
+                JournalIndexEntry {
+                    offset: offset + 4,
+                    len,
+                },
+            );
+            offset = offset.saturating_add(4 + len as u64);
+        }
+        file.seek(SeekFrom::End(0))
+            .context("seek replication log to end")?;
+
+        let mut meta = if meta_path.exists() {
+            let raw =
+                fs::read(&meta_path).with_context(|| format!("read {}", meta_path.display()))?;
+            let loaded: ReplicationJournalMeta =
+                serde_json::from_slice(&raw).context("decode replication meta json")?;
+            if loaded.schema_version != REPLICATION_JOURNAL_SCHEMA_VERSION {
+                anyhow::bail!(
+                    "replication meta schema mismatch: got {}, expected {}",
+                    loaded.schema_version,
+                    REPLICATION_JOURNAL_SCHEMA_VERSION
+                );
+            }
+            loaded
+        } else {
+            ReplicationJournalMeta {
+                schema_version: REPLICATION_JOURNAL_SCHEMA_VERSION,
+                first_seq: 1,
+                next_seq: 1,
+                last_applied_seq: 0,
+                max_term_seen: 0,
+            }
+        };
+
+        if let Some((&min_seq, _)) = index.first_key_value() {
+            meta.first_seq = min_seq;
+        } else {
+            meta.first_seq = meta.next_seq.max(1);
+        }
+        if let Some((&max_seq, _)) = index.last_key_value() {
+            meta.next_seq = meta.next_seq.max(max_seq.saturating_add(1));
+        }
+        if meta.last_applied_seq.saturating_add(1) < meta.first_seq {
+            meta.last_applied_seq = meta.first_seq.saturating_sub(1);
+        }
+
+        let mut out = Self {
+            dir,
+            log_path,
+            meta_path,
+            file,
+            index,
+            meta,
+            max_entries,
+        };
+        out.persist_meta(true)?;
+        out.compact_if_needed()?;
+        Ok(out)
+    }
+
+    fn snapshot_state(&self) -> ReplicationState {
+        ReplicationState {
+            first_seq: self.first_seq(),
+            next_seq: self.next_seq(),
+            last_applied_seq: self.last_applied_seq(),
+            max_term_seen: self.max_term_seen(),
+        }
+    }
+
+    fn first_seq(&self) -> u64 {
+        self.index
+            .first_key_value()
+            .map(|(seq, _)| *seq)
+            .unwrap_or(self.meta.next_seq.max(1))
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.meta.next_seq
+    }
+
+    fn last_seq(&self) -> u64 {
+        self.meta.next_seq.saturating_sub(1)
+    }
+
+    fn last_applied_seq(&self) -> u64 {
+        self.meta.last_applied_seq
+    }
+
+    fn expected_next_seq(&self) -> u64 {
+        self.meta.last_applied_seq.saturating_add(1)
+    }
+
+    fn max_term_seen(&self) -> u64 {
+        self.meta.max_term_seen
+    }
+
+    fn append_entry(&mut self, seq: u64, raw_payload: &[u8], sync: bool) -> anyhow::Result<()> {
+        if seq != self.meta.next_seq {
+            anyhow::bail!(
+                "invalid replication seq: got {}, expected {}",
+                seq,
+                self.meta.next_seq
+            );
+        }
+        let len = u32::try_from(raw_payload.len()).context("payload too large for log entry")?;
+        let record_start = self
+            .file
+            .seek(SeekFrom::End(0))
+            .context("seek replication log to append")?;
+        self.file
+            .write_all(&len.to_le_bytes())
+            .context("append replication record length")?;
+        self.file
+            .write_all(raw_payload)
+            .context("append replication record payload")?;
+        if sync {
+            self.file.sync_data().context("sync replication record")?;
+        }
+        self.index.insert(
+            seq,
+            JournalIndexEntry {
+                offset: record_start + 4,
+                len,
+            },
+        );
+        self.meta.next_seq = seq.saturating_add(1);
+        self.meta.first_seq = self.first_seq();
+        self.persist_meta(sync)?;
+        self.compact_if_needed()?;
+        Ok(())
+    }
+
+    fn mark_applied(&mut self, seq: u64, term: u64, sync: bool) -> anyhow::Result<()> {
+        if seq < self.meta.last_applied_seq {
+            return Ok(());
+        }
+        self.meta.last_applied_seq = seq;
+        if term > self.meta.max_term_seen {
+            self.meta.max_term_seen = term;
+        }
+        self.persist_meta(sync)
+    }
+
+    fn read_entry(&mut self, seq: u64) -> anyhow::Result<Option<Bytes>> {
+        let Some(entry) = self.index.get(&seq).copied() else {
+            return Ok(None);
+        };
+        self.file
+            .seek(SeekFrom::Start(entry.offset))
+            .with_context(|| format!("seek replication seq={seq}"))?;
+        let mut raw = vec![0u8; entry.len as usize];
+        self.file
+            .read_exact(&mut raw)
+            .with_context(|| format!("read replication seq={seq}"))?;
+        Ok(Some(Bytes::from(raw)))
+    }
+
+    fn read_range(&mut self, from_seq: u64, max_entries: usize) -> anyhow::Result<Vec<Bytes>> {
+        let capped = max_entries.clamp(1, LOG_RANGE_FRAME_MAX_ENTRIES);
+        let mut out = Vec::with_capacity(capped);
+        let seqs: Vec<u64> = self
+            .index
+            .range(from_seq..)
+            .map(|(seq, _)| *seq)
+            .take(capped)
+            .collect();
+        for seq in seqs {
+            if let Some(raw) = self.read_entry(seq)? {
+                out.push(raw);
+            }
+        }
+        Ok(out)
+    }
+
+    fn persist_meta(&self, sync: bool) -> anyhow::Result<()> {
+        let raw = serde_json::to_vec(&self.meta).context("encode replication meta")?;
+        let tmp = self.meta_path.with_extension("json.tmp");
+        fs::write(&tmp, raw).with_context(|| format!("write {}", tmp.display()))?;
+        if sync {
+            let file = OpenOptions::new()
+                .read(true)
+                .open(&tmp)
+                .with_context(|| format!("open {}", tmp.display()))?;
+            file.sync_data()
+                .with_context(|| format!("sync {}", tmp.display()))?;
+        }
+        fs::rename(&tmp, &self.meta_path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), self.meta_path.display()))?;
+        if sync {
+            let dir = OpenOptions::new()
+                .read(true)
+                .open(&self.dir)
+                .with_context(|| format!("open {}", self.dir.display()))?;
+            let _ = dir.sync_data();
+        }
+        Ok(())
+    }
+
+    fn compact_if_needed(&mut self) -> anyhow::Result<()> {
+        if self.index.len() <= self.max_entries {
+            return Ok(());
+        }
+        let keep_from = self
+            .index
+            .keys()
+            .nth(self.index.len().saturating_sub(self.max_entries))
+            .copied()
+            .unwrap_or(self.meta.next_seq);
+        if keep_from <= self.first_seq() {
+            return Ok(());
+        }
+
+        let tmp_path = self.log_path.with_extension("log.tmp");
+        let mut tmp = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .with_context(|| format!("open {}", tmp_path.display()))?;
+        let mut new_index = BTreeMap::new();
+        let mut offset = 0u64;
+        let seqs: Vec<u64> = self.index.range(keep_from..).map(|(seq, _)| *seq).collect();
+        for seq in seqs {
+            let Some(raw) = self.read_entry(seq)? else {
+                anyhow::bail!("missing seq={} during compaction", seq);
+            };
+            let len = u32::try_from(raw.len()).context("compaction payload too large")?;
+            tmp.write_all(&len.to_le_bytes())
+                .context("write compacted replication record length")?;
+            tmp.write_all(raw.as_ref())
+                .context("write compacted replication record payload")?;
+            new_index.insert(
+                seq,
+                JournalIndexEntry {
+                    offset: offset + 4,
+                    len,
+                },
+            );
+            offset = offset.saturating_add(4 + len as u64);
+        }
+        tmp.sync_data()
+            .with_context(|| format!("sync {}", tmp_path.display()))?;
+        drop(tmp);
+
+        fs::rename(&tmp_path, &self.log_path).with_context(|| {
+            format!(
+                "rename compacted log {} -> {}",
+                tmp_path.display(),
+                self.log_path.display()
+            )
+        })?;
+
+        self.file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.log_path)
+            .with_context(|| format!("reopen {}", self.log_path.display()))?;
+        self.file
+            .seek(SeekFrom::End(0))
+            .context("seek compacted replication log end")?;
+        self.index = new_index;
+        self.meta.first_seq = self.first_seq();
+        if self.meta.last_applied_seq.saturating_add(1) < self.meta.first_seq {
+            self.meta.last_applied_seq = self.meta.first_seq.saturating_sub(1);
+        }
+        self.persist_meta(true)
+    }
+}
+
+fn checksum_fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+fn encode_commit_mode(mode: MutationCommitMode) -> u8 {
+    match mode {
+        MutationCommitMode::Durable => 0,
+        MutationCommitMode::Acknowledged => 1,
+    }
+}
+
+fn decode_commit_mode(mode: u8) -> anyhow::Result<MutationCommitMode> {
+    match mode {
+        0 => Ok(MutationCommitMode::Durable),
+        1 => Ok(MutationCommitMode::Acknowledged),
+        _ => anyhow::bail!("invalid commit mode={mode}"),
+    }
+}
+
+fn encode_replication_payload(payload: &ReplicationPayload) -> anyhow::Result<Bytes> {
+    let payload_bytes =
+        rkyv::to_bytes::<_, 4096>(payload).context("serialize replication payload")?;
+    let checksum = checksum_fnv1a64(payload_bytes.as_ref());
+    let mut out = Vec::with_capacity(12 + payload_bytes.len());
+    out.extend_from_slice(&checksum.to_le_bytes());
+    let len = u32::try_from(payload_bytes.len()).context("replication payload too large")?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(payload_bytes.as_ref());
+    Ok(Bytes::from(out))
+}
+
+fn decode_replication_payload(raw: &[u8]) -> anyhow::Result<ReplicationPayload> {
+    if raw.len() < 12 {
+        anyhow::bail!("replication payload too short: {}", raw.len());
+    }
+    let checksum = u64::from_le_bytes(
+        raw[0..8]
+            .try_into()
+            .expect("checked exact checksum header length"),
+    );
+    let len = u32::from_le_bytes(
+        raw[8..12]
+            .try_into()
+            .expect("checked exact payload length header"),
+    ) as usize;
+    if raw.len() != 12 + len {
+        anyhow::bail!(
+            "replication payload length mismatch: raw={}, header_len={}",
+            raw.len(),
+            len
+        );
+    }
+    let payload_bytes = &raw[12..];
+    let actual_checksum = checksum_fnv1a64(payload_bytes);
+    if checksum != actual_checksum {
+        anyhow::bail!(
+            "replication checksum mismatch: got {}, expected {}",
+            checksum,
+            actual_checksum
+        );
+    }
+    let mut aligned = rkyv::AlignedVec::with_capacity(payload_bytes.len());
+    aligned.extend_from_slice(payload_bytes);
+    let archived = rkyv::check_archived_root::<ReplicationPayload>(aligned.as_ref())
+        .map_err(|err| anyhow::anyhow!("validate archived replication payload: {err}"))?;
+    let payload: ReplicationPayload = archived
+        .deserialize(&mut Infallible)
+        .map_err(|err| anyhow::anyhow!("deserialize replication payload: {err}"))?;
+    if payload.schema_version != REPLICATION_PAYLOAD_SCHEMA_VERSION {
+        anyhow::bail!(
+            "replication payload schema mismatch: got {}, expected {}",
+            payload.schema_version,
+            REPLICATION_PAYLOAD_SCHEMA_VERSION
+        );
+    }
+    Ok(payload)
+}
+
+fn encode_payload_frame(entries: &[Bytes]) -> anyhow::Result<Bytes> {
+    let count = u32::try_from(entries.len()).context("too many framed entries")?;
+    let mut out = Vec::with_capacity(
+        4 + entries
+            .iter()
+            .map(|entry| 4usize.saturating_add(entry.len()))
+            .sum::<usize>(),
+    );
+    out.extend_from_slice(&count.to_le_bytes());
+    for entry in entries {
+        let len = u32::try_from(entry.len()).context("framed entry too large")?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(entry);
+    }
+    Ok(Bytes::from(out))
+}
+
+#[cfg(test)]
+fn decode_payload_frame(raw: &[u8]) -> anyhow::Result<Vec<Bytes>> {
+    if raw.len() < 4 {
+        anyhow::bail!("payload frame too short");
+    }
+    let mut offset = 0usize;
+    let count =
+        u32::from_le_bytes(raw[offset..offset + 4].try_into().expect("checked header")) as usize;
+    offset += 4;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 4 > raw.len() {
+            anyhow::bail!("payload frame truncated at entry length");
+        }
+        let len = u32::from_le_bytes(
+            raw[offset..offset + 4]
+                .try_into()
+                .expect("checked entry length"),
+        ) as usize;
+        offset += 4;
+        if offset + len > raw.len() {
+            anyhow::bail!("payload frame truncated at entry payload");
+        }
+        out.push(Bytes::copy_from_slice(&raw[offset..offset + len]));
+        offset += len;
+    }
+    if offset != raw.len() {
+        anyhow::bail!("payload frame trailing bytes: {}", raw.len() - offset);
+    }
+    Ok(out)
 }
 
 #[derive(Debug)]
@@ -229,6 +779,15 @@ impl EtcdLeaderElector {
             "leader"
         } else {
             "follower"
+        }
+    }
+
+    fn current_term(&self) -> u64 {
+        match self.ownership.lock() {
+            Ok(ownership) => ownership
+                .and_then(|owned| u64::try_from(owned.lease_id).ok())
+                .unwrap_or(0),
+            Err(_) => 0,
         }
     }
 
@@ -335,19 +894,24 @@ impl EtcdLeaderElector {
     }
 }
 
-#[derive(Clone)]
 struct AppState {
     node_id: String,
     replica_peers: Vec<String>,
+    quorum_size: usize,
     replication_timeout: Duration,
+    replication_catchup_batch: usize,
     index: Arc<RwLock<SpFreshLayerDbShardedIndex>>,
     leader: Arc<EtcdLeaderElector>,
+    journal: Arc<Mutex<ReplicationJournal>>,
+    mutation_gate: Arc<AsyncMutex<()>>,
     http: Client,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ErrorResponse {
     error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replication_reject: Option<ReplicationRejectResponse>,
 }
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
@@ -358,6 +922,7 @@ struct RoleResponse {
     node_id: String,
     role: String,
     leader: bool,
+    replication: ReplicationState,
 }
 
 #[derive(Debug, Serialize)]
@@ -366,6 +931,7 @@ struct HealthResponse {
     role: String,
     leader: bool,
     stats: SpFreshLayerDbShardedStats,
+    replication: ReplicationState,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -373,17 +939,6 @@ struct HealthResponse {
 enum MutationInput {
     Upsert { id: u64, values: Vec<f32> },
     Delete { id: u64 },
-}
-
-impl MutationInput {
-    fn into_runtime(self) -> VectorMutation {
-        match self {
-            MutationInput::Upsert { id, values } => {
-                VectorMutation::Upsert(VectorRecord::new(id, values))
-            }
-            MutationInput::Delete { id } => VectorMutation::Delete { id },
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -433,6 +988,7 @@ fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
         status,
         Json(ErrorResponse {
             error: message.into(),
+            replication_reject: None,
         }),
     )
 }
@@ -448,10 +1004,18 @@ fn ensure_leader(state: &AppState) -> Result<(), ApiError> {
 }
 
 async fn role(State(state): State<Arc<AppState>>) -> ApiResult<RoleResponse> {
+    let replication = {
+        let journal = state
+            .journal
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
+        journal.snapshot_state()
+    };
     Ok(Json(RoleResponse {
         node_id: state.node_id.clone(),
         role: state.leader.role().to_string(),
         leader: state.leader.is_leader(),
+        replication,
     }))
 }
 
@@ -474,11 +1038,20 @@ async fn health(State(state): State<Arc<AppState>>) -> ApiResult<HealthResponse>
         result.map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
     })?;
 
+    let replication = {
+        let journal = state
+            .journal
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
+        journal.snapshot_state()
+    };
+
     Ok(Json(HealthResponse {
         node_id: state.node_id.clone(),
         role: state.leader.role().to_string(),
         leader: state.leader.is_leader(),
         stats,
+        replication,
     }))
 }
 
@@ -581,28 +1154,80 @@ async fn apply_mutations(
         ));
     }
 
-    let peers = state.replica_peers.clone();
-    let replication_payload = if peers.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_vec(&req).map(Bytes::from).map_err(|err| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("encode replication payload: {err}"),
-            )
-        })?)
+    let _gate = state.mutation_gate.lock().await;
+    let mode = req.commit_mode.unwrap_or(CommitModeArg::Durable).into();
+    let term = state.leader.current_term();
+    if term == 0 {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "write rejected: leader term unavailable",
+        ));
+    }
+    let seq = {
+        let journal = state
+            .journal
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
+        journal.next_seq()
     };
+    let payload = ReplicationPayload {
+        schema_version: REPLICATION_PAYLOAD_SCHEMA_VERSION,
+        seq,
+        term,
+        commit_mode: encode_commit_mode(mode),
+        mutations: req.mutations.into_iter().map(WireMutation::from).collect(),
+    };
+    let encoded = encode_replication_payload(&payload).map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("encode replication payload: {err:#}"),
+        )
+    })?;
 
-    let applied = apply_local_mutations(state.clone(), req).await?;
-    let replicated = if let Some(payload) = replication_payload {
-        replicate_to_followers(state.clone(), peers, payload).await
-    } else {
-        ReplicationSummary {
-            attempted: 0,
-            succeeded: 0,
-            failed: Vec::new(),
+    let applied =
+        apply_local_mutations_runtime(state.clone(), payload.to_runtime_mutations(), mode).await?;
+    let sync_journal = matches!(mode, MutationCommitMode::Durable);
+    {
+        let mut journal = state
+            .journal
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
+        journal
+            .append_entry(seq, encoded.as_ref(), sync_journal)
+            .map_err(|err| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("append replication journal seq={seq}: {err:#}"),
+                )
+            })?;
+        journal
+            .mark_applied(seq, term, sync_journal)
+            .map_err(|err| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("mark replication journal seq={seq} applied: {err:#}"),
+                )
+            })?;
+    }
+
+    let peers = state.replica_peers.clone();
+    let replicated = replicate_to_followers(state.clone(), peers, seq, term, encoded.clone()).await;
+
+    if matches!(mode, MutationCommitMode::Durable) {
+        let quorum_acks = 1usize.saturating_add(replicated.succeeded);
+        if quorum_acks < state.quorum_size {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "durable quorum not reached: quorum={} acks={} attempted_replicas={} failures={}",
+                    state.quorum_size,
+                    quorum_acks,
+                    replicated.attempted,
+                    replicated.failed.join(" | ")
+                ),
+            ));
         }
-    };
+    }
 
     Ok(Json(ApplyMutationsResponse {
         applied_upserts: applied.upserts,
@@ -611,18 +1236,123 @@ async fn apply_mutations(
     }))
 }
 
+fn replication_reject_error(error: String, journal: &ReplicationJournal) -> ApiError {
+    let reject = ReplicationRejectResponse {
+        error: error.clone(),
+        expected_seq: journal.expected_next_seq(),
+        first_available_seq: journal.first_seq(),
+        last_available_seq: journal.last_seq(),
+        max_term_seen: journal.max_term_seen(),
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(ErrorResponse {
+            error,
+            replication_reject: Some(reject),
+        }),
+    )
+}
+
 async fn apply_replication(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ApplyMutationsRequest>,
+    body: Bytes,
 ) -> ApiResult<ApplyMutationsResponse> {
-    if req.mutations.is_empty() {
+    let payload = decode_replication_payload(body.as_ref()).map_err(|err| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("decode replication payload: {err:#}"),
+        )
+    })?;
+    if payload.mutations.is_empty() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
-            "mutations must not be empty",
+            "replication payload mutations must not be empty",
         ));
     }
+    let _gate = state.mutation_gate.lock().await;
+    {
+        let mut journal = state
+            .journal
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
+        let expected = journal.expected_next_seq();
+        if payload.term < journal.max_term_seen() {
+            return Err(replication_reject_error(
+                format!(
+                    "stale term {} < max_term_seen {}",
+                    payload.term,
+                    journal.max_term_seen()
+                ),
+                &journal,
+            ));
+        }
+        if payload.seq < expected {
+            if let Some(existing) = journal.read_entry(payload.seq).map_err(|err| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("read replication seq={} from journal: {err:#}", payload.seq),
+                )
+            })? {
+                if existing.as_ref() == body.as_ref() {
+                    return Ok(Json(ApplyMutationsResponse {
+                        applied_upserts: 0,
+                        applied_deletes: 0,
+                        replicated: ReplicationSummary {
+                            attempted: 0,
+                            succeeded: 0,
+                            failed: Vec::new(),
+                        },
+                    }));
+                }
+            }
+            return Err(replication_reject_error(
+                format!(
+                    "duplicate or stale seq {} expected {}",
+                    payload.seq, expected
+                ),
+                &journal,
+            ));
+        }
+        if payload.seq > expected {
+            return Err(replication_reject_error(
+                format!("out-of-order seq {} expected {}", payload.seq, expected),
+                &journal,
+            ));
+        }
+    }
 
-    let applied = apply_local_mutations(state, req).await?;
+    let mode = payload.commit_mode().map_err(|err| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("invalid replication commit mode: {err:#}"),
+        )
+    })?;
+    let applied =
+        apply_local_mutations_runtime(state.clone(), payload.to_runtime_mutations(), mode).await?;
+    let sync_journal = matches!(mode, MutationCommitMode::Durable);
+    {
+        let mut journal = state
+            .journal
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
+        journal
+            .append_entry(payload.seq, body.as_ref(), sync_journal)
+            .map_err(|err| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("append replication seq={}: {err:#}", payload.seq),
+                )
+            })?;
+        journal
+            .mark_applied(payload.seq, payload.term, sync_journal)
+            .map_err(|err| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("mark replication seq={} applied: {err:#}", payload.seq),
+                )
+            })?;
+    }
+
     Ok(Json(ApplyMutationsResponse {
         applied_upserts: applied.upserts,
         applied_deletes: applied.deletes,
@@ -634,19 +1364,47 @@ async fn apply_replication(
     }))
 }
 
-async fn apply_local_mutations(
+async fn replication_log_range(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LogRangeRequest>,
+) -> Result<Bytes, ApiError> {
+    if req.max_entries == 0 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "max_entries must be > 0",
+        ));
+    }
+
+    let entries = {
+        let mut journal = state
+            .journal
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
+        journal
+            .read_range(req.from_seq, req.max_entries)
+            .map_err(|err| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "read replication log range from_seq={}: {err:#}",
+                        req.from_seq
+                    ),
+                )
+            })?
+    };
+    encode_payload_frame(&entries).map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("encode replication frame: {err:#}"),
+        )
+    })
+}
+
+async fn apply_local_mutations_runtime(
     state: Arc<AppState>,
-    req: ApplyMutationsRequest,
+    mutations: Vec<VectorMutation>,
+    mode: MutationCommitMode,
 ) -> Result<VectorMutationBatchResult, ApiError> {
-    let ApplyMutationsRequest {
-        mutations,
-        commit_mode,
-    } = req;
-    let mode = commit_mode.unwrap_or(CommitModeArg::Durable).into();
-    let mutations: Vec<VectorMutation> = mutations
-        .into_iter()
-        .map(MutationInput::into_runtime)
-        .collect();
     let index = state.index.clone();
 
     tokio::task::spawn_blocking(move || {
@@ -695,9 +1453,218 @@ fn collect_replication_peers(self_url: Option<&str>, replica_urls: &[String]) ->
         .collect()
 }
 
+#[derive(Debug)]
+enum ReplicationSendError {
+    Reject(ReplicationRejectResponse),
+    Other(String),
+}
+
+fn parse_replication_reject(body: &[u8]) -> Option<ReplicationRejectResponse> {
+    if let Ok(reject) = serde_json::from_slice::<ReplicationRejectResponse>(body) {
+        return Some(reject);
+    }
+    if let Ok(err) = serde_json::from_slice::<ErrorResponse>(body) {
+        if let Some(reject) = err.replication_reject {
+            return Some(reject);
+        }
+        if let Ok(reject) = serde_json::from_str::<ReplicationRejectResponse>(&err.error) {
+            return Some(reject);
+        }
+    }
+    None
+}
+
+async fn send_replication_payload(
+    client: &Client,
+    endpoint: &str,
+    timeout: Duration,
+    payload: Bytes,
+) -> Result<(), ReplicationSendError> {
+    let response = client
+        .post(endpoint)
+        .timeout(timeout)
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(payload)
+        .send()
+        .await
+        .map_err(|err| ReplicationSendError::Other(format!("request failed: {err}")))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+
+    let body = response
+        .bytes()
+        .await
+        .unwrap_or_else(|_| Bytes::from_static(b""));
+    if status == StatusCode::CONFLICT {
+        if let Some(reject) = parse_replication_reject(body.as_ref()) {
+            return Err(ReplicationSendError::Reject(reject));
+        }
+    }
+    let body_snippet = String::from_utf8_lossy(body.as_ref());
+    let body_snippet = body_snippet
+        .chars()
+        .take(256)
+        .collect::<String>()
+        .replace('\n', "\\n");
+    Err(ReplicationSendError::Other(format!(
+        "http {status} body={body_snippet}"
+    )))
+}
+
+async fn catch_up_peer(
+    state: Arc<AppState>,
+    peer: &str,
+    endpoint: &str,
+    target_seq: u64,
+    mut next_seq: u64,
+    leader_term: u64,
+) -> Result<(), String> {
+    if next_seq > target_seq {
+        return Ok(());
+    }
+
+    let mut rounds = 0usize;
+    while next_seq <= target_seq {
+        rounds = rounds.saturating_add(1);
+        if rounds > 1_000_000 {
+            return Err(format!(
+                "{peer}: replication catch-up exceeded retry budget at seq {next_seq}"
+            ));
+        }
+
+        let entries = {
+            let mut journal = state
+                .journal
+                .lock()
+                .map_err(|_| format!("{peer}: journal lock poisoned"))?;
+            let first = journal.first_seq();
+            let next = journal.next_seq();
+            if next_seq < first {
+                return Err(format!(
+                    "{peer}: catch-up gap next_seq={} below first_available_seq={first}",
+                    next_seq
+                ));
+            }
+            if next_seq >= next {
+                return Err(format!(
+                    "{peer}: catch-up unavailable next_seq={} local_next_seq={next}",
+                    next_seq
+                ));
+            }
+            journal
+                .read_range(next_seq, state.replication_catchup_batch)
+                .map_err(|err| {
+                    format!("{peer}: read replication range from seq={next_seq}: {err:#}")
+                })?
+        };
+
+        if entries.is_empty() {
+            return Err(format!(
+                "{peer}: empty catch-up range at seq={next_seq} target_seq={target_seq}"
+            ));
+        }
+
+        let mut restart_from = None;
+        for raw in entries {
+            let entry = decode_replication_payload(raw.as_ref()).map_err(|err| {
+                format!("{peer}: decode local replication payload during catch-up: {err:#}")
+            })?;
+            if entry.seq < next_seq {
+                continue;
+            }
+            if entry.seq > target_seq {
+                return Ok(());
+            }
+
+            match send_replication_payload(
+                &state.http,
+                endpoint,
+                state.replication_timeout,
+                raw.clone(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    next_seq = entry.seq.saturating_add(1);
+                }
+                Err(ReplicationSendError::Reject(reject)) => {
+                    if reject.max_term_seen > leader_term {
+                        return Err(format!(
+                            "{peer}: follower term {} exceeds leader term {}",
+                            reject.max_term_seen, leader_term
+                        ));
+                    }
+                    if reject.expected_seq == entry.seq.saturating_add(1) {
+                        next_seq = reject.expected_seq;
+                        continue;
+                    }
+                    if reject.expected_seq > target_seq {
+                        return Ok(());
+                    }
+                    restart_from = Some(reject.expected_seq);
+                    break;
+                }
+                Err(ReplicationSendError::Other(err)) => {
+                    return Err(format!("{peer}: catch-up seq={} failed: {err}", entry.seq));
+                }
+            }
+        }
+
+        if let Some(restart) = restart_from {
+            next_seq = restart;
+        }
+    }
+    Ok(())
+}
+
+async fn replicate_to_peer(
+    state: Arc<AppState>,
+    peer: String,
+    seq: u64,
+    leader_term: u64,
+    payload: Bytes,
+) -> Result<(), String> {
+    let endpoint = join_base_url(&peer, "/v1/internal/replicate");
+    match send_replication_payload(&state.http, &endpoint, state.replication_timeout, payload).await
+    {
+        Ok(()) => Ok(()),
+        Err(ReplicationSendError::Reject(reject)) => {
+            if reject.max_term_seen > leader_term {
+                return Err(format!(
+                    "{peer}: follower term {} exceeds leader term {}",
+                    reject.max_term_seen, leader_term
+                ));
+            }
+            if reject.expected_seq > seq.saturating_add(1) {
+                return Err(format!(
+                    "{peer}: follower expected seq {} beyond leader seq {}",
+                    reject.expected_seq, seq
+                ));
+            }
+            if reject.expected_seq == seq.saturating_add(1) {
+                return Ok(());
+            }
+            catch_up_peer(
+                state.clone(),
+                &peer,
+                &endpoint,
+                seq,
+                reject.expected_seq,
+                leader_term,
+            )
+            .await
+        }
+        Err(ReplicationSendError::Other(err)) => Err(format!("{peer}: {err}")),
+    }
+}
+
 async fn replicate_to_followers(
     state: Arc<AppState>,
     peers: Vec<String>,
+    seq: u64,
+    leader_term: u64,
     payload: Bytes,
 ) -> ReplicationSummary {
     if peers.is_empty() {
@@ -709,25 +1676,13 @@ async fn replicate_to_followers(
     }
 
     let futures = peers.iter().map(|peer| {
-        let endpoint = join_base_url(peer, "/v1/internal/replicate");
-        let peer_name = peer.clone();
-        let body = payload.clone();
-        let client = state.http.clone();
-        let timeout = state.replication_timeout;
-        async move {
-            let response = client
-                .post(&endpoint)
-                .timeout(timeout)
-                .header(CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await;
-            match response {
-                Ok(resp) if resp.status().is_success() => Ok(peer_name),
-                Ok(resp) => Err(format!("{peer_name}: http {}", resp.status())),
-                Err(err) => Err(format!("{peer_name}: {err}")),
-            }
-        }
+        replicate_to_peer(
+            state.clone(),
+            peer.clone(),
+            seq,
+            leader_term,
+            payload.clone(),
+        )
     });
 
     let mut succeeded = 0usize;
@@ -781,8 +1736,13 @@ async fn main() -> anyhow::Result<()> {
     if args.etcd_username.is_some() ^ args.etcd_password.is_some() {
         anyhow::bail!("--etcd-username and --etcd-password must be set together");
     }
+    if args.replication_catchup_batch == 0 {
+        anyhow::bail!("--replication-catchup-batch must be > 0");
+    }
 
     let index = build_index(&args).context("open sharded index")?;
+    let journal = ReplicationJournal::open(&args.db_root, args.replication_log_max_entries)
+        .context("open replication journal")?;
 
     let election_cfg = EtcdElectionConfig {
         endpoints: args.etcd_endpoints.clone(),
@@ -799,13 +1759,19 @@ async fn main() -> anyhow::Result<()> {
     );
     let leader_task = tokio::spawn(leader.clone().run());
     let replica_peers = collect_replication_peers(args.self_url.as_deref(), &args.replica_urls);
+    let cluster_size = 1usize.saturating_add(replica_peers.len());
+    let quorum_size = cluster_size / 2 + 1;
 
     let state = Arc::new(AppState {
         node_id: args.node_id.clone(),
         replica_peers: replica_peers.clone(),
+        quorum_size,
         replication_timeout: Duration::from_millis(args.replication_timeout_ms.max(100)),
+        replication_catchup_batch: args.replication_catchup_batch,
         index: Arc::new(RwLock::new(index)),
         leader,
+        journal: Arc::new(Mutex::new(journal)),
+        mutation_gate: Arc::new(AsyncMutex::new(())),
         http: Client::new(),
     });
 
@@ -815,6 +1781,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/search", post(search))
         .route("/v1/mutations", post(apply_mutations))
         .route("/v1/internal/replicate", post(apply_replication))
+        .route("/v1/internal/log-range", post(replication_log_range))
         .route("/v1/force-rebuild", post(force_rebuild))
         .route("/v1/sync-to-s3", post(sync_to_s3))
         .with_state(state.clone());
@@ -855,7 +1822,14 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_replication_peers;
+    use super::{
+        collect_replication_peers, decode_payload_frame, decode_replication_payload,
+        encode_commit_mode, encode_payload_frame, encode_replication_payload,
+        parse_replication_reject, ErrorResponse, ReplicationJournal, ReplicationPayload,
+        ReplicationRejectResponse, WireMutation, REPLICATION_PAYLOAD_SCHEMA_VERSION,
+    };
+    use bytes::Bytes;
+    use vectordb::index::MutationCommitMode;
 
     #[test]
     fn collect_replication_peers_dedups_and_skips_self() {
@@ -873,5 +1847,116 @@ mod tests {
                 "http://127.0.0.1:8082".to_string()
             ]
         );
+    }
+
+    fn build_payload(seq: u64, term: u64) -> Bytes {
+        let payload = ReplicationPayload {
+            schema_version: REPLICATION_PAYLOAD_SCHEMA_VERSION,
+            seq,
+            term,
+            commit_mode: encode_commit_mode(MutationCommitMode::Durable),
+            mutations: vec![WireMutation::Delete { id: seq }],
+        };
+        encode_replication_payload(&payload).expect("encode payload")
+    }
+
+    #[test]
+    fn replication_payload_detects_checksum_corruption() {
+        let encoded = build_payload(1, 10);
+        let mut corrupted = encoded.to_vec();
+        corrupted[12] ^= 0x55;
+        let err = decode_replication_payload(&corrupted).expect_err("decode must fail");
+        assert!(err.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn payload_frame_roundtrip() {
+        let entries = vec![Bytes::from_static(b"abc"), build_payload(2, 20)];
+        let encoded = encode_payload_frame(&entries).expect("encode frame");
+        let decoded = decode_payload_frame(encoded.as_ref()).expect("decode frame");
+        assert_eq!(entries, decoded);
+    }
+
+    #[test]
+    fn parse_replication_reject_from_error_response() {
+        let reject = ReplicationRejectResponse {
+            error: "out-of-order".to_string(),
+            expected_seq: 11,
+            first_available_seq: 5,
+            last_available_seq: 42,
+            max_term_seen: 9,
+        };
+        let body = serde_json::to_vec(&ErrorResponse {
+            error: reject.error.clone(),
+            replication_reject: Some(reject.clone()),
+        })
+        .expect("encode error response");
+        let parsed = parse_replication_reject(&body).expect("reject should parse");
+        assert_eq!(parsed.expected_seq, reject.expected_seq);
+        assert_eq!(parsed.first_available_seq, reject.first_available_seq);
+        assert_eq!(parsed.last_available_seq, reject.last_available_seq);
+        assert_eq!(parsed.max_term_seen, reject.max_term_seen);
+    }
+
+    #[test]
+    fn replication_journal_persists_and_recovers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let payload_1 = build_payload(1, 2);
+        let payload_2 = build_payload(2, 3);
+
+        {
+            let mut journal = ReplicationJournal::open(root, 8).expect("open journal");
+            journal
+                .append_entry(1, payload_1.as_ref(), true)
+                .expect("append seq 1");
+            journal.mark_applied(1, 2, true).expect("mark seq 1");
+            journal
+                .append_entry(2, payload_2.as_ref(), true)
+                .expect("append seq 2");
+            journal.mark_applied(2, 3, true).expect("mark seq 2");
+            assert_eq!(journal.first_seq(), 1);
+            assert_eq!(journal.next_seq(), 3);
+            assert_eq!(journal.last_applied_seq(), 2);
+        }
+
+        let mut reopened = ReplicationJournal::open(root, 8).expect("reopen journal");
+        assert_eq!(reopened.first_seq(), 1);
+        assert_eq!(reopened.next_seq(), 3);
+        assert_eq!(reopened.last_applied_seq(), 2);
+        assert_eq!(reopened.max_term_seen(), 3);
+        let read = reopened
+            .read_entry(2)
+            .expect("read seq 2")
+            .expect("entry exists");
+        assert_eq!(read, payload_2);
+    }
+
+    #[test]
+    fn replication_journal_compacts_old_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let payload_1 = build_payload(1, 1);
+        let payload_2 = build_payload(2, 1);
+        let payload_3 = build_payload(3, 1);
+
+        let mut journal = ReplicationJournal::open(root, 2).expect("open journal");
+        journal
+            .append_entry(1, payload_1.as_ref(), true)
+            .expect("append seq 1");
+        journal.mark_applied(1, 1, true).expect("mark seq 1");
+        journal
+            .append_entry(2, payload_2.as_ref(), true)
+            .expect("append seq 2");
+        journal.mark_applied(2, 1, true).expect("mark seq 2");
+        journal
+            .append_entry(3, payload_3.as_ref(), true)
+            .expect("append seq 3");
+        journal.mark_applied(3, 1, true).expect("mark seq 3");
+
+        assert_eq!(journal.first_seq(), 2);
+        assert!(journal.read_entry(1).expect("read seq 1").is_none());
+        assert!(journal.read_entry(2).expect("read seq 2").is_some());
+        assert!(journal.read_entry(3).expect("read seq 3").is_some());
     }
 }

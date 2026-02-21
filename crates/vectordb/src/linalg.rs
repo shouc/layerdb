@@ -70,17 +70,35 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 unsafe fn squared_l2_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
-        __m256, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps,
-        _mm256_sub_ps,
+        __m256, _mm256_add_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps,
+        _mm256_storeu_ps, _mm256_sub_ps,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
-        __m256, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps,
-        _mm256_sub_ps,
+        __m256, _mm256_add_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps,
+        _mm256_storeu_ps, _mm256_sub_ps,
     };
 
     let mut i = 0usize;
-    let mut sum: __m256 = _mm256_setzero_ps();
+    let mut sum0: __m256 = _mm256_setzero_ps();
+    let mut sum1: __m256 = _mm256_setzero_ps();
+    while i + 16 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va0 = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb0 = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+        let d0 = _mm256_sub_ps(va0, vb0);
+        sum0 = _mm256_fmadd_ps(d0, d0, sum0);
+
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va1 = unsafe { _mm256_loadu_ps(a.as_ptr().add(i + 8)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb1 = unsafe { _mm256_loadu_ps(b.as_ptr().add(i + 8)) };
+        let d1 = _mm256_sub_ps(va1, vb1);
+        sum1 = _mm256_fmadd_ps(d1, d1, sum1);
+        i += 16;
+    }
+    let mut sum = _mm256_add_ps(sum0, sum1);
     while i + 8 <= a.len() {
         // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
         let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
@@ -118,7 +136,25 @@ unsafe fn squared_l2_avx2(a: &[f32], b: &[f32]) -> f32 {
     };
 
     let mut i = 0usize;
-    let mut sum: __m256 = _mm256_setzero_ps();
+    let mut sum0: __m256 = _mm256_setzero_ps();
+    let mut sum1: __m256 = _mm256_setzero_ps();
+    while i + 16 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va0 = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb0 = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+        let d0 = _mm256_sub_ps(va0, vb0);
+        sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(d0, d0));
+
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va1 = unsafe { _mm256_loadu_ps(a.as_ptr().add(i + 8)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb1 = unsafe { _mm256_loadu_ps(b.as_ptr().add(i + 8)) };
+        let d1 = _mm256_sub_ps(va1, vb1);
+        sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(d1, d1));
+        i += 16;
+    }
+    let mut sum = _mm256_add_ps(sum0, sum1);
     while i + 8 <= a.len() {
         // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
         let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
@@ -146,15 +182,33 @@ unsafe fn squared_l2_avx2(a: &[f32], b: &[f32]) -> f32 {
 unsafe fn dot_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
-        __m256, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+        __m256, _mm256_add_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps,
+        _mm256_storeu_ps,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
-        __m256, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+        __m256, _mm256_add_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps,
+        _mm256_storeu_ps,
     };
 
     let mut i = 0usize;
-    let mut sum: __m256 = _mm256_setzero_ps();
+    let mut sum0: __m256 = _mm256_setzero_ps();
+    let mut sum1: __m256 = _mm256_setzero_ps();
+    while i + 16 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va0 = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb0 = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+        sum0 = _mm256_fmadd_ps(va0, vb0, sum0);
+
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va1 = unsafe { _mm256_loadu_ps(a.as_ptr().add(i + 8)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb1 = unsafe { _mm256_loadu_ps(b.as_ptr().add(i + 8)) };
+        sum1 = _mm256_fmadd_ps(va1, vb1, sum1);
+        i += 16;
+    }
+    let mut sum = _mm256_add_ps(sum0, sum1);
     while i + 8 <= a.len() {
         // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
         let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
@@ -188,7 +242,23 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
     };
 
     let mut i = 0usize;
-    let mut sum: __m256 = _mm256_setzero_ps();
+    let mut sum0: __m256 = _mm256_setzero_ps();
+    let mut sum1: __m256 = _mm256_setzero_ps();
+    while i + 16 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va0 = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb0 = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+        sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(va0, vb0));
+
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va1 = unsafe { _mm256_loadu_ps(a.as_ptr().add(i + 8)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb1 = unsafe { _mm256_loadu_ps(b.as_ptr().add(i + 8)) };
+        sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(va1, vb1));
+        i += 16;
+    }
+    let mut sum = _mm256_add_ps(sum0, sum1);
     while i + 8 <= a.len() {
         // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
         let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
@@ -209,13 +279,135 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
     out
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+unsafe fn squared_l2_sse2(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        __m128, _mm_add_ps, _mm_loadu_ps, _mm_mul_ps, _mm_setzero_ps, _mm_storeu_ps, _mm_sub_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        __m128, _mm_add_ps, _mm_loadu_ps, _mm_mul_ps, _mm_setzero_ps, _mm_storeu_ps, _mm_sub_ps,
+    };
+
+    let mut i = 0usize;
+    let mut sum0: __m128 = _mm_setzero_ps();
+    let mut sum1: __m128 = _mm_setzero_ps();
+    while i + 8 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va0 = unsafe { _mm_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb0 = unsafe { _mm_loadu_ps(b.as_ptr().add(i)) };
+        let d0 = _mm_sub_ps(va0, vb0);
+        sum0 = _mm_add_ps(sum0, _mm_mul_ps(d0, d0));
+
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va1 = unsafe { _mm_loadu_ps(a.as_ptr().add(i + 4)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb1 = unsafe { _mm_loadu_ps(b.as_ptr().add(i + 4)) };
+        let d1 = _mm_sub_ps(va1, vb1);
+        sum1 = _mm_add_ps(sum1, _mm_mul_ps(d1, d1));
+        i += 8;
+    }
+    let mut sum = _mm_add_ps(sum0, sum1);
+    while i + 4 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va = unsafe { _mm_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb = unsafe { _mm_loadu_ps(b.as_ptr().add(i)) };
+        let d = _mm_sub_ps(va, vb);
+        sum = _mm_add_ps(sum, _mm_mul_ps(d, d));
+        i += 4;
+    }
+
+    let mut lanes = [0f32; 4];
+    // SAFETY: writing exactly 4 f32 lanes to a properly sized stack array.
+    unsafe { _mm_storeu_ps(lanes.as_mut_ptr(), sum) };
+    let mut out = lanes.iter().sum::<f32>();
+    while i < a.len() {
+        let d = a[i] - b[i];
+        out += d * d;
+        i += 1;
+    }
+    out
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+unsafe fn dot_sse2(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        __m128, _mm_add_ps, _mm_loadu_ps, _mm_mul_ps, _mm_setzero_ps, _mm_storeu_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        __m128, _mm_add_ps, _mm_loadu_ps, _mm_mul_ps, _mm_setzero_ps, _mm_storeu_ps,
+    };
+
+    let mut i = 0usize;
+    let mut sum0: __m128 = _mm_setzero_ps();
+    let mut sum1: __m128 = _mm_setzero_ps();
+    while i + 8 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va0 = unsafe { _mm_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb0 = unsafe { _mm_loadu_ps(b.as_ptr().add(i)) };
+        sum0 = _mm_add_ps(sum0, _mm_mul_ps(va0, vb0));
+
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va1 = unsafe { _mm_loadu_ps(a.as_ptr().add(i + 4)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb1 = unsafe { _mm_loadu_ps(b.as_ptr().add(i + 4)) };
+        sum1 = _mm_add_ps(sum1, _mm_mul_ps(va1, vb1));
+        i += 8;
+    }
+    let mut sum = _mm_add_ps(sum0, sum1);
+    while i + 4 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va = unsafe { _mm_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb = unsafe { _mm_loadu_ps(b.as_ptr().add(i)) };
+        sum = _mm_add_ps(sum, _mm_mul_ps(va, vb));
+        i += 4;
+    }
+
+    let mut lanes = [0f32; 4];
+    // SAFETY: writing exactly 4 f32 lanes to a properly sized stack array.
+    unsafe { _mm_storeu_ps(lanes.as_mut_ptr(), sum) };
+    let mut out = lanes.iter().sum::<f32>();
+    while i < a.len() {
+        out += a[i] * b[i];
+        i += 1;
+    }
+    out
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn squared_l2_neon(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vld1q_f32, vmlaq_f32, vsubq_f32};
+    use std::arch::aarch64::{vaddq_f32, vaddvq_f32, vdupq_n_f32, vld1q_f32, vmlaq_f32, vsubq_f32};
 
     let mut i = 0usize;
-    let mut sum = vdupq_n_f32(0.0);
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    while i + 8 <= a.len() {
+        // SAFETY: bounds checked by loop guard.
+        let va0 = unsafe { vld1q_f32(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard.
+        let vb0 = unsafe { vld1q_f32(b.as_ptr().add(i)) };
+        let d0 = vsubq_f32(va0, vb0);
+        sum0 = vmlaq_f32(sum0, d0, d0);
+
+        // SAFETY: bounds checked by loop guard.
+        let va1 = unsafe { vld1q_f32(a.as_ptr().add(i + 4)) };
+        // SAFETY: bounds checked by loop guard.
+        let vb1 = unsafe { vld1q_f32(b.as_ptr().add(i + 4)) };
+        let d1 = vsubq_f32(va1, vb1);
+        sum1 = vmlaq_f32(sum1, d1, d1);
+        i += 8;
+    }
+    let mut sum = vaddq_f32(sum0, sum1);
     while i + 4 <= a.len() {
         // SAFETY: bounds checked by loop guard.
         let va = unsafe { vld1q_f32(a.as_ptr().add(i)) };
@@ -238,10 +430,26 @@ unsafe fn squared_l2_neon(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vld1q_f32, vmlaq_f32};
+    use std::arch::aarch64::{vaddq_f32, vaddvq_f32, vdupq_n_f32, vld1q_f32, vmlaq_f32};
 
     let mut i = 0usize;
-    let mut sum = vdupq_n_f32(0.0);
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    while i + 8 <= a.len() {
+        // SAFETY: bounds checked by loop guard.
+        let va0 = unsafe { vld1q_f32(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard.
+        let vb0 = unsafe { vld1q_f32(b.as_ptr().add(i)) };
+        sum0 = vmlaq_f32(sum0, va0, vb0);
+
+        // SAFETY: bounds checked by loop guard.
+        let va1 = unsafe { vld1q_f32(a.as_ptr().add(i + 4)) };
+        // SAFETY: bounds checked by loop guard.
+        let vb1 = unsafe { vld1q_f32(b.as_ptr().add(i + 4)) };
+        sum1 = vmlaq_f32(sum1, va1, vb1);
+        i += 8;
+    }
+    let mut sum = vaddq_f32(sum0, sum1);
     while i + 4 <= a.len() {
         // SAFETY: bounds checked by loop guard.
         let va = unsafe { vld1q_f32(a.as_ptr().add(i)) };
@@ -281,6 +489,9 @@ fn resolve_squared_l2_dispatch() -> BinaryKernel {
         if std::is_x86_feature_detected!("avx2") {
             return squared_l2_avx2_entry;
         }
+        if std::is_x86_feature_detected!("sse2") {
+            return squared_l2_sse2_entry;
+        }
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -300,6 +511,9 @@ fn resolve_dot_dispatch() -> BinaryKernel {
         }
         if std::is_x86_feature_detected!("avx2") {
             return dot_avx2_entry;
+        }
+        if std::is_x86_feature_detected!("sse2") {
+            return dot_sse2_entry;
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -337,6 +551,20 @@ fn dot_avx2_fma_entry(a: &[f32], b: &[f32]) -> f32 {
 fn dot_avx2_entry(a: &[f32], b: &[f32]) -> f32 {
     // SAFETY: dispatch resolver only selects this entrypoint when CPU supports avx2.
     unsafe { dot_avx2(a, b) }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn squared_l2_sse2_entry(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: dispatch resolver only selects this entrypoint when CPU supports sse2.
+    unsafe { squared_l2_sse2(a, b) }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn dot_sse2_entry(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: dispatch resolver only selects this entrypoint when CPU supports sse2.
+    unsafe { dot_sse2(a, b) }
 }
 
 #[cfg(target_arch = "aarch64")]

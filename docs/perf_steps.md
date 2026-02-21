@@ -87,3 +87,36 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.3640`
 - `search_qps_ratio=3.0444`
+
+## Step 4 (`simd-kernel-unroll-and-x86-sse2-fallback`)
+
+Change:
+- Unrolled AVX2/FMA and AVX2 non-FMA kernels in `dot`/`squared_l2` hot paths to reduce dependency-chain pressure.
+- Added explicit x86 SSE2 SIMD fallback kernels so x86 hosts without AVX2 still stay on a SIMD path.
+- Kept ARM NEON dispatch path and validated builds for both `x86_64-apple-darwin` and `aarch64-apple-darwin`.
+
+Benchmark runs (2x):
+
+SPFresh run1:
+- `update_qps=183480.62`
+- `search_qps=2082.94`
+- `recall_at_k=0.6030`
+
+SPFresh run2:
+- `update_qps=199256.12`
+- `search_qps=2298.22`
+- `recall_at_k=0.6030`
+
+LanceDB run1:
+- `update_qps=104954.51`
+- `search_qps=541.80`
+- `recall_at_k=0.4820`
+
+LanceDB run2:
+- `update_qps=110682.98`
+- `search_qps=629.60`
+- `recall_at_k=0.4890`
+
+Median SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.7749`
+- `search_qps_ratio=3.7401`

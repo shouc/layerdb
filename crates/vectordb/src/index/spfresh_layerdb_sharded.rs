@@ -49,6 +49,7 @@ pub struct SpFreshLayerDbShardedStats {
 pub struct SpFreshLayerDbShardedIndex {
     root: PathBuf,
     cfg: SpFreshLayerDbShardedConfig,
+    shard_mask: Option<usize>,
     shards: Vec<SpFreshLayerDbIndex>,
 }
 
@@ -111,7 +112,13 @@ impl SpFreshLayerDbShardedIndex {
         for (_id, shard) in pairs {
             shards.push(shard);
         }
-        Ok(Self { root, cfg, shards })
+        let shard_mask = Self::shard_mask_for(cfg.shard_count);
+        Ok(Self {
+            root,
+            cfg,
+            shard_mask,
+            shards,
+        })
     }
 
     pub fn open_existing(
@@ -147,6 +154,7 @@ impl SpFreshLayerDbShardedIndex {
         for (_id, shard) in pairs {
             shards.push(shard);
         }
+        let shard_mask = Self::shard_mask_for(shard_count);
         Ok(Self {
             root,
             cfg: SpFreshLayerDbShardedConfig {
@@ -156,6 +164,7 @@ impl SpFreshLayerDbShardedIndex {
                     ..Default::default()
                 },
             },
+            shard_mask,
             shards,
         })
     }
@@ -165,7 +174,19 @@ impl SpFreshLayerDbShardedIndex {
     }
 
     fn shard_for_id(&self, id: u64) -> usize {
-        (id as usize) % self.cfg.shard_count
+        if let Some(mask) = self.shard_mask {
+            (id as usize) & mask
+        } else {
+            (id as usize) % self.cfg.shard_count
+        }
+    }
+
+    fn shard_mask_for(shard_count: usize) -> Option<usize> {
+        if shard_count.is_power_of_two() {
+            Some(shard_count - 1)
+        } else {
+            None
+        }
     }
 
     fn validate_rows_dims(&self, rows: &[VectorRecord]) -> anyhow::Result<()> {

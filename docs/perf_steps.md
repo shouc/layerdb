@@ -120,3 +120,23 @@ LanceDB run2:
 Median SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7749`
 - `search_qps_ratio=3.7401`
+
+## Step 5 (`shard-routing-bitmask-fastpath`)
+
+Change:
+- Added deterministic shard-routing fast path for power-of-two shard counts (`id & (shard_count - 1)`) while preserving modulo routing for non-power-of-two shard layouts.
+- This removes repeated integer-division/modulo cost from hot update/mutation partitioning paths for typical production shard counts (4/8/16/...).
+
+SPFresh:
+- `update_qps=213350.40`
+- `search_qps=2366.64`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=98881.61`
+- `search_qps=542.32`
+- `recall_at_k=0.4900`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=2.1576`
+- `search_qps_ratio=4.3639`

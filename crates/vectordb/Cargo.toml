@@ -6,22 +6,25 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 arc-swap = "1.7"
+axum = { version = "0.8", features = ["json"] }
 arrow-array = "57.2"
 arrow-schema = "57.2"
 bincode = "1"
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
+etcd-client = "0.18"
 futures = "0.3"
 lancedb = "0.26.2"
 rand = "0.8"
 rayon = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rkyv = { version = "0.7", features = ["validation"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 layerdb = { path = "../layerdb" }
 memmap2 = "0.9"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 
 [[bin]]
 name = "bench_lancedb"
@@ -34,3 +37,7 @@ path = "../../bins/bench_spfresh_sharded.rs"
 [[bin]]
 name = "vectordb-cli"
 path = "../../bins/vectordb-cli.rs"
+
+[[bin]]
+name = "vectordb-deploy"
+path = "../../bins/vectordb-deploy.rs"

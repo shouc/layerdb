@@ -30,7 +30,24 @@ cargo run -p vectordb --bin vectordb-cli -- bench \
 # health check a persisted SPFresh LayerDB index
 cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
   --db /path/to/index --dim 64 --initial-postings 64
+
+# run sharded deployment server (leader-gated writes + replication fanout)
+cargo run -p vectordb --bin vectordb-deploy -- \
+  --db-root /tmp/vectordb-cluster/node1 \
+  --node-id node1 \
+  --listen 0.0.0.0:8080 \
+  --etcd-endpoints http://127.0.0.1:2379 \
+  --etcd-election-key /vectordb/prod/leader \
+  --self-url http://127.0.0.1:8080 \
+  --replica-urls http://127.0.0.1:8081,http://127.0.0.1:8082
 ```
+
+Deployment API (JSON):
+- `GET /v1/role`
+- `GET /v1/health`
+- `POST /v1/search`
+- `POST /v1/mutations` (leader only)
+- `POST /v1/internal/replicate` (peer replication endpoint)
 
 ## Crate Usage
 

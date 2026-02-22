@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::linalg::{mean, squared_l2};
@@ -11,7 +12,7 @@ fn default_diskmeta_probe_multiplier() -> usize {
     1
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 pub struct SpFreshConfig {
     pub dim: usize,
     pub initial_postings: usize,
@@ -39,14 +40,14 @@ impl Default for SpFreshConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 struct Posting {
     id: usize,
     centroid: Vec<f32>,
     members: Vec<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 pub struct SpFreshIndex {
     cfg: SpFreshConfig,
     postings: HashMap<usize, Posting>,

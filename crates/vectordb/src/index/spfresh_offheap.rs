@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::linalg::{mean, squared_l2};
@@ -9,28 +10,28 @@ use crate::types::{Neighbor, VectorRecord};
 use super::kmeans::l2_kmeans;
 use super::SpFreshConfig;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 struct Posting {
     id: usize,
     centroid: Vec<f32>,
     members: Vec<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 pub(crate) struct OffHeapPostingMeta {
     pub id: usize,
     pub centroid: Vec<f32>,
     pub size: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 pub(crate) struct OffHeapMetaSnapshot {
     pub postings: Vec<OffHeapPostingMeta>,
     pub vector_posting: HashMap<u64, usize>,
     pub next_posting_id: usize,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 pub(crate) struct SpFreshOffHeapIndex {
     cfg: SpFreshConfig,
     postings: HashMap<usize, Posting>,

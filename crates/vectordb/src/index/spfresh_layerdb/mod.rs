@@ -24,6 +24,7 @@ use anyhow::Context;
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use layerdb::{Db, DbOptions, ReadOptions, WriteOptions};
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
@@ -56,7 +57,7 @@ use vector_blocks::VectorBlockStore;
 pub use config::{SpFreshLayerDbConfig, SpFreshMemoryMode};
 pub use stats::SpFreshLayerDbStats;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 pub enum VectorMutation {
     Upsert(VectorRecord),
     Delete { id: u64 },
@@ -93,14 +94,14 @@ const POSTING_LOG_COMPACT_MIN_EVENTS: usize = 512;
 const POSTING_LOG_COMPACT_FACTOR: usize = 3;
 const ASYNC_COMMIT_MAX_INFLIGHT: usize = 8;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 enum RuntimeSpFreshIndex {
     Resident(SpFreshIndex),
     OffHeap(SpFreshOffHeapIndex),
     OffHeapDiskMeta(SpFreshDiskMetaIndex),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 struct PersistedIndexCheckpoint {
     schema_version: u32,
     generation: u64,

@@ -427,8 +427,16 @@ impl SpFreshLayerDbIndex {
     ) -> anyhow::Result<(RuntimeSpFreshIndex, Option<u64>)> {
         if let Some(raw) = load_index_checkpoint_bytes(db)? {
             match decode_checkpoint_frame(raw.as_ref()).and_then(|payload| {
-                bincode::deserialize::<PersistedIndexCheckpoint>(payload)
-                    .context("decode framed index checkpoint payload")
+                let mut aligned = rkyv::AlignedVec::with_capacity(payload.len());
+                aligned.extend_from_slice(payload);
+                // Safety: payload integrity is verified by CRC in decode_checkpoint_frame.
+                let archived =
+                    unsafe { rkyv::archived_root::<PersistedIndexCheckpoint>(aligned.as_ref()) };
+                let checkpoint: PersistedIndexCheckpoint =
+                    archived.deserialize(&mut rkyv::Infallible).map_err(|err| {
+                        anyhow::anyhow!("deserialize archived index checkpoint: {err}")
+                    })?;
+                Ok(checkpoint)
             }) {
                 Ok(checkpoint)
                     if checkpoint.schema_version
@@ -590,10 +598,10 @@ impl SpFreshLayerDbIndex {
             applied_wal_seq: next_wal_seq.checked_sub(1),
             index: snapshot,
         };
-        let payload =
-            bincode::serialize(&checkpoint).context("encode spfresh index checkpoint payload")?;
-        let bytes = encode_checkpoint_frame(payload.as_slice())
-            .context("frame spfresh index checkpoint")?;
+        let payload = rkyv::to_bytes::<_, 4096>(&checkpoint)
+            .context("archive spfresh index checkpoint payload")?;
+        let bytes =
+            encode_checkpoint_frame(payload.as_ref()).context("frame spfresh index checkpoint")?;
         persist_index_checkpoint_bytes(&self.db, bytes, true)?;
         let manifest = PersistedStartupManifest {
             schema_version: STARTUP_MANIFEST_SCHEMA_VERSION,

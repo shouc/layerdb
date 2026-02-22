@@ -1,3 +1,4 @@
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +37,7 @@ fn l2_norm(values: &[f32]) -> f32 {
     values.iter().map(|v| v * v).sum::<f32>().sqrt()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 pub(crate) struct DiskPosting {
     pub id: usize,
     pub centroid: Vec<f32>,
@@ -49,7 +50,7 @@ pub(crate) struct DiskPosting {
     pub sum_values: Vec<f64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 pub(crate) struct SpFreshDiskMetaIndex {
     cfg: SpFreshConfig,
     postings: FxHashMap<usize, DiskPosting>,

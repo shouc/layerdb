@@ -1269,3 +1269,39 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.3775`
 - `search_qps_ratio=3.3707`
+
+## Step 49 (`checkpoint-rkyv-archived-payload`)
+
+Change:
+- Switched index checkpoint payload encoding from `bincode` to archived `rkyv` bytes.
+- Kept existing checkpoint CRC frame (`icp1`) and framing checks.
+- Startup checkpoint load now deserializes from archived payload bytes.
+- Added `rkyv` derives on checkpoint-related index data types:
+  - `SpFreshConfig`
+  - `SpFreshIndex`
+  - `SpFreshOffHeapIndex`
+  - `SpFreshDiskMetaIndex`
+  - `VectorRecord`
+  - runtime checkpoint wrapper types
+
+Impact:
+- Reduces checkpoint encode/decode overhead and alloc churn relative to serde+bincode payloads.
+- Retains deterministic corruption handling through existing checkpoint frame CRC checks.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=190784.33`
+- `search_qps=2663.10`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=127759.81`
+- `search_qps=875.23`
+- `recall_at_k=0.4610`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.4933`
+- `search_qps_ratio=3.0427`

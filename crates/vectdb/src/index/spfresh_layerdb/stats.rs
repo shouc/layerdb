@@ -54,12 +54,18 @@ impl SpFreshLayerDbStatsInner {
         }
     }
 
-    pub(crate) fn inc_upserts(&self) {
-        self.total_upserts.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn add_upserts(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.total_upserts.fetch_add(count, Ordering::Relaxed);
     }
 
-    pub(crate) fn inc_deletes(&self) {
-        self.total_deletes.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn add_deletes(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.total_deletes.fetch_add(count, Ordering::Relaxed);
     }
 
     pub(crate) fn inc_persist_errors(&self) {

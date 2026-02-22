@@ -520,9 +520,7 @@ impl SpFreshLayerDbIndex {
                     cache.put(id, vector);
                 }
             }
-            for _ in 0..mutation_count {
-                self.stats.inc_upserts();
-            }
+            self.stats.add_upserts(mutation_count as u64);
             return Ok(mutation_count);
         }
 
@@ -603,9 +601,7 @@ impl SpFreshLayerDbIndex {
             }
         }
         self.mark_dirty_batch(touched_ids.as_slice());
-        for _ in 0..mutation_count {
-            self.stats.inc_upserts();
-        }
+        self.stats.add_upserts(mutation_count as u64);
         let pending = self.pending_ops.load(Ordering::Relaxed);
         if pending >= self.cfg.rebuild_pending_ops.max(1) {
             let _ = self.rebuild_tx.send(());
@@ -750,9 +746,7 @@ impl SpFreshLayerDbIndex {
                 self.apply_ephemeral_row_deletes(&mutations);
                 self.apply_ephemeral_posting_delete_deltas(posting_delete_deltas);
             }
-            for _ in 0..deleted {
-                self.stats.inc_deletes();
-            }
+            self.stats.add_deletes(deleted as u64);
             return Ok(deleted);
         }
 
@@ -827,9 +821,7 @@ impl SpFreshLayerDbIndex {
                 cache.remove(*id);
             }
         }
-        for _ in 0..deleted {
-            self.stats.inc_deletes();
-        }
+        self.stats.add_deletes(deleted as u64);
         if deleted > 0 {
             let pending = self.pending_ops.load(Ordering::Relaxed);
             if pending >= self.cfg.rebuild_pending_ops.max(1) {

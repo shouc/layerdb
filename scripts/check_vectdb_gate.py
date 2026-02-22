@@ -33,6 +33,17 @@ def main() -> int:
         failures.append(
             f"spfresh recall_at_k {sp_recall:.4f} < min {thresholds['min_spfresh_recall_at_k']}"
         )
+    lc_recall = float(lancedb["recall_at_k"])
+    min_lc_recall = thresholds.get("min_lancedb_recall_at_k")
+    if min_lc_recall is not None and lc_recall < float(min_lc_recall):
+        failures.append(f"lancedb recall_at_k {lc_recall:.4f} < min {min_lc_recall}")
+    max_recall_gap = thresholds.get("max_recall_gap_at_k")
+    recall_gap = abs(sp_recall - lc_recall)
+    if max_recall_gap is not None and recall_gap > float(max_recall_gap):
+        failures.append(
+            f"abs recall_at_k gap {recall_gap:.4f} > max {max_recall_gap} "
+            "(retune nprobe to make QPS comparison fair)"
+        )
 
     sp_search = float(spfresh["search_qps"])
     lc_search = max(float(lancedb["search_qps"]), 1e-9)
@@ -58,6 +69,7 @@ def main() -> int:
         "ratios": {
             "search_qps": search_ratio,
             "update_qps": update_ratio,
+            "recall_at_k_gap": recall_gap,
         },
         "thresholds": thresholds,
         "ok": len(failures) == 0,
@@ -79,4 +91,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

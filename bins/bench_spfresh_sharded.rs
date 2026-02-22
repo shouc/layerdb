@@ -52,6 +52,14 @@ struct Args {
     diskmeta: bool,
     #[arg(long, default_value_t = 1024)]
     update_batch: usize,
+    #[arg(long, default_value_t = false)]
+    exact_shard_prune: bool,
+    #[arg(long, default_value_t = 0)]
+    warmup_queries: usize,
+    #[arg(long, default_value_t = 1)]
+    search_runs: usize,
+    #[arg(long, default_value_t = false)]
+    skip_force_rebuild: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +94,9 @@ fn main() -> Result<()> {
     }
     if args.update_batch == 0 {
         anyhow::bail!("--update-batch must be > 0");
+    }
+    if args.search_runs == 0 {
+        anyhow::bail!("--search-runs must be > 0");
     }
 
     let dataset: Dataset = serde_json::from_slice(
@@ -159,7 +170,7 @@ fn main() -> Result<()> {
     let cfg = SpFreshLayerDbShardedConfig {
         shard_count: args.shards,
         shard: shard_cfg,
-        exact_shard_prune: false,
+        exact_shard_prune: args.exact_shard_prune,
     };
 
     let base_rows: Vec<VectorRecord> = dataset
@@ -184,19 +195,35 @@ fn main() -> Result<()> {
     let update_s = update_start.elapsed().as_secs_f64().max(1e-9);
     let update_qps = dataset.updates.len() as f64 / update_s;
 
-    index.force_rebuild()?;
+    let maintenance_start = Instant::now();
+    if !args.skip_force_rebuild {
+        index.force_rebuild()?;
+    }
+    let maintenance_ms = maintenance_start.elapsed().as_secs_f64() * 1000.0;
 
     let (final_ids, final_vectors) = final_rows_after_updates(&dataset);
     let expected = exact_topk_ids(&final_ids, &final_vectors, &dataset.queries, args.k);
 
-    let search_start = Instant::now();
-    let mut recall_sum = 0.0f64;
-    for (i, query) in dataset.queries.iter().enumerate() {
-        let got = index.search(query, args.k);
-        recall_sum += recall_at_k(&got, &expected[i], args.k) as f64;
+    let warmup_queries = args.warmup_queries.min(dataset.queries.len());
+    for query in dataset.queries.iter().take(warmup_queries) {
+        let _ = index.search(query, args.k);
     }
-    let search_s = search_start.elapsed().as_secs_f64().max(1e-9);
-    let search_qps = dataset.queries.len() as f64 / search_s;
+
+    let mut search_qps_runs = Vec::with_capacity(args.search_runs);
+    let mut recall_runs = Vec::with_capacity(args.search_runs);
+    for _run_idx in 0..args.search_runs {
+        let search_start = Instant::now();
+        let mut recall_sum = 0.0f64;
+        for (i, query) in dataset.queries.iter().enumerate() {
+            let got = index.search(query, args.k);
+            recall_sum += recall_at_k(&got, &expected[i], args.k) as f64;
+        }
+        let search_s = search_start.elapsed().as_secs_f64().max(1e-9);
+        search_qps_runs.push(dataset.queries.len() as f64 / search_s);
+        recall_runs.push(recall_sum / dataset.queries.len() as f64);
+    }
+    let search_qps = median_f64(search_qps_runs.as_slice());
+    let recall_at_k = median_f64(recall_runs.as_slice());
 
     let output = serde_json::json!({
         "engine": "spfresh-layerdb-sharded",
@@ -218,11 +245,18 @@ fn main() -> Result<()> {
         "offheap": args.offheap,
         "diskmeta": args.diskmeta,
         "update_batch": args.update_batch,
+        "warmup_queries": warmup_queries,
+        "search_runs": args.search_runs,
+        "search_qps_runs": search_qps_runs,
+        "recall_at_k_runs": recall_runs,
+        "skip_force_rebuild": args.skip_force_rebuild,
+        "maintenance_ms": maintenance_ms,
+        "exact_shard_prune": args.exact_shard_prune,
         "memory_mode": format!("{:?}", memory_mode),
         "build_ms": build_ms,
         "update_qps": update_qps,
         "search_qps": search_qps,
-        "recall_at_k": recall_sum / dataset.queries.len() as f64,
+        "recall_at_k": recall_at_k,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
 
@@ -297,4 +331,18 @@ fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
             d * d
         })
         .sum()
+}
+
+fn median_f64(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) * 0.5
+    }
 }

@@ -34,6 +34,11 @@ SP_DISKMETA_PROBE_MULTIPLIER="$(python3 -c 'import json,sys;print(json.load(open
 LC_NLIST="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["lancedb"]["nlist"])' "$CONFIG")"
 LC_NPROBE="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["lancedb"]["nprobe"])' "$CONFIG")"
 LC_UPDATE_BATCH="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["lancedb"]["update_batch"])' "$CONFIG")"
+SP_EXACT_SHARD_PRUNE="$(python3 -c 'import json,sys;print("true" if json.load(open(sys.argv[1]))["spfresh"].get("exact_shard_prune", False) else "false")' "$CONFIG")"
+
+FAIR_SEARCH_RUNS="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("fairness", {}).get("search_runs", 1))' "$CONFIG")"
+FAIR_WARMUP_QUERIES="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("fairness", {}).get("warmup_queries", 0))' "$CONFIG")"
+FAIR_MAINTENANCE_BEFORE_SEARCH="$(python3 -c 'import json,sys;print("true" if json.load(open(sys.argv[1])).get("fairness", {}).get("maintenance_before_search", True) else "false")' "$CONFIG")"
 
 echo "Generating benchmark dataset..."
 cargo run -p vectdb --bin vectdb-cli -- dump-dataset \
@@ -50,6 +55,18 @@ if [[ "$SP_DISKMETA" == "true" ]]; then
 else
   DISKMETA_FLAG=""
 fi
+if [[ "$SP_EXACT_SHARD_PRUNE" == "true" ]]; then
+  EXACT_SHARD_PRUNE_FLAG="--exact-shard-prune"
+else
+  EXACT_SHARD_PRUNE_FLAG=""
+fi
+if [[ "$FAIR_MAINTENANCE_BEFORE_SEARCH" == "true" ]]; then
+  SP_SKIP_FORCE_REBUILD_FLAG=""
+  LC_OPTIMIZE_BEFORE_SEARCH_FLAG="--optimize-before-search"
+else
+  SP_SKIP_FORCE_REBUILD_FLAG="--skip-force-rebuild"
+  LC_OPTIMIZE_BEFORE_SEARCH_FLAG=""
+fi
 cargo run --release -p vectdb --bin bench_spfresh_sharded -- \
   --dataset "$DATASET" \
   --k "$K" \
@@ -61,6 +78,10 @@ cargo run --release -p vectdb --bin bench_spfresh_sharded -- \
   --reassign-range "$SP_REASSIGN_RANGE" \
   --diskmeta-probe-multiplier "$SP_DISKMETA_PROBE_MULTIPLIER" \
   --update-batch "$SP_UPDATE_BATCH" \
+  --search-runs "$FAIR_SEARCH_RUNS" \
+  --warmup-queries "$FAIR_WARMUP_QUERIES" \
+  $SP_SKIP_FORCE_REBUILD_FLAG \
+  $EXACT_SHARD_PRUNE_FLAG \
   $DISKMETA_FLAG \
   > "$SPFRESH_JSON"
 
@@ -71,6 +92,9 @@ cargo run --release -p vectdb --bin bench_lancedb -- \
   --nlist "$LC_NLIST" \
   --nprobe "$LC_NPROBE" \
   --update-batch "$LC_UPDATE_BATCH" \
+  --search-runs "$FAIR_SEARCH_RUNS" \
+  --warmup-queries "$FAIR_WARMUP_QUERIES" \
+  $LC_OPTIMIZE_BEFORE_SEARCH_FLAG \
   > "$LANCEDB_JSON"
 
 python3 "$ROOT_DIR/scripts/check_vectdb_gate.py" \

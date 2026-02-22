@@ -8,7 +8,7 @@
     "k": 10
   },
   "spfresh": {
-    "shards": 8,
+    "shards": 1,
     "initial_postings": 64,
     "nprobe": 8,
     "split_limit": 256,
@@ -19,12 +19,19 @@
     "diskmeta": true
   },
   "lancedb": {
-    "nlist": 96,
-    "nprobe": 8,
+    "nlist": 64,
+    "nprobe": 64,
     "update_batch": 1024
+  },
+  "fairness": {
+    "search_runs": 3,
+    "warmup_queries": 32,
+    "maintenance_before_search": true
   },
   "thresholds": {
     "min_spfresh_recall_at_k": 0.95,
+    "min_lancedb_recall_at_k": 0.95,
+    "max_recall_gap_at_k": 0.05,
     "min_spfresh_search_qps_vs_lancedb_ratio": 1.0,
     "min_spfresh_update_qps_vs_lancedb_ratio": 0.35
   }

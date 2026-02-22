@@ -16,6 +16,7 @@ use futures::TryStreamExt;
 use lancedb::index::vector::IvfFlatIndexBuilder;
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::table::{OptimizeAction, OptimizeOptions};
 use lancedb::{connect, DistanceType};
 use serde::Deserialize;
 
@@ -33,6 +34,12 @@ struct Args {
     nprobe: usize,
     #[arg(long, default_value_t = 1)]
     update_batch: usize,
+    #[arg(long, default_value_t = 0)]
+    warmup_queries: usize,
+    #[arg(long, default_value_t = 1)]
+    search_runs: usize,
+    #[arg(long, default_value_t = false)]
+    optimize_before_search: bool,
     #[arg(long)]
     db: Option<PathBuf>,
     #[arg(long, default_value = "vectors")]
@@ -68,6 +75,9 @@ async fn main() -> Result<()> {
     }
     if args.nprobe == 0 {
         anyhow::bail!("--nprobe must be > 0");
+    }
+    if args.search_runs == 0 {
+        anyhow::bail!("--search-runs must be > 0");
     }
 
     let dataset: Dataset = serde_json::from_slice(
@@ -159,13 +169,21 @@ async fn main() -> Result<()> {
     let update_s = update_start.elapsed().as_secs_f64().max(1e-9);
     let update_qps = dataset.updates.len() as f64 / update_s;
 
+    let maintenance_start = Instant::now();
+    if args.optimize_before_search {
+        table
+            .optimize(OptimizeAction::Index(OptimizeOptions::default()))
+            .await
+            .context("optimize lancedb index before search")?;
+    }
+    let maintenance_ms = maintenance_start.elapsed().as_secs_f64() * 1000.0;
+
     let (final_ids, final_vectors) = final_rows_after_updates(&dataset);
     let expected = exact_topk_ids(&final_ids, &final_vectors, &dataset.queries, args.k);
 
-    let search_start = Instant::now();
-    let mut recall_sum = 0.0;
-    for (i, query) in dataset.queries.iter().enumerate() {
-        let results = table
+    let warmup_queries = args.warmup_queries.min(dataset.queries.len());
+    for query in dataset.queries.iter().take(warmup_queries) {
+        let _results = table
             .query()
             .nearest_to(query.as_slice())?
             .distance_type(DistanceType::L2)
@@ -176,12 +194,36 @@ async fn main() -> Result<()> {
             .context("execute lancedb vector query")?
             .try_collect::<Vec<RecordBatch>>()
             .await
-            .context("collect lancedb query results")?;
-        let got = extract_ids(&results, args.k)?;
-        recall_sum += recall_at_k(&got, &expected[i], args.k);
+            .context("collect lancedb warmup query results")?;
     }
-    let search_s = search_start.elapsed().as_secs_f64().max(1e-9);
-    let search_qps = dataset.queries.len() as f64 / search_s;
+
+    let mut search_qps_runs = Vec::with_capacity(args.search_runs);
+    let mut recall_runs = Vec::with_capacity(args.search_runs);
+    for _run_idx in 0..args.search_runs {
+        let search_start = Instant::now();
+        let mut recall_sum = 0.0;
+        for (i, query) in dataset.queries.iter().enumerate() {
+            let results = table
+                .query()
+                .nearest_to(query.as_slice())?
+                .distance_type(DistanceType::L2)
+                .nprobes(args.nprobe)
+                .limit(args.k)
+                .execute()
+                .await
+                .context("execute lancedb vector query")?
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .context("collect lancedb query results")?;
+            let got = extract_ids(&results, args.k)?;
+            recall_sum += recall_at_k(&got, &expected[i], args.k);
+        }
+        let search_s = search_start.elapsed().as_secs_f64().max(1e-9);
+        search_qps_runs.push(dataset.queries.len() as f64 / search_s);
+        recall_runs.push(recall_sum / dataset.queries.len() as f64);
+    }
+    let search_qps = median_f64(search_qps_runs.as_slice());
+    let recall_at_k = median_f64(recall_runs.as_slice());
 
     let output = serde_json::json!({
         "engine": "lancedb-ivf-flat",
@@ -196,10 +238,16 @@ async fn main() -> Result<()> {
         "nlist": args.nlist,
         "nprobe": args.nprobe,
         "update_batch": args.update_batch,
+        "warmup_queries": warmup_queries,
+        "search_runs": args.search_runs,
+        "search_qps_runs": search_qps_runs,
+        "recall_at_k_runs": recall_runs,
+        "optimize_before_search": args.optimize_before_search,
+        "maintenance_ms": maintenance_ms,
         "build_ms": build_ms,
         "update_qps": update_qps,
         "search_qps": search_qps,
-        "recall_at_k": recall_sum / dataset.queries.len() as f64,
+        "recall_at_k": recall_at_k,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
@@ -369,4 +417,18 @@ fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
             d * d
         })
         .sum()
+}
+
+fn median_f64(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) * 0.5
+    }
 }

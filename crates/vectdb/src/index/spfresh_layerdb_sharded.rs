@@ -668,6 +668,11 @@ impl SpFreshLayerDbShardedIndex {
             return Ok(0);
         }
         self.validate_rows_dims(rows)?;
+        if self.shards.len() == 1 {
+            return self.shards[0]
+                .try_upsert_batch_with_commit_mode(rows, commit_mode)
+                .with_context(|| "upsert batch shard 0".to_string());
+        }
         if rows.len() == 1 {
             let shard_id = self.shard_for_id(rows[0].id);
             return self.shards[shard_id]
@@ -716,6 +721,11 @@ impl SpFreshLayerDbShardedIndex {
             return Ok(0);
         }
         self.validate_rows_dims(rows.as_slice())?;
+        if self.shards.len() == 1 {
+            return self.shards[0]
+                .try_upsert_batch_owned_with_commit_mode(rows, commit_mode)
+                .with_context(|| "upsert batch shard 0".to_string());
+        }
         if rows.len() == 1 {
             let row = rows.into_iter().next().expect("rows.len() == 1");
             let shard_id = self.shard_for_id(row.id);
@@ -780,6 +790,11 @@ impl SpFreshLayerDbShardedIndex {
         if ids.is_empty() {
             return Ok(0);
         }
+        if self.shards.len() == 1 {
+            return self.shards[0]
+                .try_delete_batch_with_commit_mode(ids, commit_mode)
+                .with_context(|| "delete batch shard 0".to_string());
+        }
         if ids.len() == 1 {
             return self
                 .try_delete_with_commit_mode(ids[0], commit_mode)
@@ -830,6 +845,11 @@ impl SpFreshLayerDbShardedIndex {
             return Ok(VectorMutationBatchResult::default());
         }
         self.validate_mutations_dims(mutations)?;
+        if self.shards.len() == 1 {
+            return self.shards[0]
+                .try_apply_batch_with_commit_mode(mutations, commit_mode)
+                .with_context(|| "apply batch shard 0".to_string());
+        }
         if mutations.len() == 1 {
             let shard_id = self.shard_for_id(mutations[0].id());
             return self.shards[shard_id]
@@ -856,6 +876,11 @@ impl SpFreshLayerDbShardedIndex {
             return Ok(VectorMutationBatchResult::default());
         }
         self.validate_mutations_dims(mutations.as_slice())?;
+        if self.shards.len() == 1 {
+            return self.shards[0]
+                .try_apply_batch_owned_with_commit_mode(mutations, commit_mode)
+                .with_context(|| "apply batch shard 0".to_string());
+        }
         if mutations.len() == 1 {
             let shard_id = self.shard_for_id(mutations[0].id());
             return self.shards[shard_id]

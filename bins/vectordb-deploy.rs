@@ -104,6 +104,8 @@ struct Args {
 
     #[arg(long, default_value_t = 8)]
     nprobe: usize,
+    #[arg(long, default_value_t = 1)]
+    diskmeta_probe_multiplier: usize,
 
     #[arg(long, default_value_t = 8)]
     kmeans_iters: usize,
@@ -1997,6 +1999,7 @@ fn build_index(args: &Args) -> anyhow::Result<SpFreshLayerDbShardedIndex> {
             merge_limit: args.merge_limit,
             reassign_range: args.reassign_range,
             nprobe: args.nprobe,
+            diskmeta_probe_multiplier: args.diskmeta_probe_multiplier,
             kmeans_iters: args.kmeans_iters,
         },
         rebuild_pending_ops: args.rebuild_pending_ops,
@@ -2022,6 +2025,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.replication_catchup_batch == 0 {
         anyhow::bail!("--replication-catchup-batch must be > 0");
+    }
+    if args.diskmeta_probe_multiplier == 0 {
+        anyhow::bail!("--diskmeta-probe-multiplier must be > 0");
     }
 
     let index = build_index(&args).context("open sharded index")?;

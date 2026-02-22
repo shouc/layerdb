@@ -37,6 +37,7 @@ impl SpFreshLayerDbIndex {
                 merge_limit: meta.merge_limit,
                 reassign_range: meta.reassign_range,
                 nprobe: meta.nprobe,
+                diskmeta_probe_multiplier: meta.diskmeta_probe_multiplier,
                 kmeans_iters: meta.kmeans_iters,
             },
             db_options,

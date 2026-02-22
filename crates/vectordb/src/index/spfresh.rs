@@ -7,6 +7,10 @@ use crate::types::{Neighbor, VectorIndex, VectorRecord};
 
 use super::kmeans::l2_kmeans;
 
+fn default_diskmeta_probe_multiplier() -> usize {
+    1
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpFreshConfig {
     pub dim: usize,
@@ -15,6 +19,8 @@ pub struct SpFreshConfig {
     pub merge_limit: usize,
     pub reassign_range: usize,
     pub nprobe: usize,
+    #[serde(default = "default_diskmeta_probe_multiplier")]
+    pub diskmeta_probe_multiplier: usize,
     pub kmeans_iters: usize,
 }
 
@@ -27,6 +33,7 @@ impl Default for SpFreshConfig {
             merge_limit: 64,
             reassign_range: 64,
             nprobe: 8,
+            diskmeta_probe_multiplier: default_diskmeta_probe_multiplier(),
             kmeans_iters: 8,
         }
     }
@@ -515,6 +522,7 @@ mod tests {
             merge_limit: 1,
             reassign_range: 2,
             nprobe: 2,
+            diskmeta_probe_multiplier: 1,
             kmeans_iters: 4,
         };
 
@@ -537,6 +545,7 @@ mod tests {
             merge_limit: 1,
             reassign_range: 4,
             nprobe: 3,
+            diskmeta_probe_multiplier: 1,
             kmeans_iters: 4,
         };
 

@@ -573,6 +573,7 @@ mod tests {
             merge_limit: 1,
             reassign_range: 2,
             nprobe: 2,
+            diskmeta_probe_multiplier: 1,
             kmeans_iters: 4,
         };
         let base = vec![

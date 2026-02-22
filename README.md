@@ -25,11 +25,12 @@ cargo run -p vectordb --bin vectordb-cli -- version
 
 # benchmark across engines
 cargo run -p vectordb --bin vectordb-cli -- bench \
-  --dim 64 --base 20000 --updates 2000 --queries 400 --k 10
+  --dim 64 --base 20000 --updates 2000 --queries 400 --k 10 \
+  --spfresh-diskmeta --spfresh-diskmeta-probe-multiplier 8
 
 # health check a persisted SPFresh LayerDB index
 cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
-  --db /path/to/index --dim 64 --initial-postings 64
+  --db /path/to/index --dim 64 --initial-postings 64 --diskmeta-probe-multiplier 1
 
 # run sharded deployment server (leader-gated writes + replication fanout)
 cargo run -p vectordb --bin vectordb-deploy -- \

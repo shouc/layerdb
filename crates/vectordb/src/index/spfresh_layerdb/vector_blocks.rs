@@ -261,46 +261,67 @@ impl VectorBlockStore {
         let rec_size = record_size(self.dim);
         let mut found = Vec::with_capacity(ids.len());
         let mut missing = Vec::new();
-        for id in ids {
-            let Some(offset) = self.offsets.get(id).copied() else {
-                missing.push(*id);
-                continue;
-            };
-            let Some(start) = usize::try_from(offset).ok() else {
-                missing.push(*id);
-                continue;
-            };
-            let Some(end) = start.checked_add(rec_size) else {
-                missing.push(*id);
-                continue;
-            };
-            let Some(record) = mmap.get(start..end) else {
-                missing.push(*id);
-                continue;
-            };
-            let flags = record[8];
-            if (flags & VECTOR_BLOCK_TOMBSTONE) != 0 {
-                missing.push(*id);
-                continue;
-            }
-
-            let mut distance = 0.0f32;
-            let mut cursor = 17usize;
-            for query_value in query {
-                // SAFETY: `record` length is exactly one full record (rec_size), and
-                // `query.len() == self.dim`, so each 4-byte load is in-bounds.
-                let bits = unsafe {
-                    u32::from_le(record.as_ptr().add(cursor).cast::<u32>().read_unaligned())
+        let iterate =
+            |id: u64, offset: u64, found: &mut Vec<(u64, f32)>, missing: &mut Vec<u64>| {
+                let Some(start) = usize::try_from(offset).ok() else {
+                    missing.push(id);
+                    return;
                 };
-                let value = f32::from_bits(bits);
-                let delta = *query_value - value;
-                distance += delta * delta;
-                cursor += 4;
+                let Some(end) = start.checked_add(rec_size) else {
+                    missing.push(id);
+                    return;
+                };
+                let Some(record) = mmap.get(start..end) else {
+                    missing.push(id);
+                    return;
+                };
+                let flags = record[8];
+                if (flags & VECTOR_BLOCK_TOMBSTONE) != 0 {
+                    missing.push(id);
+                    return;
+                }
+
+                let mut distance = 0.0f32;
+                let mut cursor = 17usize;
+                for query_value in query {
+                    // SAFETY: `record` length is exactly one full record (rec_size), and
+                    // `query.len() == self.dim`, so each 4-byte load is in-bounds.
+                    let bits = unsafe {
+                        u32::from_le(record.as_ptr().add(cursor).cast::<u32>().read_unaligned())
+                    };
+                    let value = f32::from_bits(bits);
+                    let delta = *query_value - value;
+                    distance += delta * delta;
+                    cursor += 4;
+                }
+                if distance.is_finite() {
+                    found.push((id, distance));
+                } else {
+                    missing.push(id);
+                }
+            };
+
+        if ids.len() >= 2_048 {
+            let mut ordered_offsets = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(offset) = self.offsets.get(id).copied() else {
+                    missing.push(*id);
+                    continue;
+                };
+                ordered_offsets.push((*id, offset));
             }
-            if distance.is_finite() {
-                found.push((*id, distance));
-            } else {
-                missing.push(*id);
+            // Group large scans by file locality to reduce page-fault churn on cold scans.
+            ordered_offsets.sort_unstable_by_key(|(_, offset)| *offset);
+            for (id, offset) in ordered_offsets {
+                iterate(id, offset, &mut found, &mut missing);
+            }
+        } else {
+            for id in ids {
+                let Some(offset) = self.offsets.get(id).copied() else {
+                    missing.push(*id);
+                    continue;
+                };
+                iterate(*id, offset, &mut found, &mut missing);
             }
         }
         (found, missing)
@@ -510,6 +531,30 @@ mod tests {
         assert_eq!(found[0].0, 1);
         assert!((found[0].1 - 0.0).abs() <= f32::EPSILON);
         assert_eq!(missing, vec![2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn distances_for_ids_large_scan_path_matches_expected() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let mut store = VectorBlockStore::open(dir.path(), 2, 1)?;
+        let total = 2_200u64;
+        for id in 0..total {
+            store.append_upsert_with_posting(id, None, &[id as f32, 0.0])?;
+        }
+        // Ensure tombstones and missing ids are still handled on the ordered-offset path.
+        store.append_delete_batch(&[13, 1700, 2199])?;
+        store.remap()?;
+
+        let ids: Vec<u64> = (0..total).collect();
+        let (found, missing) = store.distances_for_ids(&ids, &[0.0, 0.0]);
+        assert_eq!(found.len(), (total as usize).saturating_sub(3));
+        assert_eq!(missing, vec![13, 1700, 2199]);
+        let found_zero = found
+            .iter()
+            .find(|(id, _)| *id == 0)
+            .expect("id=0 should be present");
+        assert!((found_zero.1 - 0.0).abs() <= f32::EPSILON);
         Ok(())
     }
 

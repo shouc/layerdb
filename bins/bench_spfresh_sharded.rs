@@ -28,6 +28,8 @@ struct Args {
     initial_postings: usize,
     #[arg(long, default_value_t = 8)]
     nprobe: usize,
+    #[arg(long, default_value_t = 1)]
+    diskmeta_probe_multiplier: usize,
     #[arg(long, default_value_t = 512)]
     split_limit: usize,
     #[arg(long, default_value_t = 64)]
@@ -75,6 +77,9 @@ fn main() -> Result<()> {
     }
     if args.nprobe == 0 {
         anyhow::bail!("--nprobe must be > 0");
+    }
+    if args.diskmeta_probe_multiplier == 0 {
+        anyhow::bail!("--diskmeta-probe-multiplier must be > 0");
     }
     if args.offheap && args.diskmeta {
         anyhow::bail!("--offheap and --diskmeta are mutually exclusive");
@@ -127,6 +132,7 @@ fn main() -> Result<()> {
             merge_limit: args.merge_limit,
             reassign_range: args.reassign_range,
             nprobe: args.nprobe,
+            diskmeta_probe_multiplier: args.diskmeta_probe_multiplier,
             kmeans_iters: 8,
         },
         rebuild_pending_ops: args.rebuild_pending_ops.max(1),
@@ -204,6 +210,7 @@ fn main() -> Result<()> {
         "shards": args.shards,
         "initial_postings": args.initial_postings,
         "nprobe": args.nprobe,
+        "diskmeta_probe_multiplier": args.diskmeta_probe_multiplier,
         "split_limit": args.split_limit,
         "merge_limit": args.merge_limit,
         "reassign_range": args.reassign_range,

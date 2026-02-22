@@ -482,18 +482,46 @@ impl SpFreshLayerDbShardedIndex {
         lower_bounds.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
         let mut top: Vec<Neighbor> = Vec::with_capacity(k);
-        for (shard_id, lower_bound) in lower_bounds {
-            if top.len() >= k {
-                let worst = top.last().map(|n| n.distance).unwrap_or(f32::INFINITY);
-                if lower_bound >= worst {
-                    break;
+        let window_size = rayon::current_num_threads()
+            .max(1)
+            .min(self.shards.len().max(1));
+        let mut cursor = 0usize;
+        while cursor < lower_bounds.len() {
+            let worst = top.last().map(|n| n.distance).unwrap_or(f32::INFINITY);
+            if top.len() >= k && lower_bounds[cursor].1 >= worst {
+                break;
+            }
+
+            let mut window = Vec::with_capacity(window_size);
+            while cursor < lower_bounds.len() && window.len() < window_size {
+                let (shard_id, lower_bound) = lower_bounds[cursor];
+                if top.len() >= k {
+                    let worst_now = top.last().map(|n| n.distance).unwrap_or(f32::INFINITY);
+                    if lower_bound >= worst_now {
+                        break;
+                    }
+                }
+                window.push(shard_id);
+                cursor = cursor.saturating_add(1);
+            }
+            if window.is_empty() {
+                break;
+            }
+
+            let results: Vec<Vec<Neighbor>> = window
+                .par_iter()
+                .map(|shard_id| self.shards[*shard_id].search(query, k))
+                .collect();
+            for shard_neighbors in results {
+                for neighbor in shard_neighbors {
+                    Self::push_neighbor_topk(&mut top, neighbor, k);
                 }
             }
-            let shard_neighbors = self.shards[shard_id].search(query, k);
-            for neighbor in shard_neighbors {
-                Self::push_neighbor_topk(&mut top, neighbor, k);
-            }
             top.sort_by(Self::neighbor_cmp);
+        }
+        top.sort_by(Self::neighbor_cmp);
+        if top.len() > k {
+            top.truncate(k);
         }
         top
     }

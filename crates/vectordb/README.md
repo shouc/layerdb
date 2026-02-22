@@ -26,6 +26,7 @@ Use `--spfresh-offheap` (vector payload off-heap) or `--spfresh-diskmeta`
 (vector payload + posting metadata off-heap) to run LayerDB-backed SPFresh variants in low-RAM modes.
 
 For higher recall operating points in SPFresh, raise `--nprobe` (for example `--nprobe 32`).
+For diskmeta mode, tune `--diskmeta-probe-multiplier` to scale probe fanout without changing `nprobe`.
 
 Export a reproducible benchmark dataset:
 ```bash
@@ -65,7 +66,7 @@ Run sharded SPFresh with disk-backed metadata (hot posting/member lists cached i
 cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
   --dataset /tmp/vectordb_dataset.json --k 10 --shards 4 \
   --initial-postings 64 --nprobe 8 --split-limit 256 --merge-limit 64 --reassign-range 16 \
-  --diskmeta
+  --diskmeta --diskmeta-probe-multiplier 8
 ```
 
 Run the cross-engine benchmark gate (SPFresh vs LanceDB thresholds):
@@ -77,7 +78,7 @@ Check SPFresh LayerDB index health:
 ```bash
 cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
   --db /path/to/spfresh-index --dim 64 --initial-postings 64 --split-limit 512 \
-  --merge-limit 64 --reassign-range 64 --nprobe 8 --kmeans-iters 8
+  --merge-limit 64 --reassign-range 64 --nprobe 8 --diskmeta-probe-multiplier 1 --kmeans-iters 8
 ```
 
 Docker integration test for the sharded deployment server (etcd + 3 nodes):

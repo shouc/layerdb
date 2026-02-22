@@ -129,9 +129,12 @@ impl SpFreshLayerDbIndex {
                     .len()
                     .saturating_mul(POSTING_LOG_COMPACT_FACTOR)
         {
-            if let Err(err) =
-                self.compact_posting_members_log(generation, posting_id, &loaded.members)
-            {
+            if let Err(err) = self.compact_posting_members_log(
+                generation,
+                posting_id,
+                loaded.max_event_seq,
+                &loaded.members,
+            ) {
                 eprintln!(
                     "spfresh-layerdb posting log compaction failed generation={} posting={}: {err:#}",
                     generation, posting_id
@@ -152,37 +155,28 @@ impl SpFreshLayerDbIndex {
         &self,
         generation: u64,
         posting_id: usize,
+        max_event_seq: Option<u64>,
         members: &[PostingMember],
     ) -> anyhow::Result<()> {
         let mut canonical = members.to_vec();
         canonical.sort_by_key(|m| m.id);
 
-        let mut next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
         let prefix = posting_members_prefix(generation, posting_id);
         let prefix_bytes = prefix.into_bytes();
-        let end = prefix_exclusive_end(&prefix_bytes)?;
-        let mut ops = vec![layerdb::Op::delete_range(prefix_bytes, end)];
-        for member in canonical {
-            let seq = next_seq;
-            next_seq = next_seq.saturating_add(1);
-            let scale = member.residual_scale.unwrap_or(1.0);
-            let code = member.residual_code.unwrap_or_default();
-            let value = posting_member_event_upsert_value_from_sketch(member.id, scale, &code)?;
-            ops.push(layerdb::Op::put(
-                posting_member_event_key(generation, posting_id, seq, member.id),
-                value,
-            ));
-        }
-        let posting_event_next =
-            bincode::serialize(&next_seq).context("encode posting-event next seq")?;
-        ops.push(layerdb::Op::put(
-            config::META_POSTING_EVENT_NEXT_SEQ_KEY,
-            posting_event_next,
-        ));
+        let end = match max_event_seq {
+            Some(seq) => posting_member_event_key(generation, posting_id, seq.saturating_add(1), 0)
+                .into_bytes(),
+            None => prefix_exclusive_end(&prefix_bytes)?,
+        };
+        let snapshot_key = posting_members_snapshot_key(generation, posting_id);
+        let snapshot_seq = max_event_seq.unwrap_or(0);
+        let snapshot_value = encode_posting_members_snapshot(snapshot_seq, canonical.as_slice())?;
+        let ops = vec![
+            layerdb::Op::put(snapshot_key, snapshot_value),
+            layerdb::Op::delete_range(prefix_bytes, end),
+        ];
         self.submit_commit(ops, false, true)
             .context("compact posting-member append log")?;
-        self.posting_event_next_seq
-            .store(next_seq, Ordering::Relaxed);
         Ok(())
     }
 

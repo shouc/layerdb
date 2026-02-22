@@ -14,7 +14,8 @@ use super::config::{
     SpFreshLayerDbConfig, SpFreshPersistedMeta, INDEX_WAL_PREFIX, META_ACTIVE_GENERATION_KEY,
     META_CONFIG_KEY, META_INDEX_CHECKPOINT_KEY, META_INDEX_WAL_NEXT_SEQ_KEY,
     META_POSTING_EVENT_NEXT_SEQ_KEY, META_SCHEMA_VERSION, META_STARTUP_MANIFEST_KEY,
-    POSTING_MAP_ROOT_PREFIX, POSTING_MEMBERS_ROOT_PREFIX, VECTOR_ROOT_PREFIX,
+    POSTING_MAP_ROOT_PREFIX, POSTING_MEMBERS_ROOT_PREFIX, POSTING_MEMBERS_SNAPSHOT_ROOT_PREFIX,
+    VECTOR_ROOT_PREFIX,
 };
 
 const VECTOR_ROW_BIN_TAG: &[u8] = b"vr3";
@@ -160,6 +161,9 @@ pub(crate) fn validate_config(cfg: &SpFreshLayerDbConfig) -> anyhow::Result<()> 
     }
     if cfg.spfresh.nprobe == 0 {
         anyhow::bail!("spfresh nprobe must be > 0");
+    }
+    if cfg.spfresh.diskmeta_probe_multiplier == 0 {
+        anyhow::bail!("spfresh diskmeta_probe_multiplier must be > 0");
     }
     if cfg.spfresh.kmeans_iters == 0 {
         anyhow::bail!("spfresh kmeans_iters must be > 0");
@@ -394,6 +398,7 @@ pub(crate) fn ensure_metadata(db: &Db, cfg: &SpFreshLayerDbConfig) -> anyhow::Re
         merge_limit: cfg.spfresh.merge_limit,
         reassign_range: cfg.spfresh.reassign_range,
         nprobe: cfg.spfresh.nprobe,
+        diskmeta_probe_multiplier: cfg.spfresh.diskmeta_probe_multiplier,
         kmeans_iters: cfg.spfresh.kmeans_iters,
     };
 
@@ -417,6 +422,7 @@ pub(crate) fn ensure_metadata(db: &Db, cfg: &SpFreshLayerDbConfig) -> anyhow::Re
             || actual.merge_limit != expected.merge_limit
             || actual.reassign_range != expected.reassign_range
             || actual.nprobe != expected.nprobe
+            || actual.diskmeta_probe_multiplier != expected.diskmeta_probe_multiplier
             || actual.kmeans_iters != expected.kmeans_iters
         {
             anyhow::bail!(
@@ -651,6 +657,13 @@ pub(crate) fn posting_members_generation_prefix(generation: u64) -> String {
     key
 }
 
+pub(crate) fn posting_members_snapshot_key(generation: u64, posting_id: usize) -> String {
+    let mut key = String::with_capacity(POSTING_MEMBERS_SNAPSHOT_ROOT_PREFIX.len() + 16 + 1 + 10);
+    key.push_str(POSTING_MEMBERS_SNAPSHOT_ROOT_PREFIX);
+    let _ = write!(&mut key, "{generation:016x}/{posting_id:010}");
+    key
+}
+
 pub(crate) fn posting_member_event_key(
     generation: u64,
     posting_id: usize,
@@ -670,11 +683,32 @@ pub(crate) fn posting_member_event_key(
 const POSTING_MEMBER_EVENT_RKYV_V3_TAG: &[u8] = b"pk3";
 const POSTING_MEMBER_EVENT_FLAG_TOMBSTONE: u8 = 1 << 0;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PostingMember {
     pub id: u64,
     pub residual_scale: Option<f32>,
     pub residual_code: Option<Vec<i8>>,
+}
+
+const POSTING_MEMBERS_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PostingMembersSnapshot {
+    pub schema_version: u32,
+    pub last_event_seq: u64,
+    pub members: Vec<PostingMember>,
+}
+
+pub(crate) fn encode_posting_members_snapshot(
+    last_event_seq: u64,
+    members: &[PostingMember],
+) -> anyhow::Result<Vec<u8>> {
+    let snapshot = PostingMembersSnapshot {
+        schema_version: POSTING_MEMBERS_SNAPSHOT_SCHEMA_VERSION,
+        last_event_seq,
+        members: members.to_vec(),
+    };
+    bincode::serialize(&snapshot).context("encode posting members snapshot")
 }
 
 pub(crate) fn posting_member_event_upsert_value_with_residual(
@@ -713,6 +747,7 @@ pub(crate) fn posting_member_event_upsert_value_with_residual(
     Ok(out)
 }
 
+#[cfg(test)]
 pub(crate) fn posting_member_event_upsert_value_from_sketch(
     id: u64,
     residual_scale: f32,
@@ -795,6 +830,15 @@ fn decode_posting_member_event(raw: &[u8]) -> anyhow::Result<DecodedPostingMembe
 pub(crate) struct PostingMembersLoadResult {
     pub members: Vec<PostingMember>,
     pub scanned_events: usize,
+    pub max_event_seq: Option<u64>,
+}
+
+fn parse_posting_member_event_seq(key: &[u8], prefix: &[u8]) -> Option<u64> {
+    let start = prefix.len();
+    let end = start.checked_add(20)?;
+    let seq_hex = key.get(start..end)?;
+    let seq_str = std::str::from_utf8(seq_hex).ok()?;
+    seq_str.parse::<u64>().ok()
 }
 
 pub(crate) fn load_posting_members(
@@ -804,12 +848,44 @@ pub(crate) fn load_posting_members(
 ) -> anyhow::Result<PostingMembersLoadResult> {
     let mut latest = FxHashMap::<u64, PostingMember>::default();
     let mut scanned_events = 0usize;
+    let mut max_event_seq = None;
+    let snapshot_key = posting_members_snapshot_key(generation, posting_id);
+    if let Some(snapshot_raw) = db
+        .get(snapshot_key.as_bytes(), ReadOptions::default())
+        .with_context(|| {
+            format!("load posting members snapshot generation={generation} posting={posting_id}")
+        })?
+    {
+        let snapshot: PostingMembersSnapshot = bincode::deserialize(snapshot_raw.as_ref())
+            .with_context(|| {
+                format!(
+                    "decode posting members snapshot generation={generation} posting={posting_id}"
+                )
+            })?;
+        if snapshot.schema_version == POSTING_MEMBERS_SNAPSHOT_SCHEMA_VERSION {
+            max_event_seq = Some(snapshot.last_event_seq);
+            for member in snapshot.members {
+                latest.insert(member.id, member);
+            }
+        }
+    }
+
     let prefix = posting_members_prefix(generation, posting_id);
     let prefix_bytes = prefix.as_bytes().to_vec();
     let end = prefix_exclusive_end(&prefix_bytes)?;
+    let start = if let Some(snapshot_seq) = max_event_seq {
+        Bytes::from(posting_member_event_key(
+            generation,
+            posting_id,
+            snapshot_seq.saturating_add(1),
+            0,
+        ))
+    } else {
+        Bytes::from(prefix_bytes.clone())
+    };
     let mut iter = db.iter(
         Range {
-            start: Bound::Included(Bytes::from(prefix_bytes.clone())),
+            start: Bound::Included(start),
             end: Bound::Excluded(Bytes::from(end)),
         },
         ReadOptions::default(),
@@ -824,6 +900,9 @@ pub(crate) fn load_posting_members(
             continue;
         };
         scanned_events = scanned_events.saturating_add(1);
+        if let Some(seq) = parse_posting_member_event_seq(&key, prefix_bytes.as_slice()) {
+            max_event_seq = Some(max_event_seq.map_or(seq, |existing| existing.max(seq)));
+        }
         let raw = value.as_ref();
         let decoded = decode_posting_member_event(raw).with_context(|| {
             format!(
@@ -854,6 +933,7 @@ pub(crate) fn load_posting_members(
     Ok(PostingMembersLoadResult {
         members,
         scanned_events,
+        max_event_seq,
     })
 }
 
@@ -915,6 +995,10 @@ mod tests {
                 "{POSTING_MEMBERS_ROOT_PREFIX}{generation:016x}/{posting_id:010}/{seq:020}/{id:020}"
             )
         );
+        assert_eq!(
+            posting_members_snapshot_key(generation, posting_id),
+            format!("{POSTING_MEMBERS_SNAPSHOT_ROOT_PREFIX}{generation:016x}/{posting_id:010}")
+        );
     }
 
     #[test]
@@ -931,5 +1015,48 @@ mod tests {
             }
             other => panic!("expected touch-batch entry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_posting_members_merges_snapshot_with_delta_events() -> anyhow::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let db = Db::open(dir.path(), layerdb::DbOptions::default())?;
+        let generation = 7u64;
+        let posting_id = 3usize;
+
+        let snapshot_members = vec![
+            PostingMember {
+                id: 11,
+                residual_scale: Some(1.0),
+                residual_code: Some(vec![1, 2, 3]),
+            },
+            PostingMember {
+                id: 12,
+                residual_scale: Some(1.0),
+                residual_code: Some(vec![4, 5, 6]),
+            },
+        ];
+        db.put(
+            posting_members_snapshot_key(generation, posting_id),
+            encode_posting_members_snapshot(10, snapshot_members.as_slice())?,
+            WriteOptions { sync: true },
+        )?;
+        db.put(
+            posting_member_event_key(generation, posting_id, 11, 12),
+            posting_member_event_tombstone_value(12)?,
+            WriteOptions { sync: true },
+        )?;
+        db.put(
+            posting_member_event_key(generation, posting_id, 12, 13),
+            posting_member_event_upsert_value_from_sketch(13, 1.0, &[7, 8, 9])?,
+            WriteOptions { sync: true },
+        )?;
+
+        let loaded = load_posting_members(&db, generation, posting_id)?;
+        let mut ids: Vec<u64> = loaded.members.iter().map(|m| m.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![11, 13]);
+        assert_eq!(loaded.max_event_seq, Some(12));
+        Ok(())
     }
 }

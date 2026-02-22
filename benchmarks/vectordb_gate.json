@@ -14,6 +14,7 @@
     "split_limit": 256,
     "merge_limit": 64,
     "reassign_range": 16,
+    "diskmeta_probe_multiplier": 8,
     "update_batch": 1024,
     "diskmeta": true
   },

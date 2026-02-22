@@ -29,6 +29,7 @@ SP_MERGE_LIMIT="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))
 SP_REASSIGN_RANGE="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["spfresh"]["reassign_range"])' "$CONFIG")"
 SP_UPDATE_BATCH="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["spfresh"]["update_batch"])' "$CONFIG")"
 SP_DISKMETA="$(python3 -c 'import json,sys;print("true" if json.load(open(sys.argv[1]))["spfresh"]["diskmeta"] else "false")' "$CONFIG")"
+SP_DISKMETA_PROBE_MULTIPLIER="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["spfresh"].get("diskmeta_probe_multiplier", 1))' "$CONFIG")"
 
 LC_NLIST="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["lancedb"]["nlist"])' "$CONFIG")"
 LC_NPROBE="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["lancedb"]["nprobe"])' "$CONFIG")"
@@ -58,6 +59,7 @@ cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
   --split-limit "$SP_SPLIT_LIMIT" \
   --merge-limit "$SP_MERGE_LIMIT" \
   --reassign-range "$SP_REASSIGN_RANGE" \
+  --diskmeta-probe-multiplier "$SP_DISKMETA_PROBE_MULTIPLIER" \
   --update-batch "$SP_UPDATE_BATCH" \
   $DISKMETA_FLAG \
   > "$SPFRESH_JSON"
@@ -76,4 +78,3 @@ python3 "$ROOT_DIR/scripts/check_vectordb_gate.py" \
   "$SPFRESH_JSON" \
   "$LANCEDB_JSON" \
   "$SUMMARY_JSON"
-

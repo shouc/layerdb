@@ -24,11 +24,29 @@ fn default_empty_coarse_to_postings() -> FxHashMap<usize, Vec<usize>> {
     FxHashMap::default()
 }
 
+fn default_infinite_f32() -> f32 {
+    f32::INFINITY
+}
+
+fn default_empty_sum_values() -> Vec<f64> {
+    Vec::new()
+}
+
+fn l2_norm(values: &[f32]) -> f32 {
+    values.iter().map(|v| v * v).sum::<f32>().sqrt()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct DiskPosting {
     pub id: usize,
     pub centroid: Vec<f32>,
     pub size: u64,
+    #[serde(default = "default_infinite_f32")]
+    pub max_radius: f32,
+    #[serde(default = "default_infinite_f32")]
+    pub max_l2_norm: f32,
+    #[serde(default = "default_empty_sum_values")]
+    pub sum_values: Vec<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,13 +107,15 @@ impl SpFreshDiskMetaIndex {
                         id: posting.id,
                         centroid: posting.centroid,
                         size: posting.size,
+                        max_radius: f32::INFINITY,
+                        max_l2_norm: f32::INFINITY,
+                        sum_values: vec![0.0; out.cfg.dim],
                     },
                 );
             }
             out.postings = postings;
             out.next_posting_id = snapshot.next_posting_id;
             out.total_rows = snapshot.vector_posting.len() as u64;
-            out.rebuild_coarse_index();
             let mut assignments = FxHashMap::with_capacity_and_hasher(
                 snapshot.vector_posting.len(),
                 Default::default(),
@@ -103,6 +123,44 @@ impl SpFreshDiskMetaIndex {
             for (id, posting_id) in snapshot.vector_posting {
                 assignments.insert(id, posting_id);
             }
+            let mut sums: FxHashMap<usize, Vec<f64>> = FxHashMap::default();
+            let mut counts: FxHashMap<usize, u64> = FxHashMap::default();
+            let mut max_norms: FxHashMap<usize, f32> = FxHashMap::default();
+            let mut max_radii: FxHashMap<usize, f32> = FxHashMap::default();
+            for row in rows {
+                let Some(posting_id) = assignments.get(&row.id).copied() else {
+                    continue;
+                };
+                let sum = sums
+                    .entry(posting_id)
+                    .or_insert_with(|| vec![0.0; out.cfg.dim]);
+                for (i, value) in row.values.iter().enumerate() {
+                    sum[i] += *value as f64;
+                }
+                *counts.entry(posting_id).or_insert(0) += 1;
+                let norm = l2_norm(&row.values);
+                let max_norm = max_norms.entry(posting_id).or_insert(0.0);
+                if norm > *max_norm {
+                    *max_norm = norm;
+                }
+                if let Some(posting) = out.postings.get(&posting_id) {
+                    let radius = squared_l2(&row.values, &posting.centroid).sqrt();
+                    let max_radius = max_radii.entry(posting_id).or_insert(0.0);
+                    if radius > *max_radius {
+                        *max_radius = radius;
+                    }
+                }
+            }
+            for (posting_id, posting) in &mut out.postings {
+                posting.size = counts.get(posting_id).copied().unwrap_or(posting.size);
+                posting.sum_values = sums
+                    .get(posting_id)
+                    .cloned()
+                    .unwrap_or_else(|| vec![0.0; out.cfg.dim]);
+                posting.max_l2_norm = max_norms.get(posting_id).copied().unwrap_or(f32::INFINITY);
+                posting.max_radius = max_radii.get(posting_id).copied().unwrap_or(f32::INFINITY);
+            }
+            out.rebuild_coarse_index();
             return (out, assignments);
         }
 
@@ -116,6 +174,7 @@ impl SpFreshDiskMetaIndex {
         let mut assigns = FxHashMap::with_capacity_and_hasher(rows.len(), Default::default());
         let mut sums: FxHashMap<usize, Vec<f64>> = FxHashMap::default();
         let mut counts: FxHashMap<usize, u64> = FxHashMap::default();
+        let mut max_norms: FxHashMap<usize, f32> = FxHashMap::default();
         for row in rows {
             let posting_id = if let Some(assigns) = known_assignments {
                 if let Some(pid) = assigns.get(&row.id).copied() {
@@ -126,6 +185,9 @@ impl SpFreshDiskMetaIndex {
                             id: pid,
                             centroid: row.values.clone(),
                             size: 0,
+                            max_radius: f32::INFINITY,
+                            max_l2_norm: f32::INFINITY,
+                            sum_values: vec![0.0; out.cfg.dim],
                         });
                         if out.next_posting_id <= pid {
                             out.next_posting_id = pid + 1;
@@ -152,6 +214,11 @@ impl SpFreshDiskMetaIndex {
                 sum[i] += *value as f64;
             }
             *counts.entry(posting_id).or_insert(0) += 1;
+            let norm = l2_norm(&row.values);
+            let entry = max_norms.entry(posting_id).or_insert(0.0);
+            if norm > *entry {
+                *entry = norm;
+            }
         }
 
         out.total_rows = rows.len() as u64;
@@ -159,13 +226,32 @@ impl SpFreshDiskMetaIndex {
             let count = counts.get(pid).copied().unwrap_or(0);
             posting.size = count;
             if count == 0 {
+                posting.sum_values = vec![0.0; out.cfg.dim];
+                posting.max_l2_norm = f32::INFINITY;
+                posting.max_radius = f32::INFINITY;
                 continue;
             }
             if let Some(sum) = sums.get(pid) {
+                posting.sum_values = sum.clone();
                 posting.centroid = sum
                     .iter()
                     .map(|v| (*v / count as f64) as f32)
                     .collect::<Vec<_>>();
+            }
+            posting.max_l2_norm = max_norms.get(pid).copied().unwrap_or(f32::INFINITY);
+            posting.max_radius = 0.0;
+        }
+
+        for row in rows {
+            let Some(posting_id) = assigns.get(&row.id).copied() else {
+                continue;
+            };
+            let Some(posting) = out.postings.get_mut(&posting_id) else {
+                continue;
+            };
+            let radius = squared_l2(&row.values, &posting.centroid).sqrt();
+            if radius > posting.max_radius {
+                posting.max_radius = radius;
             }
         }
 
@@ -183,6 +269,9 @@ impl SpFreshDiskMetaIndex {
                 id,
                 centroid,
                 size: 0,
+                max_radius: f32::INFINITY,
+                max_l2_norm: f32::INFINITY,
+                sum_values: vec![0.0; self.cfg.dim],
             },
         );
         id
@@ -243,22 +332,94 @@ impl SpFreshDiskMetaIndex {
         }
     }
 
+    fn scaled_probe_count(&self, base: usize, cap: usize) -> usize {
+        if cap == 0 {
+            return 0;
+        }
+        base.max(1)
+            .saturating_mul(self.cfg.diskmeta_probe_multiplier.max(1))
+            .min(cap)
+    }
+
+    fn ensure_sum_values(posting: &mut DiskPosting, dim: usize) {
+        if posting.sum_values.len() == dim {
+            return;
+        }
+        let n = posting.size as f64;
+        posting.sum_values = posting
+            .centroid
+            .iter()
+            .map(|value| *value as f64 * n)
+            .collect();
+    }
+
+    fn probe_cmp(a: &(usize, f32), b: &(usize, f32)) -> std::cmp::Ordering {
+        a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+    }
+
+    fn recompute_worst_probe_idx(top: &[(usize, f32)]) -> Option<usize> {
+        if top.is_empty() {
+            return None;
+        }
+        let mut worst = 0usize;
+        for idx in 1..top.len() {
+            if Self::probe_cmp(&top[idx], &top[worst]).is_gt() {
+                worst = idx;
+            }
+        }
+        Some(worst)
+    }
+
+    fn push_probe_topn(
+        top: &mut Vec<(usize, f32)>,
+        worst_idx: &mut Option<usize>,
+        candidate: (usize, f32),
+        n: usize,
+    ) {
+        if n == 0 {
+            return;
+        }
+        if top.len() < n {
+            top.push(candidate);
+            if top.len() == n {
+                *worst_idx = Self::recompute_worst_probe_idx(top);
+            }
+            return;
+        }
+        let worst = match *worst_idx {
+            Some(idx) if idx < top.len() => idx,
+            _ => {
+                let idx = Self::recompute_worst_probe_idx(top).expect("non-empty top");
+                *worst_idx = Some(idx);
+                idx
+            }
+        };
+        if Self::probe_cmp(&candidate, &top[worst]).is_lt() {
+            top[worst] = candidate;
+            *worst_idx = Self::recompute_worst_probe_idx(top);
+        }
+    }
+
     fn nearest_coarse_centroids(&self, query: &[f32], n: usize) -> Vec<usize> {
         if self.coarse_centroids.is_empty() || n == 0 {
             return Vec::new();
         }
-        let mut all: Vec<(usize, f32)> = self
-            .coarse_centroids
-            .iter()
-            .enumerate()
-            .map(|(cid, centroid)| (cid, squared_l2(query, centroid)))
-            .collect();
-        all.sort_by(|a, b| a.1.total_cmp(&b.1));
-        all.truncate(n.min(all.len()));
-        all.into_iter().map(|(cid, _)| cid).collect()
+        let limit = n.min(self.coarse_centroids.len());
+        let mut top = Vec::with_capacity(limit);
+        let mut worst_idx = None;
+        for (cid, centroid) in self.coarse_centroids.iter().enumerate() {
+            Self::push_probe_topn(
+                &mut top,
+                &mut worst_idx,
+                (cid, squared_l2(query, centroid)),
+                limit,
+            );
+        }
+        top.sort_by(Self::probe_cmp);
+        top.into_iter().map(|(cid, _)| cid).collect()
     }
 
-    fn candidate_postings_for_query(&self, query: &[f32]) -> Vec<usize> {
+    fn candidate_postings_for_query(&self, query: &[f32], coarse_probe: usize) -> Vec<usize> {
         if self.postings.len() <= self.cfg.initial_postings.max(1) {
             return self.postings.keys().copied().collect();
         }
@@ -266,11 +427,7 @@ impl SpFreshDiskMetaIndex {
             return self.postings.keys().copied().collect();
         }
 
-        let coarse_probe = self
-            .cfg
-            .nprobe
-            .max(1)
-            .min(self.coarse_centroids.len().max(1));
+        let coarse_probe = coarse_probe.max(1).min(self.coarse_centroids.len().max(1));
         let coarse_ids = self.nearest_coarse_centroids(query, coarse_probe);
         let mut out = Vec::new();
         for cid in coarse_ids {
@@ -287,33 +444,54 @@ impl SpFreshDiskMetaIndex {
         }
     }
 
-    fn nearest_postings(&self, query: &[f32], n: usize) -> Vec<(usize, f32)> {
-        let candidates = self.candidate_postings_for_query(query);
-        let mut all: Vec<(usize, f32)> = candidates
-            .iter()
-            .filter_map(|pid| {
-                self.postings
-                    .get(pid)
-                    .map(|p| (p.id, squared_l2(query, &p.centroid)))
-            })
-            .collect();
-        if all.is_empty() {
-            all = self
-                .postings
-                .values()
-                .map(|p| (p.id, squared_l2(query, &p.centroid)))
-                .collect();
+    fn nearest_postings_with_coarse(
+        &self,
+        query: &[f32],
+        n: usize,
+        coarse_probe: usize,
+    ) -> Vec<(usize, f32)> {
+        if n == 0 {
+            return Vec::new();
         }
-        all.sort_by(|a, b| a.1.total_cmp(&b.1));
-        all.truncate(n);
-        all
+        let candidates = self.candidate_postings_for_query(query, coarse_probe);
+        let mut top = Vec::with_capacity(n.min(candidates.len().max(1)));
+        let mut worst_idx = None;
+        for posting_id in candidates {
+            let Some(posting) = self.postings.get(&posting_id) else {
+                continue;
+            };
+            Self::push_probe_topn(
+                &mut top,
+                &mut worst_idx,
+                (posting.id, squared_l2(query, &posting.centroid)),
+                n,
+            );
+        }
+        if top.is_empty() {
+            for posting in self.postings.values() {
+                Self::push_probe_topn(
+                    &mut top,
+                    &mut worst_idx,
+                    (posting.id, squared_l2(query, &posting.centroid)),
+                    n,
+                );
+            }
+        }
+        top.sort_by(Self::probe_cmp);
+        top
+    }
+
+    fn nearest_postings(&self, query: &[f32], n: usize) -> Vec<(usize, f32)> {
+        self.nearest_postings_with_coarse(query, n, n)
     }
 
     pub(crate) fn choose_posting(&self, vector: &[f32]) -> Option<usize> {
         if vector.len() != self.cfg.dim {
             return None;
         }
-        let candidates = self.candidate_postings_for_query(vector);
+        let coarse_probe =
+            self.scaled_probe_count(self.cfg.nprobe.max(1), self.coarse_centroids.len());
+        let candidates = self.candidate_postings_for_query(vector, coarse_probe);
         let mut best: Option<(usize, f32)> = None;
         for posting_id in candidates {
             let Some(posting) = self.postings.get(&posting_id) else {
@@ -349,34 +527,116 @@ impl SpFreshDiskMetaIndex {
         out
     }
 
-    pub(crate) fn choose_probe_postings(&self, query: &[f32], k: usize) -> Vec<usize> {
+    fn posting_query_lower_bound_sq(
+        posting: &DiskPosting,
+        query_norm: f32,
+        centroid_distance_sq: f32,
+    ) -> f32 {
+        let centroid_lb = if posting.max_radius.is_finite() {
+            let d = centroid_distance_sq.sqrt() - posting.max_radius.max(0.0);
+            if d > 0.0 {
+                d * d
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        let norm_lb = if posting.max_l2_norm.is_finite() {
+            let d = query_norm - posting.max_l2_norm.max(0.0);
+            if d > 0.0 {
+                d * d
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        centroid_lb.max(norm_lb)
+    }
+
+    pub(crate) fn choose_probe_postings_with_bounds(
+        &self,
+        query: &[f32],
+        k: usize,
+    ) -> Vec<(usize, f32)> {
         if query.len() != self.cfg.dim || k == 0 {
             return Vec::new();
         }
-        let max_probe = self.postings.len().max(1);
-        let mut nearest = self.nearest_postings(query, max_probe);
-        if nearest.is_empty() {
+        let posting_count = self.postings.len();
+        if posting_count == 0 {
             return Vec::new();
         }
-        let probe_count = self.cfg.nprobe.max(1).min(nearest.len());
-        nearest.truncate(probe_count);
-        nearest.into_iter().map(|(pid, _)| pid).collect()
+        let base_probe = self.cfg.nprobe.max(k).min(posting_count);
+        let probe_count = self.scaled_probe_count(base_probe, posting_count);
+        let coarse_probe = self.scaled_probe_count(base_probe, self.coarse_centroids.len());
+        let query_norm = l2_norm(query);
+        let mut out: Vec<(usize, f32, f32)> = self
+            .nearest_postings_with_coarse(query, probe_count, coarse_probe)
+            .into_iter()
+            .filter_map(|(posting_id, centroid_distance_sq)| {
+                self.postings.get(&posting_id).map(|posting| {
+                    (
+                        posting_id,
+                        Self::posting_query_lower_bound_sq(
+                            posting,
+                            query_norm,
+                            centroid_distance_sq,
+                        ),
+                        centroid_distance_sq,
+                    )
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then_with(|| a.2.total_cmp(&b.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out.into_iter()
+            .map(|(posting_id, lb, _)| (posting_id, lb))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn choose_probe_postings(&self, query: &[f32], k: usize) -> Vec<usize> {
+        self.choose_probe_postings_with_bounds(query, k)
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect()
     }
 
     fn remove_from_posting(&mut self, posting_id: usize, old_vector: &[f32]) -> bool {
         let Some(posting) = self.postings.get_mut(&posting_id) else {
             return false;
         };
+        Self::ensure_sum_values(posting, self.cfg.dim);
         if posting.size <= 1 {
             posting.size = 0;
+            posting.sum_values = vec![0.0; self.cfg.dim];
+            posting.max_radius = f32::INFINITY;
+            posting.max_l2_norm = f32::INFINITY;
             return true;
         }
-        let n = posting.size as f64;
         for (i, v) in old_vector.iter().enumerate() {
-            posting.centroid[i] =
-                (((posting.centroid[i] as f64 * n) - *v as f64) / (n - 1.0)) as f32;
+            posting.sum_values[i] -= *v as f64;
         }
         posting.size -= 1;
+        let inv = 1.0 / posting.size as f64;
+        let mut centroid_shift_sq = 0.0f32;
+        for i in 0..self.cfg.dim {
+            let old_centroid = posting.centroid[i];
+            let new_centroid = (posting.sum_values[i] * inv) as f32;
+            let delta = old_centroid - new_centroid;
+            centroid_shift_sq += delta * delta;
+            posting.centroid[i] = new_centroid;
+        }
+        if posting.max_radius.is_finite() {
+            posting.max_radius = posting.max_radius.max(0.0) + centroid_shift_sq.sqrt();
+        }
+        if posting.max_l2_norm.is_finite() {
+            posting.max_l2_norm = posting.max_l2_norm.max(l2_norm(old_vector));
+        }
         false
     }
 
@@ -384,17 +644,38 @@ impl SpFreshDiskMetaIndex {
         let Some(posting) = self.postings.get_mut(&posting_id) else {
             return;
         };
+        Self::ensure_sum_values(posting, self.cfg.dim);
         if posting.size == 0 {
             posting.centroid = new_vector.to_vec();
             posting.size = 1;
+            posting.sum_values = new_vector.iter().map(|v| *v as f64).collect();
+            posting.max_radius = 0.0;
+            posting.max_l2_norm = l2_norm(new_vector);
             return;
         }
-        let n = posting.size as f64;
         for (i, v) in new_vector.iter().enumerate() {
-            posting.centroid[i] =
-                (((posting.centroid[i] as f64 * n) + *v as f64) / (n + 1.0)) as f32;
+            posting.sum_values[i] += *v as f64;
         }
         posting.size += 1;
+        let inv = 1.0 / posting.size as f64;
+        let mut centroid_shift_sq = 0.0f32;
+        for i in 0..self.cfg.dim {
+            let old_centroid = posting.centroid[i];
+            let new_centroid = (posting.sum_values[i] * inv) as f32;
+            let delta = old_centroid - new_centroid;
+            centroid_shift_sq += delta * delta;
+            posting.centroid[i] = new_centroid;
+        }
+        if posting.max_radius.is_finite() {
+            posting.max_radius = posting.max_radius.max(0.0) + centroid_shift_sq.sqrt();
+            let new_radius = squared_l2(new_vector, &posting.centroid).sqrt();
+            if new_radius > posting.max_radius {
+                posting.max_radius = new_radius;
+            }
+        }
+        if posting.max_l2_norm.is_finite() {
+            posting.max_l2_norm = posting.max_l2_norm.max(l2_norm(new_vector));
+        }
     }
 
     pub(crate) fn apply_upsert_ref(
@@ -406,10 +687,26 @@ impl SpFreshDiskMetaIndex {
         match old {
             Some((old_posting, old_vector)) if old_posting == new_posting => {
                 if let Some(posting) = self.postings.get_mut(&old_posting) {
-                    let n = posting.size.max(1) as f64;
+                    Self::ensure_sum_values(posting, self.cfg.dim);
+                    let size = posting.size.max(1) as f64;
+                    let mut centroid_shift_sq = 0.0f32;
                     for i in 0..self.cfg.dim {
-                        let delta = (new_vector[i] - old_vector[i]) as f64 / n;
-                        posting.centroid[i] += delta as f32;
+                        let old_centroid = posting.centroid[i];
+                        posting.sum_values[i] += (new_vector[i] - old_vector[i]) as f64;
+                        let new_centroid = (posting.sum_values[i] / size) as f32;
+                        let delta = old_centroid - new_centroid;
+                        centroid_shift_sq += delta * delta;
+                        posting.centroid[i] = new_centroid;
+                    }
+                    if posting.max_radius.is_finite() {
+                        posting.max_radius = posting.max_radius.max(0.0) + centroid_shift_sq.sqrt();
+                        let new_radius = squared_l2(new_vector, &posting.centroid).sqrt();
+                        if new_radius > posting.max_radius {
+                            posting.max_radius = new_radius;
+                        }
+                    }
+                    if posting.max_l2_norm.is_finite() {
+                        posting.max_l2_norm = posting.max_l2_norm.max(l2_norm(new_vector));
                     }
                 }
             }
@@ -428,6 +725,9 @@ impl SpFreshDiskMetaIndex {
                         id: new_posting,
                         centroid: new_vector.to_vec(),
                         size: 0,
+                        max_radius: f32::INFINITY,
+                        max_l2_norm: f32::INFINITY,
+                        sum_values: vec![0.0; self.cfg.dim],
                     });
                     if self.next_posting_id <= new_posting {
                         self.next_posting_id = new_posting + 1;
@@ -479,6 +779,8 @@ impl SpFreshDiskMetaIndex {
 
 #[cfg(test)]
 mod tests {
+    use rustc_hash::FxHashMap;
+
     use super::SpFreshDiskMetaIndex;
     use crate::index::SpFreshConfig;
     use crate::types::VectorRecord;
@@ -493,6 +795,36 @@ mod tests {
             rows.push(VectorRecord::new(i as u64, v));
         }
         rows
+    }
+
+    fn naive_nearest_postings(
+        index: &SpFreshDiskMetaIndex,
+        query: &[f32],
+        n: usize,
+    ) -> Vec<(usize, f32)> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let candidates = index.candidate_postings_for_query(query, n);
+        let mut all: Vec<(usize, f32)> = candidates
+            .iter()
+            .filter_map(|pid| {
+                index
+                    .postings
+                    .get(pid)
+                    .map(|p| (p.id, crate::linalg::squared_l2(query, &p.centroid)))
+            })
+            .collect();
+        if all.is_empty() {
+            all = index
+                .postings
+                .values()
+                .map(|p| (p.id, crate::linalg::squared_l2(query, &p.centroid)))
+                .collect();
+        }
+        all.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        all.truncate(n.min(all.len()));
+        all
     }
 
     #[test]
@@ -559,5 +891,140 @@ mod tests {
             index.postings.contains_key(&new_posting),
             "new posting should exist after upsert"
         );
+    }
+
+    #[test]
+    fn nearest_postings_topn_matches_naive_sort() {
+        let cfg = SpFreshConfig {
+            dim: 16,
+            initial_postings: 32,
+            nprobe: 8,
+            ..Default::default()
+        };
+        let rows = synthetic_rows(cfg.dim, 2_048);
+        let (index, _assignments) = SpFreshDiskMetaIndex::build_with_assignments(cfg, &rows);
+
+        for &n in &[1usize, 2, 4, 8, 16] {
+            for query in rows
+                .iter()
+                .step_by(73)
+                .take(16)
+                .map(|r| r.values.as_slice())
+            {
+                let got = index.nearest_postings(query, n);
+                let want = naive_nearest_postings(&index, query, n);
+                assert_eq!(got, want, "n={n} query_first_dim={}", query[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn diskmeta_probe_multiplier_scales_search_probe_budget() {
+        let cfg = SpFreshConfig {
+            dim: 16,
+            initial_postings: 64,
+            nprobe: 1,
+            diskmeta_probe_multiplier: 4,
+            ..Default::default()
+        };
+        let rows = synthetic_rows(cfg.dim, 512);
+        let (index, _assignments) = SpFreshDiskMetaIndex::build_with_assignments(cfg, &rows);
+        let probes = index.choose_probe_postings(&rows[11].values, 1);
+        let expected = 4usize.min(index.postings.len());
+        assert_eq!(probes.len(), expected);
+    }
+
+    #[test]
+    fn mutation_bounds_remain_finite_and_sound() {
+        let cfg = SpFreshConfig {
+            dim: 8,
+            initial_postings: 16,
+            nprobe: 4,
+            ..Default::default()
+        };
+        let rows = synthetic_rows(cfg.dim, 256);
+        let (mut index, mut assignments) = SpFreshDiskMetaIndex::build_with_assignments(cfg, &rows);
+        let mut values_by_id: FxHashMap<u64, Vec<f32>> = rows
+            .iter()
+            .map(|row| (row.id, row.values.clone()))
+            .collect();
+
+        for step in 0..1_024usize {
+            let id = rows[step % rows.len()].id;
+            let old_posting = *assignments
+                .get(&id)
+                .expect("assignment must exist for all synthetic rows");
+            let old_values = values_by_id
+                .get(&id)
+                .expect("value must exist for all synthetic rows")
+                .clone();
+            let mut new_values = old_values.clone();
+            new_values[0] += ((step as f32) * 0.013).sin() * 0.07;
+            new_values[1] += ((step as f32) * 0.009).cos() * 0.05;
+            let new_posting = if step % 7 == 0 {
+                index.choose_posting(&new_values).unwrap_or(old_posting)
+            } else {
+                old_posting
+            };
+            index.apply_upsert(
+                Some((old_posting, old_values)),
+                new_posting,
+                new_values.clone(),
+            );
+            assignments.insert(id, new_posting);
+            values_by_id.insert(id, new_values);
+
+            if step % 64 != 0 {
+                continue;
+            }
+            let mut member_counts: FxHashMap<usize, usize> = FxHashMap::default();
+            let mut member_ids: FxHashMap<usize, Vec<u64>> = FxHashMap::default();
+            for (&row_id, &posting_id) in &assignments {
+                *member_counts.entry(posting_id).or_insert(0) += 1;
+                member_ids.entry(posting_id).or_default().push(row_id);
+            }
+            for (&posting_id, posting) in &index.postings {
+                assert!(
+                    posting.max_radius.is_finite(),
+                    "posting={posting_id} max_radius should stay finite under mutations"
+                );
+                assert!(
+                    posting.max_l2_norm.is_finite(),
+                    "posting={posting_id} max_l2_norm should stay finite under mutations"
+                );
+                let count = member_counts.get(&posting_id).copied().unwrap_or(0);
+                assert_eq!(
+                    posting.size as usize, count,
+                    "posting={posting_id} size mismatch"
+                );
+                let mut true_max_norm = 0.0f32;
+                let mut true_max_radius = 0.0f32;
+                if let Some(ids) = member_ids.get(&posting_id) {
+                    for row_id in ids {
+                        let values = values_by_id
+                            .get(row_id)
+                            .expect("member row should have values");
+                        let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        if norm > true_max_norm {
+                            true_max_norm = norm;
+                        }
+                        let radius = crate::linalg::squared_l2(values, &posting.centroid).sqrt();
+                        if radius > true_max_radius {
+                            true_max_radius = radius;
+                        }
+                    }
+                }
+                assert!(
+                    posting.max_l2_norm + 1e-4 >= true_max_norm,
+                    "posting={posting_id} max_l2_norm={} true={true_max_norm}",
+                    posting.max_l2_norm
+                );
+                assert!(
+                    posting.max_radius + 1e-4 >= true_max_radius,
+                    "posting={posting_id} max_radius={} true={true_max_radius}",
+                    posting.max_radius
+                );
+            }
+        }
     }
 }

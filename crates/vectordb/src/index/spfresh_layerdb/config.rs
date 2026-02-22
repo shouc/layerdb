@@ -8,6 +8,7 @@ use crate::index::SpFreshConfig;
 pub(crate) const VECTOR_ROOT_PREFIX: &str = "spfresh/v/";
 pub(crate) const POSTING_MAP_ROOT_PREFIX: &str = "spfresh/m/";
 pub(crate) const POSTING_MEMBERS_ROOT_PREFIX: &str = "spfresh/p/";
+pub(crate) const POSTING_MEMBERS_SNAPSHOT_ROOT_PREFIX: &str = "spfresh/ps/";
 pub(crate) const META_CONFIG_KEY: &str = "spfresh/meta/config";
 pub(crate) const META_ACTIVE_GENERATION_KEY: &str = "spfresh/meta/active_generation";
 pub(crate) const META_INDEX_CHECKPOINT_KEY: &str = "spfresh/meta/index_checkpoint";
@@ -18,6 +19,10 @@ pub(crate) const INDEX_WAL_PREFIX: &str = "spfresh/wal/";
 pub(crate) const META_SCHEMA_VERSION: u32 = 1;
 pub(crate) const META_INDEX_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 
+fn default_diskmeta_probe_multiplier() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SpFreshPersistedMeta {
     pub schema_version: u32,
@@ -27,6 +32,8 @@ pub(crate) struct SpFreshPersistedMeta {
     pub merge_limit: usize,
     pub reassign_range: usize,
     pub nprobe: usize,
+    #[serde(default = "default_diskmeta_probe_multiplier")]
+    pub diskmeta_probe_multiplier: usize,
     pub kmeans_iters: usize,
 }
 

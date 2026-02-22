@@ -49,6 +49,8 @@ struct BenchArgs {
     initial_postings: usize,
     #[arg(long, default_value_t = 8)]
     nprobe: usize,
+    #[arg(long, default_value_t = 1)]
+    spfresh_diskmeta_probe_multiplier: usize,
     #[arg(long, default_value_t = 512)]
     split_limit: usize,
     #[arg(long, default_value_t = 64)]
@@ -123,6 +125,8 @@ struct SpfreshHealthArgs {
     reassign_range: usize,
     #[arg(long, default_value_t = 8)]
     nprobe: usize,
+    #[arg(long, default_value_t = 1)]
+    diskmeta_probe_multiplier: usize,
     #[arg(long, default_value_t = 8)]
     kmeans_iters: usize,
 }
@@ -156,6 +160,9 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
     }
     if args.spfresh_offheap && args.spfresh_diskmeta {
         anyhow::bail!("--spfresh-offheap and --spfresh-diskmeta are mutually exclusive");
+    }
+    if args.spfresh_diskmeta_probe_multiplier == 0 {
+        anyhow::bail!("--spfresh-diskmeta-probe-multiplier must be > 0");
     }
     let data = generate_synthetic(&SyntheticConfig {
         seed: args.seed,
@@ -205,6 +212,10 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
     println!("- same update stream and same query set for all engines");
     println!("- recall measured against exact KNN after all updates");
     println!("- same nprobe={} and top-k={}", args.nprobe, args.k);
+    println!(
+        "- SPFresh diskmeta probe multiplier={}",
+        args.spfresh_diskmeta_probe_multiplier
+    );
 
     Ok(())
 }
@@ -325,6 +336,9 @@ fn run_dump_dataset(args: &DumpDatasetArgs) -> Result<()> {
 }
 
 fn run_spfresh_health(args: &SpfreshHealthArgs) -> Result<()> {
+    if args.diskmeta_probe_multiplier == 0 {
+        anyhow::bail!("--diskmeta-probe-multiplier must be > 0");
+    }
     let cfg = SpFreshLayerDbConfig {
         spfresh: SpFreshConfig {
             dim: args.dim,
@@ -333,6 +347,7 @@ fn run_spfresh_health(args: &SpfreshHealthArgs) -> Result<()> {
             merge_limit: args.merge_limit,
             reassign_range: args.reassign_range,
             nprobe: args.nprobe,
+            diskmeta_probe_multiplier: args.diskmeta_probe_multiplier,
             kmeans_iters: args.kmeans_iters,
         },
         ..Default::default()
@@ -368,6 +383,7 @@ fn bench_spfresh(
         merge_limit: args.merge_limit,
         reassign_range: args.reassign_range,
         nprobe: args.nprobe,
+        diskmeta_probe_multiplier: args.spfresh_diskmeta_probe_multiplier,
         kmeans_iters: 8,
     };
 
@@ -453,6 +469,7 @@ fn bench_spfresh_layerdb(
         merge_limit: args.merge_limit,
         reassign_range: args.reassign_range,
         nprobe: args.nprobe,
+        diskmeta_probe_multiplier: args.spfresh_diskmeta_probe_multiplier,
         kmeans_iters: 8,
     };
     let cfg = SpFreshLayerDbConfig {
@@ -516,6 +533,7 @@ fn bench_spfresh_layerdb_sharded(
         merge_limit: args.merge_limit,
         reassign_range: args.reassign_range,
         nprobe: args.nprobe,
+        diskmeta_probe_multiplier: args.spfresh_diskmeta_probe_multiplier,
         kmeans_iters: 8,
     };
     let cfg = SpFreshLayerDbShardedConfig {

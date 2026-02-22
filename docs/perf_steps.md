@@ -811,3 +811,64 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.5786`
 - `search_qps_ratio=5.0220`
+
+## Step 32 (`diskmeta-probe-topn-selection`)
+
+Change:
+- Reworked diskmeta probe selection to avoid full sorting when only top-`nprobe` is required:
+  - added incremental top-N selection helpers in `SpFreshDiskMetaIndex`,
+  - applied them to coarse-centroid selection and posting selection.
+- `choose_probe_postings(...)` now directly requests only `probe_count` nearest postings.
+- Added deterministic equivalence test:
+  `nearest_postings_topn_matches_naive_sort`.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step33-spfresh.json`,
+  `target/vectordb-step33-lancedb.json`.
+
+SPFresh:
+- `update_qps=219030.05`
+- `search_qps=2858.59`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=130902.54`
+- `search_qps=916.08`
+- `recall_at_k=0.4845`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.6732`
+- `search_qps_ratio=3.1205`
+
+## Step 33 (`diskmeta-mutation-bound-shift-update`)
+
+Change:
+- Replaced mutation-time bound invalidation (`max_radius/max_l2_norm = INF`) with a sound
+  centroid-shift upper-bound update:
+  - for centroid movement from `c_old` to `c_new`, retained members satisfy
+    `||x - c_new|| <= ||x - c_old|| + ||c_old - c_new||`,
+  - add/same-posting-upsert paths also fold in exact distance of the new vector to the new
+    centroid.
+- This keeps posting bounds finite and useful for query-time lower-bound pruning without full
+  member rescans on each update.
+- Added deterministic stress test:
+  `mutation_bounds_remain_finite_and_sound`.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-gate/summary.json` (SPFresh + LanceDB from gate run).
+
+SPFresh:
+- `update_qps=230412.54`
+- `search_qps=2878.64`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=130275.48`
+- `search_qps=915.82`
+- `recall_at_k=0.4880`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.7687`
+- `search_qps_ratio=3.1433`

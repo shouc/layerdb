@@ -170,6 +170,7 @@ impl SpFreshLayerDbIndex {
         self.maybe_prewarm_posting_members_cache();
         Ok(())
     }
+
     fn dedup_last_upserts(rows: &[VectorRecord]) -> Vec<(u64, Vec<f32>)> {
         let mut seen = FxHashSet::with_capacity_and_hasher(rows.len(), Default::default());
         let mut out_rev = Vec::with_capacity(rows.len());
@@ -417,7 +418,7 @@ impl SpFreshLayerDbIndex {
                 mutations.len().saturating_mul(2),
                 Default::default(),
             );
-            let mut ephemeral_deltas = Vec::with_capacity(mutations.len());
+            let mut posting_deltas = Vec::with_capacity(mutations.len());
             for (id, vector) in &mutations {
                 let old = states.get(id).and_then(|state| state.as_ref());
                 let new_posting = shadow.choose_posting(vector).unwrap_or(0);
@@ -456,9 +457,8 @@ impl SpFreshLayerDbIndex {
                             ));
                         }
                     }
-                } else {
-                    ephemeral_deltas.push((*id, old_posting, new_posting));
                 }
+                posting_deltas.push((*id, old_posting, new_posting));
                 if let Some(old_posting) = old_posting {
                     dirty_postings.insert(old_posting);
                 }
@@ -527,7 +527,7 @@ impl SpFreshLayerDbIndex {
                     cache.put(*id, vector.clone());
                 }
                 self.apply_ephemeral_row_upserts(&mutations, &new_postings);
-                self.apply_ephemeral_posting_upsert_deltas(ephemeral_deltas);
+                self.apply_ephemeral_posting_upsert_deltas(posting_deltas);
             } else {
                 let mut cache = lock_mutex(&self.vector_cache);
                 for (id, vector) in mutations {
@@ -660,7 +660,7 @@ impl SpFreshLayerDbIndex {
             let mut deleted = 0usize;
             let mut dirty_postings =
                 FxHashSet::with_capacity_and_hasher(mutations.len(), Default::default());
-            let mut ephemeral_deletions = Vec::with_capacity(mutations.len());
+            let mut posting_delete_deltas = Vec::with_capacity(mutations.len());
             let mut posting_event_next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
             for id in &mutations {
                 let old = states.get(id).cloned().unwrap_or(None);
@@ -669,9 +669,8 @@ impl SpFreshLayerDbIndex {
                 }
                 if let Some((old_posting, _)) = &old {
                     dirty_postings.insert(*old_posting);
-                    if use_fast_path {
-                        ephemeral_deletions.push((*id, *old_posting));
-                    } else {
+                    posting_delete_deltas.push((*id, *old_posting));
+                    if !use_fast_path {
                         let tombstone_event_seq = posting_event_next_seq;
                         posting_event_next_seq = posting_event_next_seq.saturating_add(1);
                         batch_ops.push(layerdb::Op::put(
@@ -745,7 +744,7 @@ impl SpFreshLayerDbIndex {
             }
             if use_fast_path {
                 self.apply_ephemeral_row_deletes(&mutations);
-                self.apply_ephemeral_posting_delete_deltas(ephemeral_deletions);
+                self.apply_ephemeral_posting_delete_deltas(posting_delete_deltas);
             }
             for _ in 0..deleted {
                 self.stats.inc_deletes();

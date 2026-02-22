@@ -117,8 +117,23 @@ impl VectorIndex for SpFreshLayerDbIndex {
         let out = if let Some(index) = diskmeta_snapshot {
             let mut top = Vec::with_capacity(k);
             let mut worst_idx = None;
-            let postings = index.choose_probe_postings(query, k);
-            for posting_id in postings {
+            let postings = index.choose_probe_postings_with_bounds(query, k);
+            for (posting_id, lower_bound_sq) in postings {
+                if top.len() >= k {
+                    let worst = top[worst_idx.unwrap_or_else(|| {
+                        let mut idx = 0usize;
+                        for i in 1..top.len() {
+                            if Self::neighbor_cmp(&top[i], &top[idx]).is_gt() {
+                                idx = i;
+                            }
+                        }
+                        idx
+                    })]
+                    .distance;
+                    if lower_bound_sq >= worst {
+                        break;
+                    }
+                }
                 let members = self
                     .load_posting_members_for(generation, posting_id)
                     .unwrap_or_else(|err| panic!("offheap-diskmeta load members failed: {err:#}"));

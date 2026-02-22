@@ -1404,3 +1404,34 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.4136`
 - `search_qps_ratio=3.3379`
+
+## Step 53 (`commit-worker-hard-op-cap`)
+
+Change:
+- Fixed commit-worker grouped-write cap semantics to enforce `GROUP_COMMIT_MAX_OPS` strictly:
+  - introduced deferred request carry-over when the next request would overflow op budget
+  - kept request order deterministic by replaying deferred request first on next loop
+- Switched grouped-op accounting from repeated full-vector sums to incremental running totals.
+
+Impact:
+- Restores bounded group-commit behavior under heavy write concurrency.
+- Prevents oversize grouped batches that can increase tail latency and burst memory usage.
+- Reduces commit-worker overhead from repeated aggregate recomputation.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=204687.34`
+- `search_qps=2692.50`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=124810.83`
+- `search_qps=841.16`
+- `recall_at_k=0.4650`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.6400`
+- `search_qps_ratio=3.2009`

@@ -306,24 +306,37 @@ impl SpFreshLayerDbIndex {
         let commit_worker = std::thread::spawn(move || {
             const GROUP_COMMIT_MAX_REQUESTS: usize = 32;
             const GROUP_COMMIT_MAX_OPS: usize = 16_384;
-            while let Ok(req) = commit_rx.recv() {
+            let mut deferred = None;
+            loop {
+                let req = match deferred.take() {
+                    Some(req) => req,
+                    None => match commit_rx.recv() {
+                        Ok(req) => req,
+                        Err(_) => break,
+                    },
+                };
                 match req {
                     CommitRequest::Write { ops, sync, resp } => {
                         let mut grouped = Vec::with_capacity(GROUP_COMMIT_MAX_REQUESTS);
+                        let mut grouped_ops = 0usize;
+                        grouped_ops = grouped_ops.saturating_add(ops.len());
                         grouped.push((ops, sync, resp));
                         let mut saw_shutdown = false;
 
                         loop {
-                            let grouped_reqs = grouped.len();
-                            let grouped_ops: usize =
-                                grouped.iter().map(|(ops, _, _)| ops.len()).sum();
-                            if grouped_reqs >= GROUP_COMMIT_MAX_REQUESTS
+                            if grouped.len() >= GROUP_COMMIT_MAX_REQUESTS
                                 || grouped_ops >= GROUP_COMMIT_MAX_OPS
                             {
                                 break;
                             }
                             match commit_rx.try_recv() {
                                 Ok(CommitRequest::Write { ops, sync, resp }) => {
+                                    let next_grouped_ops = grouped_ops.saturating_add(ops.len());
+                                    if next_grouped_ops > GROUP_COMMIT_MAX_OPS {
+                                        deferred = Some(CommitRequest::Write { ops, sync, resp });
+                                        break;
+                                    }
+                                    grouped_ops = next_grouped_ops;
                                     grouped.push((ops, sync, resp));
                                 }
                                 Ok(CommitRequest::Shutdown) => {
@@ -336,8 +349,7 @@ impl SpFreshLayerDbIndex {
                         }
 
                         let need_sync = grouped.iter().any(|(_, sync, _)| *sync);
-                        let total_ops: usize = grouped.iter().map(|(ops, _, _)| ops.len()).sum();
-                        let mut merged_ops = Vec::with_capacity(total_ops);
+                        let mut merged_ops = Vec::with_capacity(grouped_ops);
                         let mut responders = Vec::with_capacity(grouped.len());
                         for (ops, _sync, resp) in grouped {
                             merged_ops.extend(ops);

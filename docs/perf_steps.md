@@ -758,3 +758,29 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.6143`
 - `search_qps_ratio=2.9129`
+
+## Step 30 (`wal-tail-touched-capacity-precount`)
+
+Change:
+- In startup WAL tail replay, pre-counted touched-id capacity from WAL entries
+  (including `TouchBatch` lengths) before building the touched-id set.
+- This reduces hash-set rehash/reserve churn for large WAL tails on restart.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step31-spfresh.json`,
+  `target/vectordb-step31-lancedb.json`.
+
+SPFresh:
+- `update_qps=229231.83`
+- `search_qps=3008.67`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=131947.88`
+- `search_qps=917.01`
+- `recall_at_k=0.4855`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.7373`
+- `search_qps_ratio=3.2810`

@@ -263,7 +263,18 @@ impl SpFreshLayerDbIndex {
             return Ok(());
         }
 
-        let mut touched = FxHashSet::with_capacity_and_hasher(entries.len(), Default::default());
+        let mut touched_capacity = 0usize;
+        for entry in &entries {
+            let add = match entry {
+                IndexWalEntry::Touch { .. } => 1usize,
+                IndexWalEntry::TouchBatch { ids } => ids.len(),
+            };
+            touched_capacity = touched_capacity.saturating_add(add);
+        }
+        let mut touched = FxHashSet::with_capacity_and_hasher(
+            touched_capacity.max(entries.len()),
+            Default::default(),
+        );
         for entry in entries {
             match entry {
                 IndexWalEntry::Touch { id } => {

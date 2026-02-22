@@ -410,7 +410,6 @@ impl SpFreshLayerDbIndex {
             };
             let mut posting_event_next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(3));
-            let touched_ids = if use_fast_path { Vec::new() } else { ids };
             let mut new_postings =
                 FxHashMap::with_capacity_and_hasher(mutations.len(), Default::default());
             let mut dirty_postings = FxHashSet::with_capacity_and_hasher(
@@ -480,8 +479,8 @@ impl SpFreshLayerDbIndex {
                     config::META_POSTING_EVENT_NEXT_SEQ_KEY,
                     posting_event_next,
                 )];
-                if let Err(err) = self.persist_with_wal_ops(
-                    IndexWalEntry::TouchBatch { ids: touched_ids },
+                if let Err(err) = self.persist_with_wal_touch_batch_ids(
+                    ids.as_slice(),
                     batch_ops,
                     trailer_ops,
                     commit_mode,
@@ -659,11 +658,6 @@ impl SpFreshLayerDbIndex {
                 _ => anyhow::bail!("diskmeta delete batch called for non-diskmeta index"),
             };
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(2));
-            let touched_ids = if use_fast_path {
-                Vec::new()
-            } else {
-                mutations.clone()
-            };
             let mut deleted = 0usize;
             let mut dirty_postings =
                 FxHashSet::with_capacity_and_hasher(mutations.len(), Default::default());
@@ -706,8 +700,8 @@ impl SpFreshLayerDbIndex {
                     config::META_POSTING_EVENT_NEXT_SEQ_KEY,
                     posting_event_next,
                 )];
-                if let Err(err) = self.persist_with_wal_ops(
-                    IndexWalEntry::TouchBatch { ids: touched_ids },
+                if let Err(err) = self.persist_with_wal_touch_batch_ids(
+                    mutations.as_slice(),
                     batch_ops,
                     trailer_ops,
                     commit_mode,

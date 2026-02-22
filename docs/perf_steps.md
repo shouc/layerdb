@@ -476,3 +476,33 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=2.6603`
 - `search_qps_ratio=5.7515`
+
+## Step 20 (`wal-touch-batch-slice-encoding`)
+
+Change:
+- Added `encode_wal_touch_batch_ids(&[u64])` and
+  `persist_with_wal_touch_batch_ids(&[u64], ...)` so diskmeta mutation commits can encode WAL
+  touch-batches directly from slices.
+- Updated diskmeta upsert/delete durable paths to use the slice-based helper and removed
+  pre-commit id-vector cloning from those paths.
+
+Benchmark note:
+- Same dataset, two rerun pairs:
+  - run1: `target/vectordb-step21-spfresh.json`, `target/vectordb-step21-lancedb.json`
+  - run2: `target/vectordb-step21-spfresh-rerun2.json`,
+    `target/vectordb-step21-lancedb-rerun2.json`
+- Host variance was non-trivial; median ratios are reported below.
+
+SPFresh (run1):
+- `update_qps=213185.52`
+- `search_qps=2800.90`
+- `recall_at_k=0.6030`
+
+LanceDB (run1):
+- `update_qps=123094.29`
+- `search_qps=833.91`
+- `recall_at_k=0.4785`
+
+SPFresh/LanceDB ratio (median across run1/run2):
+- `update_qps_ratio=1.5776`
+- `search_qps_ratio=3.1615`

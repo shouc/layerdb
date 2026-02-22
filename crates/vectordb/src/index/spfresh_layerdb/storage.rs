@@ -500,6 +500,18 @@ pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>>
     Ok(out)
 }
 
+pub(crate) fn encode_wal_touch_batch_ids(ids: &[u64]) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(WAL_BIN_TAG.len() + 1 + 4 + ids.len().saturating_mul(8));
+    out.extend_from_slice(WAL_BIN_TAG);
+    out.push(WAL_KIND_TOUCH_BATCH);
+    let len = u32::try_from(ids.len()).context("wal touch-batch len does not fit u32")?;
+    out.extend_from_slice(&len.to_le_bytes());
+    for id in ids {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    Ok(out)
+}
+
 pub(crate) fn decode_wal_entry(raw: &[u8]) -> anyhow::Result<IndexWalEntry> {
     if !raw.starts_with(WAL_BIN_TAG) {
         anyhow::bail!("unsupported wal tag");
@@ -902,5 +914,21 @@ mod tests {
                 "{POSTING_MEMBERS_ROOT_PREFIX}{generation:016x}/{posting_id:010}/{seq:020}/{id:020}"
             )
         );
+    }
+
+    #[test]
+    fn touch_batch_slice_encoder_matches_enum_encoder() {
+        let ids = vec![7u64, 11, 13, 17, 19];
+        let via_enum = encode_wal_entry(&IndexWalEntry::TouchBatch { ids: ids.clone() })
+            .expect("encode wal enum");
+        let via_slice = encode_wal_touch_batch_ids(ids.as_slice()).expect("encode wal slice");
+        assert_eq!(via_enum, via_slice);
+        let decoded = decode_wal_entry(via_slice.as_slice()).expect("decode wal slice bytes");
+        match decoded {
+            IndexWalEntry::TouchBatch { ids: decoded_ids } => {
+                assert_eq!(decoded_ids, ids);
+            }
+            other => panic!("expected touch-batch entry, got {other:?}"),
+        }
     }
 }

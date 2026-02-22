@@ -22,16 +22,16 @@ use reqwest::Client;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Infallible, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
-use vectordb::index::{
+use vectdb::index::{
     MutationCommitMode, SpFreshConfig, SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig,
     SpFreshLayerDbShardedIndex, SpFreshLayerDbShardedStats, SpFreshMemoryMode, VectorMutation,
     VectorMutationBatchResult,
 };
-use vectordb::types::{Neighbor, VectorIndex, VectorRecord};
+use vectdb::types::{Neighbor, VectorIndex, VectorRecord};
 
 #[derive(Debug, Parser)]
-#[command(name = "vectordb-deploy")]
-#[command(about = "Sharded VectorDB deployment server with leader-gated writes")]
+#[command(name = "vectdb-deploy")]
+#[command(about = "Sharded VectDB deployment server with leader-gated writes")]
 struct Args {
     #[arg(long)]
     db_root: PathBuf,
@@ -51,7 +51,7 @@ struct Args {
     #[arg(long, value_delimiter = ',', default_value = "http://127.0.0.1:2379")]
     etcd_endpoints: Vec<String>,
 
-    #[arg(long, default_value = "/vectordb/deploy/leader")]
+    #[arg(long, default_value = "/vectdb/deploy/leader")]
     etcd_election_key: String,
 
     #[arg(long, default_value_t = 10)]
@@ -2085,7 +2085,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {}", args.listen))?;
 
     println!(
-        "vectordb-deploy node_id={} listen={} shards={} db_root={} etcd_endpoints={} election_key={} replicas={}",
+        "vectdb-deploy node_id={} listen={} shards={} db_root={} etcd_endpoints={} election_key={} replicas={}",
         args.node_id,
         args.listen,
         args.shards,
@@ -2125,7 +2125,7 @@ mod tests {
         SNAPSHOT_PAYLOAD_SCHEMA_VERSION,
     };
     use bytes::Bytes;
-    use vectordb::index::MutationCommitMode;
+    use vectdb::index::MutationCommitMode;
 
     #[test]
     fn collect_replication_peers_dedups_and_skips_self() {

@@ -113,8 +113,8 @@ From the research and current codebase constraints:
 
 Added `SpFreshLayerDbShardedIndex` on top of existing LayerDB-backed SPFresh:
 
-- New module: `vectordb/src/index/spfresh_layerdb_sharded.rs`
-- Exported in: `vectordb/src/index/mod.rs`
+- New module: `vectdb/src/index/spfresh_layerdb_sharded.rs`
+- Exported in: `vectdb/src/index/mod.rs`
 
 Capabilities:
 - Deterministic routing (`id % shard_count`) for updates/deletes.
@@ -132,7 +132,7 @@ Validation added:
 ## B) Benchmark tooling for direct comparison
 
 Added benchmark binary:
-- `vectordb/src/bin/bench_spfresh_sharded.rs`
+- `vectdb/src/bin/bench_spfresh_sharded.rs`
 
 Features:
 - Consumes same dataset format as `bench_lancedb`.
@@ -142,7 +142,7 @@ Features:
   - default false: benchmark throughput mode.
 
 Also improved Lance benchmark robustness:
-- `vectordb/src/bin/bench_lancedb.rs` now deduplicates duplicate IDs inside each update batch before merge-insert, preventing ambiguous merge failures with `--update-batch > 1`.
+- `vectdb/src/bin/bench_lancedb.rs` now deduplicates duplicate IDs inside each update batch before merge-insert, preventing ambiguous merge failures with `--update-batch > 1`.
 
 ## C) Off-heap SPFresh runtime mode (memory fix for very large datasets)
 
@@ -156,32 +156,32 @@ To align closer with SPFresh-style disk-first scaling, `SpFreshLayerDbIndex` now
   bounded hot posting-list cache.
 
 Implementation:
-- New off-heap core: `vectordb/src/index/spfresh_offheap.rs`
-- New disk-metadata core: `vectordb/src/index/spfresh_diskmeta.rs`
+- New off-heap core: `vectdb/src/index/spfresh_offheap.rs`
+- New disk-metadata core: `vectdb/src/index/spfresh_diskmeta.rs`
 - LayerDB runtime enum + checkpoint support for resident/offheap/diskmeta:
-  `vectordb/src/index/spfresh_layerdb/mod.rs`
+  `vectdb/src/index/spfresh_layerdb/mod.rs`
 - Diskmeta build now reuses offheap split/merge topology at build time and exports
   centroid/size + id->posting metadata from offheap:
-  `vectordb/src/index/spfresh_offheap.rs`, `vectordb/src/index/spfresh_diskmeta.rs`
+  `vectdb/src/index/spfresh_offheap.rs`, `vectdb/src/index/spfresh_diskmeta.rs`
 - LayerDB now exposes `Db::multi_get` (single-snapshot batched point reads), and diskmeta
   search uses batched row fetch on vector-cache misses:
-  `src/db/mod.rs`, `vectordb/src/index/spfresh_layerdb/mod.rs`
+  `src/db/mod.rs`, `vectdb/src/index/spfresh_layerdb/mod.rs`
 - Diskmeta WAL now records replayable deltas (upsert/delete payloads) so startup can apply
   WAL tail directly to checkpointed diskmeta state instead of rebuilding from all rows:
-  `vectordb/src/index/spfresh_layerdb/storage.rs`, `vectordb/src/index/spfresh_layerdb/mod.rs`
+  `vectdb/src/index/spfresh_layerdb/storage.rs`, `vectdb/src/index/spfresh_layerdb/mod.rs`
 - Diskmeta posting-member values now persist vector payloads (with legacy id-only decode fallback),
   allowing posting scans to prefill vector cache and reduce random point lookups:
-  `vectordb/src/index/spfresh_layerdb/storage.rs`, `vectordb/src/index/spfresh_layerdb/mod.rs`
+  `vectdb/src/index/spfresh_layerdb/storage.rs`, `vectdb/src/index/spfresh_layerdb/mod.rs`
 - Search ranking now uses partial top-k selection (`select_nth_unstable_by`) instead of full candidate sort:
-  `vectordb/src/index/spfresh.rs`, `vectordb/src/index/spfresh_offheap.rs`,
-  `vectordb/src/index/spfresh_layerdb/mod.rs`
+  `vectdb/src/index/spfresh.rs`, `vectdb/src/index/spfresh_offheap.rs`,
+  `vectdb/src/index/spfresh_layerdb/mod.rs`
 - Sharded SPFresh query fanout now runs in parallel across shards:
-  `vectordb/src/index/spfresh_layerdb_sharded.rs`
+  `vectdb/src/index/spfresh_layerdb_sharded.rs`
 - Diskmeta probe count is adaptive to centroid-distance confidence (fewer probes for confident
   queries, full probes for ambiguous ones):
-  `vectordb/src/index/spfresh_diskmeta.rs`
+  `vectdb/src/index/spfresh_diskmeta.rs`
 - Rebuilder support in offheap mode:
-  `vectordb/src/index/spfresh_layerdb/rebuilder.rs`
+  `vectdb/src/index/spfresh_layerdb/rebuilder.rs`
 - New tests:
   - `offheap_persists_and_recovers_vectors`
   - `offheap_randomized_restarts_preserve_model_state`
@@ -370,10 +370,10 @@ The following production features were added in code:
 - Added Arrow-backed `VectorColumnarPage` and wired diskmeta rerank scanning through it.
 
 10. Continuous benchmark gate:
-- Added `scripts/vectordb_bench_gate.sh` + `scripts/check_vectordb_gate.py`.
-- Added `benchmarks/vectordb_gate.json` thresholds for SPFresh-vs-LanceDB checks.
+- Added `scripts/vectdb_bench_gate.sh` + `scripts/check_vectdb_gate.py`.
+- Added `benchmarks/vectdb_gate.json` thresholds for SPFresh-vs-LanceDB checks.
 
-### Latest gate profile (same dataset/config as `vectordb_gate.json`)
+### Latest gate profile (same dataset/config as `vectdb_gate.json`)
 
 SPFresh-sharded diskmeta (`shards=8`, `update_batch=1024`):
 - recall@k: `1.0000`
@@ -429,11 +429,11 @@ Implemented:
 
 Validation:
 - New unit test `posting_member_residual_round_trip_omits_values_payload`.
-- `cargo clippy -p vectordb --all-targets -- -D warnings`
-- `cargo test -p vectordb spfresh_layerdb::tests:: -- --nocapture`
-- `scripts/vectordb_bench_gate.sh`
+- `cargo clippy -p vectdb --all-targets -- -D warnings`
+- `cargo test -p vectdb spfresh_layerdb::tests:: -- --nocapture`
+- `scripts/vectdb_bench_gate.sh`
 
-Latest gate summary (`target/vectordb-gate/summary.json`):
+Latest gate summary (`target/vectdb-gate/summary.json`):
 - SPFresh-sharded diskmeta:
   - update_qps: `69565.22`
   - search_qps: `1405.27`
@@ -495,11 +495,11 @@ Implemented in this cycle:
   deterministic serialized commit order per shard/index.
 
 Validation:
-- `cargo clippy -p vectordb --all-targets -- -D warnings`
-- `cargo test -p vectordb spfresh_layerdb::tests:: -- --nocapture`
-- `scripts/vectordb_bench_gate.sh`
+- `cargo clippy -p vectdb --all-targets -- -D warnings`
+- `cargo test -p vectdb spfresh_layerdb::tests:: -- --nocapture`
+- `scripts/vectdb_bench_gate.sh`
 
-Latest gate summary after full refactor (`target/vectordb-gate/summary.json`):
+Latest gate summary after full refactor (`target/vectdb-gate/summary.json`):
 - SPFresh-sharded diskmeta:
   - update_qps: `64228.05`
   - search_qps: `1165.21`
@@ -520,7 +520,7 @@ Implemented:
   mmap vector blocks and only falls back to LayerDB row reads for unresolved ids.
 - Removed legacy posting-map assignment scan from rebuild and old-state lookup paths.
 
-Outcome on benchmark gate (`target/vectordb-gate/summary.json`):
+Outcome on benchmark gate (`target/vectdb-gate/summary.json`):
 - SPFresh-sharded diskmeta:
   - update_qps: `141291.99`
   - search_qps: `1100.43`
@@ -537,8 +537,8 @@ This crosses both gate objectives in the same profile: higher update throughput 
 
 ## Production Readiness Checks Performed
 
-- `cargo clippy -p vectordb --all-targets -- -D warnings`
-- `cargo test -p vectordb -- --nocapture`
+- `cargo clippy -p vectdb --all-targets -- -D warnings`
+- `cargo test -p vectdb -- --nocapture`
 - `cargo test --workspace -- --nocapture`
 
 All passed in this environment.
@@ -548,7 +548,7 @@ All passed in this environment.
 Dataset generation:
 
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- dump-dataset \
+cargo run -p vectdb --bin vectdb-cli -- dump-dataset \
   --out output/bench/vdb_dataset_medium.json --seed 406 --dim 64 \
   --base 10000 --updates 2000 --queries 200
 ```
@@ -556,7 +556,7 @@ cargo run -p vectordb --bin vectordb-cli -- dump-dataset \
 LanceDB:
 
 ```bash
-cargo run --release -p vectordb --bin bench_lancedb -- \
+cargo run --release -p vectdb --bin bench_lancedb -- \
   --dataset output/bench/vdb_dataset_medium.json \
   --k 10 --nlist 96 --nprobe 8 --update-batch 128
 ```
@@ -564,7 +564,7 @@ cargo run --release -p vectordb --bin bench_lancedb -- \
 SPFresh-sharded:
 
 ```bash
-cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
+cargo run --release -p vectdb --bin bench_spfresh_sharded -- \
   --dataset output/bench/vdb_dataset_medium.json \
   --k 10 --shards 4 --initial-postings 96 --nprobe 8 \
   --split-limit 256 --merge-limit 64 --reassign-range 16 \
@@ -574,7 +574,7 @@ cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
 SPFresh-sharded offheap:
 
 ```bash
-cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
+cargo run --release -p vectdb --bin bench_spfresh_sharded -- \
   --dataset output/bench/vdb_dataset_medium.json \
   --k 10 --shards 4 --initial-postings 96 --nprobe 8 \
   --split-limit 256 --merge-limit 64 --reassign-range 16 \
@@ -585,7 +585,7 @@ cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
 SPFresh-sharded diskmeta:
 
 ```bash
-cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
+cargo run --release -p vectdb --bin bench_spfresh_sharded -- \
   --dataset output/bench/vdb_dataset_medium.json \
   --k 10 --shards 4 --initial-postings 96 --nprobe 8 \
   --split-limit 256 --merge-limit 64 --reassign-range 16 \
@@ -596,7 +596,7 @@ cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
 Durable SPFresh-sharded:
 
 ```bash
-cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
+cargo run --release -p vectdb --bin bench_spfresh_sharded -- \
   --dataset output/bench/vdb_dataset_medium.json \
   --k 10 --shards 4 --initial-postings 96 --nprobe 8 \
   --split-limit 256 --merge-limit 64 --reassign-range 16 \

@@ -11,7 +11,7 @@ def load_json(path: Path):
 def main() -> int:
     if len(sys.argv) != 5:
         print(
-            "usage: check_vectordb_gate.py <config.json> <spfresh.json> <lancedb.json> <summary.json>",
+            "usage: check_vectdb_gate.py <config.json> <spfresh.json> <lancedb.json> <summary.json>",
             file=sys.stderr,
         )
         return 2
@@ -66,13 +66,13 @@ def main() -> int:
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     if failures:
-        print("vectordb benchmark gate failed:")
+        print("vectdb benchmark gate failed:")
         for failure in failures:
             print(f"- {failure}")
         print(f"summary: {summary_path}")
         return 1
 
-    print("vectordb benchmark gate passed")
+    print("vectdb benchmark gate passed")
     print(f"summary: {summary_path}")
     return 0
 

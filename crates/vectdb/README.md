@@ -1,4 +1,4 @@
-# vectordb
+# vectdb
 
 Experimental vector index crate with:
 - `SPFreshIndex`: partitioned incremental update with split/reassign
@@ -11,12 +11,12 @@ Experimental vector index crate with:
 
 Show version:
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- version
+cargo run -p vectdb --bin vectdb-cli -- version
 ```
 
 Fair benchmark across engines:
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- bench \
+cargo run -p vectdb --bin vectdb-cli -- bench \
   --dim 64 --base 20000 --updates 2000 --queries 400 --k 10 \
   --initial-postings 128 --nprobe 12 --split-limit 256 --reassign-range 16 \
   --saq-total-bits 256 --saq-ivf-clusters 128
@@ -30,67 +30,67 @@ For diskmeta mode, tune `--diskmeta-probe-multiplier` to scale probe fanout with
 
 Export a reproducible benchmark dataset:
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- dump-dataset \
-  --out /tmp/vectordb_dataset.json --seed 404 --dim 64 --base 10000 --updates 2000 --queries 200
+cargo run -p vectdb --bin vectdb-cli -- dump-dataset \
+  --out /tmp/vectdb_dataset.json --seed 404 --dim 64 --base 10000 --updates 2000 --queries 200
 ```
 
 Compare the same dataset with Milvus:
 ```bash
 python3 scripts/bench_milvus.py \
-  --dataset /tmp/vectordb_dataset.json --k 10 --nprobe 8 --nlist 64 --update-batch 1
+  --dataset /tmp/vectdb_dataset.json --k 10 --nprobe 8 --nlist 64 --update-batch 1
 ```
 
 Compare the same dataset with LanceDB (Rust API):
 ```bash
-cargo run --release -p vectordb --bin bench_lancedb -- \
-  --dataset /tmp/vectordb_dataset.json --k 10 --nprobe 8 --nlist 64 --update-batch 1
+cargo run --release -p vectdb --bin bench_lancedb -- \
+  --dataset /tmp/vectdb_dataset.json --k 10 --nprobe 8 --nlist 64 --update-batch 1
 ```
 
 Compare the same dataset with sharded SPFresh LayerDB:
 ```bash
-cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
-  --dataset /tmp/vectordb_dataset.json --k 10 --shards 4 \
+cargo run --release -p vectdb --bin bench_spfresh_sharded -- \
+  --dataset /tmp/vectdb_dataset.json --k 10 --shards 4 \
   --initial-postings 64 --nprobe 8 --split-limit 256 --merge-limit 64 --reassign-range 16
 ```
 
 Run sharded SPFresh in off-heap mode (vectors on LayerDB, metadata in RAM):
 ```bash
-cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
-  --dataset /tmp/vectordb_dataset.json --k 10 --shards 4 \
+cargo run --release -p vectdb --bin bench_spfresh_sharded -- \
+  --dataset /tmp/vectdb_dataset.json --k 10 --shards 4 \
   --initial-postings 64 --nprobe 8 --split-limit 256 --merge-limit 64 --reassign-range 16 \
   --offheap
 ```
 
 Run sharded SPFresh with disk-backed metadata (hot posting/member lists cached in RAM):
 ```bash
-cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
-  --dataset /tmp/vectordb_dataset.json --k 10 --shards 4 \
+cargo run --release -p vectdb --bin bench_spfresh_sharded -- \
+  --dataset /tmp/vectdb_dataset.json --k 10 --shards 4 \
   --initial-postings 64 --nprobe 8 --split-limit 256 --merge-limit 64 --reassign-range 16 \
   --diskmeta --diskmeta-probe-multiplier 8
 ```
 
 Run the cross-engine benchmark gate (SPFresh vs LanceDB thresholds):
 ```bash
-./scripts/vectordb_bench_gate.sh
+./scripts/vectdb_bench_gate.sh
 ```
 
 Check SPFresh LayerDB index health:
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
+cargo run -p vectdb --bin vectdb-cli -- spfresh-health \
   --db /path/to/spfresh-index --dim 64 --initial-postings 64 --split-limit 512 \
   --merge-limit 64 --reassign-range 64 --nprobe 8 --diskmeta-probe-multiplier 1 --kmeans-iters 8
 ```
 
 Docker integration test for the sharded deployment server (etcd + 3 nodes):
 ```bash
-./scripts/vectordb_deploy_integration.sh
-VDB_DOCKER_INTEGRATION=1 cargo test -p vectordb --test deploy_docker -- --nocapture
+./scripts/vectdb_deploy_integration.sh
+VDB_DOCKER_INTEGRATION=1 cargo test -p vectdb --test deploy_docker -- --nocapture
 ```
 
 Docker cluster load test (parallel write/search pressure + replication validation):
 ```bash
-./scripts/vectordb_deploy_load_test.sh
-VDB_DOCKER_LOAD_TEST=1 cargo test -p vectordb --test deploy_docker_load -- --nocapture
+./scripts/vectdb_deploy_load_test.sh
+VDB_DOCKER_LOAD_TEST=1 cargo test -p vectdb --test deploy_docker_load -- --nocapture
 ```
 
 ## Production Notes (LayerDB-backed SPFresh)
@@ -137,7 +137,7 @@ To use real object storage (instead of local `sst_s3/` emulation), set
 
 SAQ paper-style validation (vs uniform ablation):
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- saq-validate \
+cargo run -p vectdb --bin vectdb-cli -- saq-validate \
   --dim 96 --base 25000 --queries 500 --k 10 --total-bits 256 \
   --ivf-clusters 128 --nprobe 12
 ```

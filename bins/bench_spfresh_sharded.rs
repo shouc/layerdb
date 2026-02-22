@@ -7,16 +7,16 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
-use vectordb::ground_truth::recall_at_k;
-use vectordb::index::{
+use vectdb::ground_truth::recall_at_k;
+use vectdb::index::{
     MutationCommitMode, SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig,
     SpFreshLayerDbShardedIndex, SpFreshMemoryMode,
 };
-use vectordb::types::{VectorIndex, VectorRecord};
+use vectdb::types::{VectorIndex, VectorRecord};
 
 #[derive(Debug, Parser)]
 #[command(name = "bench_spfresh_sharded")]
-#[command(about = "Run sharded SPFresh LayerDB benchmark on vectordb exported dataset")]
+#[command(about = "Run sharded SPFresh LayerDB benchmark on vectdb exported dataset")]
 struct Args {
     #[arg(long)]
     dataset: PathBuf,
@@ -125,7 +125,7 @@ fn main() -> Result<()> {
     prepare_db_path(&db_path, args.keep_db)?;
 
     let mut shard_cfg = SpFreshLayerDbConfig {
-        spfresh: vectordb::index::SpFreshConfig {
+        spfresh: vectdb::index::SpFreshConfig {
             dim,
             initial_postings: args.initial_postings,
             split_limit: args.split_limit,
@@ -265,13 +265,13 @@ fn exact_topk_ids(
     vectors: &[Vec<f32>],
     queries: &[Vec<f32>],
     k: usize,
-) -> Vec<Vec<vectordb::Neighbor>> {
+) -> Vec<Vec<vectdb::Neighbor>> {
     let mut out = Vec::with_capacity(queries.len());
     for query in queries {
-        let mut pairs: Vec<vectordb::Neighbor> = ids
+        let mut pairs: Vec<vectdb::Neighbor> = ids
             .iter()
             .zip(vectors.iter())
-            .map(|(id, vector)| vectordb::Neighbor {
+            .map(|(id, vector)| vectdb::Neighbor {
                 id: *id,
                 distance: squared_l2(query, vector),
             })

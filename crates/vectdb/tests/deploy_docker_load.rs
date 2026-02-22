@@ -17,7 +17,7 @@ fn sharded_deploy_docker_cluster_load() -> anyhow::Result<()> {
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let script = manifest_dir.join("../../scripts/vectordb_deploy_load_test.sh");
+    let script = manifest_dir.join("../../scripts/vectdb_deploy_load_test.sh");
     anyhow::ensure!(
         script.exists(),
         "missing docker load script at {}",

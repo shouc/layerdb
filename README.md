@@ -1,4 +1,4 @@
-# vectordb
+# vectdb
 
 Experimental Rust vector database focused on SPFresh indexes, including a durable LayerDB-backed mode.
 
@@ -6,7 +6,7 @@ Experimental Rust vector database focused on SPFresh indexes, including a durabl
 
 ```bash
 cargo build --workspace
-cargo test -p vectordb
+cargo test -p vectdb
 ```
 
 ## CLI
@@ -14,31 +14,31 @@ cargo test -p vectordb
 Show all commands:
 
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- --help
+cargo run -p vectdb --bin vectdb-cli -- --help
 ```
 
 Common commands:
 
 ```bash
 # version
-cargo run -p vectordb --bin vectordb-cli -- version
+cargo run -p vectdb --bin vectdb-cli -- version
 
 # benchmark across engines
-cargo run -p vectordb --bin vectordb-cli -- bench \
+cargo run -p vectdb --bin vectdb-cli -- bench \
   --dim 64 --base 20000 --updates 2000 --queries 400 --k 10 \
   --spfresh-diskmeta --spfresh-diskmeta-probe-multiplier 8
 
 # health check a persisted SPFresh LayerDB index
-cargo run -p vectordb --bin vectordb-cli -- spfresh-health \
+cargo run -p vectdb --bin vectdb-cli -- spfresh-health \
   --db /path/to/index --dim 64 --initial-postings 64 --diskmeta-probe-multiplier 1
 
 # run sharded deployment server (leader-gated writes + replication fanout)
-cargo run -p vectordb --bin vectordb-deploy -- \
-  --db-root /tmp/vectordb-cluster/node1 \
+cargo run -p vectdb --bin vectdb-deploy -- \
+  --db-root /tmp/vectdb-cluster/node1 \
   --node-id node1 \
   --listen 0.0.0.0:8080 \
   --etcd-endpoints http://127.0.0.1:2379 \
-  --etcd-election-key /vectordb/prod/leader \
+  --etcd-election-key /vectdb/prod/leader \
   --self-url http://127.0.0.1:8080 \
   --replica-urls http://127.0.0.1:8081,http://127.0.0.1:8082
 ```
@@ -54,20 +54,20 @@ Docker integration test (etcd + 3 deploy nodes):
 
 ```bash
 # direct script
-./scripts/vectordb_deploy_integration.sh
+./scripts/vectdb_deploy_integration.sh
 
 # cargo-gated integration test
-VDB_DOCKER_INTEGRATION=1 cargo test -p vectordb --test deploy_docker -- --nocapture
+VDB_DOCKER_INTEGRATION=1 cargo test -p vectdb --test deploy_docker -- --nocapture
 ```
 
 Docker cluster load test:
 
 ```bash
 # direct script (tune via VDB_LOAD_* env vars)
-./scripts/vectordb_deploy_load_test.sh
+./scripts/vectdb_deploy_load_test.sh
 
 # cargo-gated load test
-VDB_DOCKER_LOAD_TEST=1 cargo test -p vectordb --test deploy_docker_load -- --nocapture
+VDB_DOCKER_LOAD_TEST=1 cargo test -p vectdb --test deploy_docker_load -- --nocapture
 ```
 
 ## Crate Usage
@@ -76,18 +76,18 @@ Add dependency (path for local workspace usage):
 
 ```toml
 [dependencies]
-vectordb = { path = "crates/vectordb" }
+vectdb = { path = "crates/vectdb" }
 anyhow = "1"
 ```
 
 Minimal durable index example:
 
 ```rust
-use vectordb::index::{SpFreshLayerDbConfig, SpFreshLayerDbIndex};
-use vectordb::VectorIndex;
+use vectdb::index::{SpFreshLayerDbConfig, SpFreshLayerDbIndex};
+use vectdb::VectorIndex;
 
 fn main() -> anyhow::Result<()> {
-    let mut index = SpFreshLayerDbIndex::open("/tmp/vectordb-demo", SpFreshLayerDbConfig::default())?;
+    let mut index = SpFreshLayerDbIndex::open("/tmp/vectdb-demo", SpFreshLayerDbConfig::default())?;
 
     index.try_upsert(1, vec![0.1; 64])?;
     index.try_upsert(2, vec![0.2; 64])?;
@@ -100,4 +100,4 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-For full benchmark and mode details, see `crates/vectordb/README.md`.
+For full benchmark and mode details, see `crates/vectdb/README.md`.

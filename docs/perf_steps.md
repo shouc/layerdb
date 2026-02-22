@@ -327,8 +327,8 @@ Change:
 
 Benchmark note:
 - Gate runs were highly noisy on this host in this cycle, so numbers below use a same-dataset
-  release rerun pair (`target/vectordb-step15/spfresh-rerun2.json`,
-  `target/vectordb-step15/lancedb-rerun2.json`).
+  release rerun pair (`target/vectdb-step15/spfresh-rerun2.json`,
+  `target/vectdb-step15/lancedb-rerun2.json`).
 
 SPFresh:
 - `update_qps=124248.36`
@@ -353,7 +353,7 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step16-spfresh.json`, `target/vectordb-step16-lancedb.json`.
+  `target/vectdb-step16-spfresh.json`, `target/vectdb-step16-lancedb.json`.
 
 SPFresh:
 - `update_qps=175470.66`
@@ -379,7 +379,7 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step17-spfresh.json`, `target/vectordb-step17-lancedb.json`.
+  `target/vectdb-step17-spfresh.json`, `target/vectdb-step17-lancedb.json`.
 
 SPFresh:
 - `update_qps=120025.51`
@@ -405,7 +405,7 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step18-spfresh.json`, `target/vectordb-step18-lancedb.json`.
+  `target/vectdb-step18-spfresh.json`, `target/vectdb-step18-lancedb.json`.
 
 SPFresh:
 - `update_qps=216303.91`
@@ -430,11 +430,11 @@ Change:
   WAL/meta/trailer append does not trigger extra vector growth on common update/delete commits.
 
 Benchmark note:
-- The first full gate run at `target/vectordb-step19/summary.json` was noisy and underperformed
+- The first full gate run at `target/vectdb-step19/summary.json` was noisy and underperformed
   during long release compile pressure.
 - Reported numbers below use a clean same-dataset rerun pair:
-  `target/vectordb-step19-spfresh-rerun.json`,
-  `target/vectordb-step19-lancedb-rerun.json`.
+  `target/vectdb-step19-spfresh-rerun.json`,
+  `target/vectdb-step19-lancedb-rerun.json`.
 
 SPFresh:
 - `update_qps=147255.97`
@@ -460,8 +460,8 @@ Change:
 
 Benchmark note:
 - Same dataset rerun pair:
-  `target/vectordb-step20-spfresh.json`,
-  `target/vectordb-step20-lancedb.json`.
+  `target/vectdb-step20-spfresh.json`,
+  `target/vectdb-step20-lancedb.json`.
 
 SPFresh:
 - `update_qps=193346.46`
@@ -488,9 +488,9 @@ Change:
 
 Benchmark note:
 - Same dataset, two rerun pairs:
-  - run1: `target/vectordb-step21-spfresh.json`, `target/vectordb-step21-lancedb.json`
-  - run2: `target/vectordb-step21-spfresh-rerun2.json`,
-    `target/vectordb-step21-lancedb-rerun2.json`
+  - run1: `target/vectdb-step21-spfresh.json`, `target/vectdb-step21-lancedb.json`
+  - run2: `target/vectdb-step21-spfresh-rerun2.json`,
+    `target/vectdb-step21-lancedb-rerun2.json`
 - Host variance was non-trivial; median ratios are reported below.
 
 SPFresh (run1):
@@ -516,8 +516,8 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step22-spfresh.json`,
-  `target/vectordb-step22-lancedb.json`.
+  `target/vectdb-step22-spfresh.json`,
+  `target/vectdb-step22-lancedb.json`.
 
 SPFresh:
 - `update_qps=227745.04`
@@ -542,8 +542,8 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step23-spfresh.json`,
-  `target/vectordb-step23-lancedb.json`.
+  `target/vectdb-step23-spfresh.json`,
+  `target/vectdb-step23-lancedb.json`.
 
 SPFresh:
 - `update_qps=209071.07`
@@ -570,8 +570,8 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step24-spfresh.json`,
-  `target/vectordb-step24-lancedb.json`.
+  `target/vectdb-step24-spfresh.json`,
+  `target/vectdb-step24-lancedb.json`.
 
 SPFresh:
 - `update_qps=213528.82`
@@ -598,8 +598,8 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step25-spfresh.json`,
-  `target/vectordb-step25-lancedb.json`.
+  `target/vectdb-step25-spfresh.json`,
+  `target/vectdb-step25-lancedb.json`.
 
 SPFresh:
 - `update_qps=189088.03`
@@ -626,8 +626,8 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step26-spfresh.json`,
-  `target/vectordb-step26-lancedb.json`.
+  `target/vectdb-step26-spfresh.json`,
+  `target/vectdb-step26-lancedb.json`.
 
 SPFresh:
 - `update_qps=188696.32`
@@ -656,9 +656,9 @@ Benchmark note:
 - This step primarily targets startup memory behavior; throughput measurements were highly noisy in
   this cycle.
 - Two same-dataset rerun pairs:
-  - run1: `target/vectordb-step27-spfresh.json`, `target/vectordb-step27-lancedb.json`
-  - run2: `target/vectordb-step27-spfresh-rerun2.json`,
-    `target/vectordb-step27-lancedb-rerun2.json`
+  - run1: `target/vectdb-step27-spfresh.json`, `target/vectdb-step27-lancedb.json`
+  - run2: `target/vectdb-step27-spfresh-rerun2.json`,
+    `target/vectdb-step27-lancedb-rerun2.json`
 - Median ratios are reported below.
 
 SPFresh (run2):
@@ -689,8 +689,8 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step28-spfresh.json`,
-  `target/vectordb-step28-lancedb.json`.
+  `target/vectdb-step28-spfresh.json`,
+  `target/vectdb-step28-lancedb.json`.
 
 SPFresh:
 - `update_qps=183508.68`
@@ -716,8 +716,8 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step29-spfresh.json`,
-  `target/vectordb-step29-lancedb.json`.
+  `target/vectdb-step29-spfresh.json`,
+  `target/vectdb-step29-lancedb.json`.
 
 SPFresh:
 - `update_qps=191761.45`
@@ -742,8 +742,8 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step30-spfresh.json`,
-  `target/vectordb-step30-lancedb.json`.
+  `target/vectdb-step30-spfresh.json`,
+  `target/vectdb-step30-lancedb.json`.
 
 SPFresh:
 - `update_qps=203482.96`
@@ -768,8 +768,8 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step31-spfresh.json`,
-  `target/vectordb-step31-lancedb.json`.
+  `target/vectdb-step31-spfresh.json`,
+  `target/vectdb-step31-lancedb.json`.
 
 SPFresh:
 - `update_qps=229231.83`
@@ -795,8 +795,8 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step32-spfresh.json`,
-  `target/vectordb-step32-lancedb.json`.
+  `target/vectdb-step32-spfresh.json`,
+  `target/vectdb-step32-lancedb.json`.
 
 SPFresh:
 - `update_qps=194874.79`
@@ -824,8 +824,8 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-step33-spfresh.json`,
-  `target/vectordb-step33-lancedb.json`.
+  `target/vectdb-step33-spfresh.json`,
+  `target/vectdb-step33-lancedb.json`.
 
 SPFresh:
 - `update_qps=219030.05`
@@ -857,7 +857,7 @@ Change:
 
 Benchmark note:
 - Same-dataset release rerun pair:
-  `target/vectordb-gate/summary.json` (SPFresh + LanceDB from gate run).
+  `target/vectdb-gate/summary.json` (SPFresh + LanceDB from gate run).
 
 SPFresh:
 - `update_qps=230412.54`
@@ -916,7 +916,7 @@ Change:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=213498.44`
@@ -947,7 +947,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=198083.54`
@@ -989,7 +989,7 @@ Change:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=195701.09`
@@ -1051,7 +1051,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=223970.44`
@@ -1086,7 +1086,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=191595.34`
@@ -1120,7 +1120,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=199844.28`
@@ -1154,7 +1154,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=214825.66`
@@ -1191,7 +1191,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=208279.98`
@@ -1222,7 +1222,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=230740.39`
@@ -1254,7 +1254,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=180240.39`
@@ -1290,7 +1290,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=190784.33`
@@ -1321,7 +1321,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=231755.30`
@@ -1354,7 +1354,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=185188.05`
@@ -1389,7 +1389,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=183394.39`
@@ -1420,7 +1420,7 @@ Impact:
 
 Benchmark note (post-step gate run):
 - Summary file:
-  `target/vectordb-gate/summary.json`
+  `target/vectdb-gate/summary.json`
 
 SPFresh:
 - `update_qps=204687.34`

@@ -13,13 +13,13 @@ services:
   node1:
     build:
       context: ..
-      dockerfile: docker/vectordb-deploy.Dockerfile
-    image: layerdb/vectordb-deploy:integration
+      dockerfile: docker/vectdb-deploy.Dockerfile
+    image: layerdb/vectdb-deploy:integration
     depends_on:
       - etcd
     command:
       - --db-root
-      - /var/lib/vectordb
+      - /var/lib/vectdb
       - --listen
       - 0.0.0.0:8080
       - --node-id
@@ -31,7 +31,7 @@ services:
       - --etcd-endpoints
       - http://etcd:2379
       - --etcd-election-key
-      - /vectordb/integration/leader
+      - /vectdb/integration/leader
       - --etcd-lease-ttl-secs
       - "5"
       - --etcd-retry-ms
@@ -63,16 +63,16 @@ services:
     ports:
       - "${VDB_NODE1_PORT:-18080}:8080"
     volumes:
-      - node1-data:/var/lib/vectordb
+      - node1-data:/var/lib/vectdb
 
   node2:
-    image: layerdb/vectordb-deploy:integration
+    image: layerdb/vectdb-deploy:integration
     depends_on:
       - etcd
       - node1
     command:
       - --db-root
-      - /var/lib/vectordb
+      - /var/lib/vectdb
       - --listen
       - 0.0.0.0:8080
       - --node-id
@@ -84,7 +84,7 @@ services:
       - --etcd-endpoints
       - http://etcd:2379
       - --etcd-election-key
-      - /vectordb/integration/leader
+      - /vectdb/integration/leader
       - --etcd-lease-ttl-secs
       - "5"
       - --etcd-retry-ms
@@ -116,16 +116,16 @@ services:
     ports:
       - "${VDB_NODE2_PORT:-18081}:8080"
     volumes:
-      - node2-data:/var/lib/vectordb
+      - node2-data:/var/lib/vectdb
 
   node3:
-    image: layerdb/vectordb-deploy:integration
+    image: layerdb/vectdb-deploy:integration
     depends_on:
       - etcd
       - node1
     command:
       - --db-root
-      - /var/lib/vectordb
+      - /var/lib/vectdb
       - --listen
       - 0.0.0.0:8080
       - --node-id
@@ -137,7 +137,7 @@ services:
       - --etcd-endpoints
       - http://etcd:2379
       - --etcd-election-key
-      - /vectordb/integration/leader
+      - /vectdb/integration/leader
       - --etcd-lease-ttl-secs
       - "5"
       - --etcd-retry-ms
@@ -169,7 +169,7 @@ services:
     ports:
       - "${VDB_NODE3_PORT:-18082}:8080"
     volumes:
-      - node3-data:/var/lib/vectordb
+      - node3-data:/var/lib/vectdb
 
 volumes:
   node1-data:

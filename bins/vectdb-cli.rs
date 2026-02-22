@@ -5,18 +5,18 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use vectordb::dataset::{generate_synthetic, SyntheticConfig};
-use vectordb::ground_truth::{exact_knn, recall_at_k};
-use vectordb::index::{
+use vectdb::dataset::{generate_synthetic, SyntheticConfig};
+use vectdb::ground_truth::{exact_knn, recall_at_k};
+use vectdb::index::{
     AppendOnlyConfig, AppendOnlyIndex, SaqConfig, SaqIndex, SpFreshConfig, SpFreshIndex,
     SpFreshLayerDbConfig, SpFreshLayerDbIndex, SpFreshLayerDbShardedConfig,
     SpFreshLayerDbShardedIndex, SpFreshMemoryMode,
 };
-use vectordb::types::{VectorIndex, VectorRecord};
+use vectdb::types::{VectorIndex, VectorRecord};
 
 #[derive(Debug, Parser)]
-#[command(name = "vectordb-cli")]
-#[command(about = "VectorDB command line utility")]
+#[command(name = "vectdb-cli")]
+#[command(about = "VectDB command line utility")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -135,7 +135,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Version => {
-            println!("{}", vectordb::VERSION);
+            println!("{}", vectdb::VERSION);
         }
         Command::Bench(args) => run_bench(&args)?,
         Command::SaqValidate(args) => run_saq_validate(&args)?,
@@ -173,7 +173,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
     });
 
     let exact_rows = final_rows_after_updates(&data.base, &data.updates);
-    let exact_answers: Vec<Vec<vectordb::Neighbor>> = data
+    let exact_answers: Vec<Vec<vectdb::Neighbor>> = data
         .queries
         .iter()
         .map(|q| exact_knn(&exact_rows, q, args.k))
@@ -189,7 +189,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
     ];
 
     println!(
-        "vectordb bench dim={} base={} updates={} queries={} k={}",
+        "vectdb bench dim={} base={} updates={} queries={} k={}",
         args.dim, args.base, args.updates, args.queries, args.k
     );
     println!(
@@ -226,7 +226,7 @@ fn run_saq_validate(args: &SaqValidateArgs) -> Result<()> {
     }
 
     let (base, queries) = generate_anisotropic(args.seed, args.base, args.queries, args.dim);
-    let exact_answers: Vec<Vec<vectordb::Neighbor>> = queries
+    let exact_answers: Vec<Vec<vectdb::Neighbor>> = queries
         .iter()
         .map(|q| exact_knn(&base, q, args.k))
         .collect();
@@ -373,8 +373,8 @@ fn final_rows_after_updates(
 
 fn bench_spfresh(
     args: &BenchArgs,
-    data: &vectordb::dataset::SyntheticDataset,
-    exact_answers: &[Vec<vectordb::Neighbor>],
+    data: &vectdb::dataset::SyntheticDataset,
+    exact_answers: &[Vec<vectdb::Neighbor>],
 ) -> EngineStats {
     let cfg = SpFreshConfig {
         dim: args.dim,
@@ -418,8 +418,8 @@ fn bench_spfresh(
 
 fn bench_append_only(
     args: &BenchArgs,
-    data: &vectordb::dataset::SyntheticDataset,
-    exact_answers: &[Vec<vectordb::Neighbor>],
+    data: &vectdb::dataset::SyntheticDataset,
+    exact_answers: &[Vec<vectdb::Neighbor>],
 ) -> EngineStats {
     let cfg = AppendOnlyConfig {
         dim: args.dim,
@@ -459,8 +459,8 @@ fn bench_append_only(
 
 fn bench_spfresh_layerdb(
     args: &BenchArgs,
-    data: &vectordb::dataset::SyntheticDataset,
-    exact_answers: &[Vec<vectordb::Neighbor>],
+    data: &vectdb::dataset::SyntheticDataset,
+    exact_answers: &[Vec<vectdb::Neighbor>],
 ) -> Result<EngineStats> {
     let sp_cfg = SpFreshConfig {
         dim: args.dim,
@@ -523,8 +523,8 @@ fn bench_spfresh_layerdb(
 
 fn bench_spfresh_layerdb_sharded(
     args: &BenchArgs,
-    data: &vectordb::dataset::SyntheticDataset,
-    exact_answers: &[Vec<vectordb::Neighbor>],
+    data: &vectdb::dataset::SyntheticDataset,
+    exact_answers: &[Vec<vectdb::Neighbor>],
 ) -> Result<EngineStats> {
     let sp_cfg = SpFreshConfig {
         dim: args.dim,
@@ -591,8 +591,8 @@ fn bench_spfresh_layerdb_sharded(
 
 fn bench_saq(
     args: &BenchArgs,
-    data: &vectordb::dataset::SyntheticDataset,
-    exact_answers: &[Vec<vectordb::Neighbor>],
+    data: &vectdb::dataset::SyntheticDataset,
+    exact_answers: &[Vec<vectdb::Neighbor>],
 ) -> EngineStats {
     let cfg = SaqConfig {
         dim: args.dim,
@@ -633,8 +633,8 @@ fn bench_saq(
 
 fn bench_saq_uniform(
     args: &BenchArgs,
-    data: &vectordb::dataset::SyntheticDataset,
-    exact_answers: &[Vec<vectordb::Neighbor>],
+    data: &vectdb::dataset::SyntheticDataset,
+    exact_answers: &[Vec<vectdb::Neighbor>],
 ) -> EngineStats {
     let cfg = SaqConfig {
         dim: args.dim,

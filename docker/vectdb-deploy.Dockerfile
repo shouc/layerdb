@@ -9,13 +9,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY bins ./bins
 
-RUN cargo build --release -p vectordb --bin vectordb-deploy
+RUN cargo build --release -p vectdb --bin vectdb-deploy
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /workspace/target/release/vectordb-deploy /usr/local/bin/vectordb-deploy
+COPY --from=builder /workspace/target/release/vectdb-deploy /usr/local/bin/vectdb-deploy
 
-ENTRYPOINT ["/usr/local/bin/vectordb-deploy"]
+ENTRYPOINT ["/usr/local/bin/vectdb-deploy"]

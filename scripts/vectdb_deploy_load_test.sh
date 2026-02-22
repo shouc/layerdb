@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
 COMPOSE_FILE="${ROOT_DIR}/docker/docker-compose.integration.yml"
-PROJECT="${VDB_LOAD_PROJECT:-vectordb-load}"
+PROJECT="${VDB_LOAD_PROJECT:-vectdb-load}"
 TIMEOUT_SECS="${VDB_LOAD_TIMEOUT_SECS:-180}"
 NODE1_PORT="${VDB_NODE1_PORT:-18080}"
 NODE2_PORT="${VDB_NODE2_PORT:-18081}"

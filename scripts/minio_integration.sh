@@ -61,4 +61,4 @@ export LAYERDB_S3_SECURE=0
 export LAYERDB_S3_AUTO_CREATE_BUCKET=1
 
 cargo test --test freeze_s3_minio -- --nocapture
-cargo test -p vectordb s3_sync_round_trip_against_minio_when_enabled -- --nocapture
+cargo test -p vectdb s3_sync_round_trip_against_minio_when_enabled -- --nocapture

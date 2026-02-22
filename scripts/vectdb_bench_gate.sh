@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-CONFIG="${CONFIG:-$ROOT_DIR/benchmarks/vectordb_gate.json}"
-OUT_DIR="${OUT_DIR:-$ROOT_DIR/target/vectordb-gate}"
+CONFIG="${CONFIG:-$ROOT_DIR/benchmarks/vectdb_gate.json}"
+OUT_DIR="${OUT_DIR:-$ROOT_DIR/target/vectdb-gate}"
 
 mkdir -p "$OUT_DIR"
 
@@ -36,7 +36,7 @@ LC_NPROBE="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["lan
 LC_UPDATE_BATCH="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["lancedb"]["update_batch"])' "$CONFIG")"
 
 echo "Generating benchmark dataset..."
-cargo run -p vectordb --bin vectordb-cli -- dump-dataset \
+cargo run -p vectdb --bin vectdb-cli -- dump-dataset \
   --out "$DATASET" \
   --seed "$SEED" \
   --dim "$DIM" \
@@ -50,7 +50,7 @@ if [[ "$SP_DISKMETA" == "true" ]]; then
 else
   DISKMETA_FLAG=""
 fi
-cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
+cargo run --release -p vectdb --bin bench_spfresh_sharded -- \
   --dataset "$DATASET" \
   --k "$K" \
   --shards "$SP_SHARDS" \
@@ -65,7 +65,7 @@ cargo run --release -p vectordb --bin bench_spfresh_sharded -- \
   > "$SPFRESH_JSON"
 
 echo "Running LanceDB benchmark..."
-cargo run --release -p vectordb --bin bench_lancedb -- \
+cargo run --release -p vectdb --bin bench_lancedb -- \
   --dataset "$DATASET" \
   --k "$K" \
   --nlist "$LC_NLIST" \
@@ -73,7 +73,7 @@ cargo run --release -p vectordb --bin bench_lancedb -- \
   --update-batch "$LC_UPDATE_BATCH" \
   > "$LANCEDB_JSON"
 
-python3 "$ROOT_DIR/scripts/check_vectordb_gate.py" \
+python3 "$ROOT_DIR/scripts/check_vectdb_gate.py" \
   "$CONFIG" \
   "$SPFRESH_JSON" \
   "$LANCEDB_JSON" \

@@ -1,5 +1,5 @@
 [package]
-name = "vectordb"
+name = "vectdb"
 version = "0.1.0"
 edition = "2021"
 
@@ -37,9 +37,9 @@ name = "bench_spfresh_sharded"
 path = "../../bins/bench_spfresh_sharded.rs"
 
 [[bin]]
-name = "vectordb-cli"
-path = "../../bins/vectordb-cli.rs"
+name = "vectdb-cli"
+path = "../../bins/vectdb-cli.rs"
 
 [[bin]]
-name = "vectordb-deploy"
-path = "../../bins/vectordb-deploy.rs"
+name = "vectdb-deploy"
+path = "../../bins/vectdb-deploy.rs"

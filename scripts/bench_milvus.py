@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Benchmark Milvus on the exact dataset exported by vectordb-cli.
+Benchmark Milvus on the exact dataset exported by vectdb-cli.
 
 Usage:
-  python3 scripts/bench_milvus.py --dataset /tmp/vectordb_dataset.json --k 10 --nprobe 8
+  python3 scripts/bench_milvus.py --dataset /tmp/vectdb_dataset.json --k 10 --nprobe 8
 """
 
 from __future__ import annotations
@@ -43,8 +43,8 @@ class Dataset:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run fair Milvus benchmark on vectordb dataset.")
-    parser.add_argument("--dataset", required=True, help="Path to dataset JSON from vectordb-cli dump-dataset.")
+    parser = argparse.ArgumentParser(description="Run fair Milvus benchmark on vectdb dataset.")
+    parser.add_argument("--dataset", required=True, help="Path to dataset JSON from vectdb-cli dump-dataset.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default="19530")
     parser.add_argument("--collection", default="")

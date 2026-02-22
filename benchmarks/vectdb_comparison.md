@@ -1,4 +1,4 @@
-# VectorDB Benchmark Report
+# VectDB Benchmark Report
 
 Date: 2026-02-18
 
@@ -30,20 +30,20 @@ Milvus fairness setup:
 - source cloned from `https://github.com/milvus-io/milvus.git` (`/tmp/milvus-layerdb-20260217b`)
 - Milvus standalone launched via Docker Compose from repo deployment config
 - index type `IVF_FLAT` with `nlist=64`
-- updates applied one-by-one (`update_batch=1`) to match vectordb benchmark write mode
+- updates applied one-by-one (`update_batch=1`) to match vectdb benchmark write mode
 
 ## Main Comparison (10k / 2k / 200)
 
 Dataset exported once and reused:
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- dump-dataset \
-  --out /tmp/vectordb_dataset_10000_2000_200_seed404.json \
+cargo run -p vectdb --bin vectdb-cli -- dump-dataset \
+  --out /tmp/vectdb_dataset_10000_2000_200_seed404.json \
   --seed 404 --dim 64 --base 10000 --updates 2000 --queries 200
 ```
 
-vectordb run:
+vectdb run:
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- bench \
+cargo run -p vectdb --bin vectdb-cli -- bench \
   --seed 404 --dim 64 --base 10000 --updates 2000 --queries 200 --k 10 \
   --initial-postings 64 --nprobe 8 --split-limit 64 --merge-limit 16 --reassign-range 32 \
   --saq-total-bits 256 --saq-ivf-clusters 64
@@ -52,7 +52,7 @@ cargo run -p vectordb --bin vectordb-cli -- bench \
 milvus run:
 ```bash
 python3 scripts/bench_milvus.py \
-  --dataset /tmp/vectordb_dataset_10000_2000_200_seed404.json \
+  --dataset /tmp/vectdb_dataset_10000_2000_200_seed404.json \
   --k 10 --nprobe 8 --nlist 64 --update-batch 1
 ```
 
@@ -70,7 +70,7 @@ python3 scripts/bench_milvus.py \
 After production-hardening changes (binary storage, atomic generation switch on bulk-load, incremental dirty-id rebuilder, tuned SPFresh probe fanout):
 
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- bench \
+cargo run -p vectdb --bin vectdb-cli -- bench \
   --seed 404 --dim 64 --base 10000 --updates 2000 --queries 200 --k 10 \
   --initial-postings 64 --nprobe 8 --split-limit 64 --merge-limit 16 --reassign-range 32 \
   --saq-total-bits 256 --saq-ivf-clusters 64
@@ -88,14 +88,14 @@ cargo run -p vectordb --bin vectordb-cli -- bench \
 
 Dataset:
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- dump-dataset \
-  --out /tmp/vectordb_eval_2000_400_100_seed777.json \
+cargo run -p vectdb --bin vectdb-cli -- dump-dataset \
+  --out /tmp/vectdb_eval_2000_400_100_seed777.json \
   --seed 777 --dim 64 --base 2000 --updates 400 --queries 100
 ```
 
-vectordb:
+vectdb:
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- bench \
+cargo run -p vectdb --bin vectdb-cli -- bench \
   --seed 777 --dim 64 --base 2000 --updates 400 --queries 100 --k 10 \
   --initial-postings 64 --nprobe 8 --split-limit 64 --merge-limit 16 --reassign-range 32 \
   --saq-total-bits 256 --saq-ivf-clusters 64
@@ -104,7 +104,7 @@ cargo run -p vectordb --bin vectordb-cli -- bench \
 milvus:
 ```bash
 python3 scripts/bench_milvus.py \
-  --dataset /tmp/vectordb_eval_2000_400_100_seed777.json \
+  --dataset /tmp/vectdb_eval_2000_400_100_seed777.json \
   --k 10 --nprobe 8 --nlist 64 --update-batch 1
 ```
 
@@ -117,14 +117,14 @@ python3 scripts/bench_milvus.py \
 
 Dataset export:
 ```bash
-cargo run --release -p vectordb --bin vectordb-cli -- dump-dataset \
-  --out /tmp/vectordb_dataset_20000_5000_400_seed404.json \
+cargo run --release -p vectdb --bin vectdb-cli -- dump-dataset \
+  --out /tmp/vectdb_dataset_20000_5000_400_seed404.json \
   --seed 404 --dim 64 --base 20000 --updates 5000 --queries 400
 ```
 
-vectordb run (`nprobe=8`):
+vectdb run (`nprobe=8`):
 ```bash
-cargo run --release -p vectordb --bin vectordb-cli -- bench \
+cargo run --release -p vectdb --bin vectdb-cli -- bench \
   --seed 404 --dim 64 --base 20000 --updates 5000 --queries 400 --k 10 \
   --initial-postings 64 --nprobe 8 --split-limit 64 --merge-limit 16 --reassign-range 32 \
   --saq-total-bits 256 --saq-ivf-clusters 64
@@ -141,7 +141,7 @@ cargo run --release -p vectordb --bin vectordb-cli -- bench \
 milvus run (`nprobe=8`):
 ```bash
 python3 scripts/bench_milvus.py \
-  --dataset /tmp/vectordb_dataset_20000_5000_400_seed404.json \
+  --dataset /tmp/vectdb_dataset_20000_5000_400_seed404.json \
   --k 10 --nprobe 8 --nlist 64 --update-batch 1
 ```
 
@@ -151,13 +151,13 @@ python3 scripts/bench_milvus.py \
 
 High-recall operating point (`nprobe=32`):
 ```bash
-cargo run --release -p vectordb --bin vectordb-cli -- bench \
+cargo run --release -p vectdb --bin vectdb-cli -- bench \
   --seed 404 --dim 64 --base 20000 --updates 5000 --queries 400 --k 10 \
   --initial-postings 64 --nprobe 32 --split-limit 64 --merge-limit 16 --reassign-range 32 \
   --saq-total-bits 256 --saq-ivf-clusters 64
 
 python3 scripts/bench_milvus.py \
-  --dataset /tmp/vectordb_dataset_20000_5000_400_seed404.json \
+  --dataset /tmp/vectdb_dataset_20000_5000_400_seed404.json \
   --k 10 --nprobe 32 --nlist 64 --update-batch 1
 ```
 
@@ -170,15 +170,15 @@ python3 scripts/bench_milvus.py \
 
 Standalone Rust benchmark binary:
 ```bash
-cargo run --release -p vectordb --bin bench_lancedb -- \
-  --dataset /tmp/vectordb_dataset_10000_2000_200_seed404.json \
+cargo run --release -p vectdb --bin bench_lancedb -- \
+  --dataset /tmp/vectdb_dataset_10000_2000_200_seed404.json \
   --k 10 --nlist 64 --nprobe 8 --update-batch 1
 ```
 
 High-recall variant:
 ```bash
-cargo run --release -p vectordb --bin bench_lancedb -- \
-  --dataset /tmp/vectordb_dataset_10000_2000_200_seed404.json \
+cargo run --release -p vectdb --bin bench_lancedb -- \
+  --dataset /tmp/vectdb_dataset_10000_2000_200_seed404.json \
   --k 10 --nlist 64 --nprobe 32 --update-batch 1
 ```
 
@@ -203,7 +203,7 @@ Implemented in `SaqIndex`:
 
 Validation command:
 ```bash
-cargo run -p vectordb --bin vectordb-cli -- saq-validate \
+cargo run -p vectdb --bin vectdb-cli -- saq-validate \
   --dim 96 --base 25000 --queries 500 --k 10 --seed 42 \
   --total-bits 256 --ivf-clusters 128 --nprobe 12
 ```

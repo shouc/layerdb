@@ -17,7 +17,7 @@ fn sharded_deploy_docker_round_trip() -> anyhow::Result<()> {
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let script = manifest_dir.join("../../scripts/vectordb_deploy_integration.sh");
+    let script = manifest_dir.join("../../scripts/vectdb_deploy_integration.sh");
     anyhow::ensure!(
         script.exists(),
         "missing docker integration script at {}",

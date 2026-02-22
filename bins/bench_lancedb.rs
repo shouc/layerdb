@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Parser)]
 #[command(name = "bench_lancedb")]
-#[command(about = "Run LanceDB benchmark on vectordb exported dataset")]
+#[command(about = "Run LanceDB benchmark on vectdb exported dataset")]
 struct Args {
     #[arg(long)]
     dataset: PathBuf,

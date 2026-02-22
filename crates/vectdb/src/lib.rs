@@ -1,4 +1,4 @@
-//! VectorDB core library.
+//! VectDB core library.
 
 pub mod columnar;
 pub mod dataset;

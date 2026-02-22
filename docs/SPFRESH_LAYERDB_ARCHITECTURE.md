@@ -47,7 +47,7 @@ Responsibilities:
 - scan `spfresh/v/*` rows
 - rebuild `SpFreshIndex` from recovered vectors
 
-This provides crash recovery without replaying external logs in `vectordb`.
+This provides crash recovery without replaying external logs in `vectdb`.
 
 ## Data Flow
 1. Client update arrives.
@@ -75,7 +75,7 @@ This implementation follows the same system split:
 - recovery: restore serving state from durable storage
 
 Code reference:
-- `vectordb/src/index/spfresh_layerdb/mod.rs`
-- `vectordb/src/index/spfresh_layerdb/rebuilder.rs`
-- `vectordb/src/index/spfresh_layerdb/storage.rs`
-- `vectordb/src/index/spfresh.rs`
+- `vectdb/src/index/spfresh_layerdb/mod.rs`
+- `vectdb/src/index/spfresh_layerdb/rebuilder.rs`
+- `vectdb/src/index/spfresh_layerdb/storage.rs`
+- `vectdb/src/index/spfresh.rs`

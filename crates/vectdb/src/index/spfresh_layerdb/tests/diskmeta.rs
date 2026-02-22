@@ -106,6 +106,44 @@ fn acknowledged_commit_mode_round_trip_on_clean_restart() -> anyhow::Result<()> 
 }
 
 #[test]
+fn acknowledged_commit_mode_persists_without_explicit_close() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig {
+        write_sync: false,
+        db_options: layerdb::DbOptions {
+            fsync_writes: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        let rows = vec![
+            VectorRecord::new(10, vec![0.1; cfg.spfresh.dim]),
+            VectorRecord::new(11, vec![0.2; cfg.spfresh.dim]),
+            VectorRecord::new(12, vec![0.3; cfg.spfresh.dim]),
+        ];
+        assert_eq!(
+            idx.try_upsert_batch_with_commit_mode(&rows, MutationCommitMode::Acknowledged)?,
+            rows.len()
+        );
+        assert_eq!(
+            idx.try_delete_batch_with_commit_mode(&[10], MutationCommitMode::Acknowledged)?,
+            1
+        );
+        drop(idx);
+    }
+
+    let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
+    assert_eq!(idx.len(), 2);
+    let got = idx.search(&[0.25; 64], 2);
+    assert_eq!(got.len(), 2);
+    assert!(got.iter().all(|n| n.id != 10));
+    Ok(())
+}
+
+#[test]
 fn diskmeta_search_fails_closed_when_exact_payloads_are_missing() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let cfg = SpFreshLayerDbConfig {

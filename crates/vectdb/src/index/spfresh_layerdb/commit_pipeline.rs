@@ -124,12 +124,14 @@ impl SpFreshLayerDbIndex {
         ));
         row_ops.append(&mut trailer_ops);
         let sync = matches!(commit_mode, MutationCommitMode::Durable);
-        self.submit_commit(row_ops, sync, true).with_context(|| {
-            format!(
-                "persist vector+wal seq={} next={} ops={}",
-                start_seq, next_seq, op_count_hint
-            )
-        })?;
+        let wait_for_ack = matches!(commit_mode, MutationCommitMode::Durable);
+        self.submit_commit(row_ops, sync, wait_for_ack)
+            .with_context(|| {
+                format!(
+                    "persist vector+wal seq={} next={} ops={}",
+                    start_seq, next_seq, op_count_hint
+                )
+            })?;
         self.wal_next_seq.store(next_seq, Ordering::Relaxed);
         Ok(())
     }

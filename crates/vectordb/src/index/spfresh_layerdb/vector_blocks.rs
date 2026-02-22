@@ -285,13 +285,12 @@ impl VectorBlockStore {
             let mut distance = 0.0f32;
             let mut cursor = 17usize;
             for query_value in query {
-                let Some(bits_bytes) = record.get(cursor..cursor + 4) else {
-                    distance = f32::INFINITY;
-                    break;
+                // SAFETY: `record` length is exactly one full record (rec_size), and
+                // `query.len() == self.dim`, so each 4-byte load is in-bounds.
+                let bits = unsafe {
+                    u32::from_le(record.as_ptr().add(cursor).cast::<u32>().read_unaligned())
                 };
-                let mut bits = [0u8; 4];
-                bits.copy_from_slice(bits_bytes);
-                let value = f32::from_bits(u32::from_le_bytes(bits));
+                let value = f32::from_bits(bits);
                 let delta = *query_value - value;
                 distance += delta * delta;
                 cursor += 4;
@@ -337,10 +336,11 @@ impl VectorBlockStore {
         let mut values = Vec::with_capacity(self.dim);
         let mut cursor = 17usize;
         for _ in 0..self.dim {
-            let bits_bytes = record.get(cursor..cursor + 4)?;
-            let mut arr = [0u8; 4];
-            arr.copy_from_slice(bits_bytes);
-            values.push(f32::from_bits(u32::from_le_bytes(arr)));
+            // SAFETY: `record` length is a full record and we iterate exactly `self.dim`
+            // values from the payload region starting at byte 17.
+            let bits =
+                unsafe { u32::from_le(record.as_ptr().add(cursor).cast::<u32>().read_unaligned()) };
+            values.push(f32::from_bits(bits));
             cursor += 4;
         }
         Some(VectorBlockState { posting_id, values })

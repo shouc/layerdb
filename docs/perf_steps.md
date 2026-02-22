@@ -705,3 +705,30 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.5594`
 - `search_qps_ratio=3.5455`
+
+## Step 28 (`vector-block-unaligned-decode-fastpath`)
+
+Change:
+- Reworked vector value decode in `VectorBlockStore` hot read paths to use unaligned 32-bit loads:
+  - `distances_for_ids(...)`
+  - `get_state(...)`
+- Removed repeated per-value slice-bound checks/copies in those loops.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step29-spfresh.json`,
+  `target/vectordb-step29-lancedb.json`.
+
+SPFresh:
+- `update_qps=191761.45`
+- `search_qps=2705.20`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=126026.26`
+- `search_qps=832.32`
+- `recall_at_k=0.4720`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.5216`
+- `search_qps_ratio=3.2502`

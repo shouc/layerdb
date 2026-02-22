@@ -230,13 +230,29 @@ pub(crate) fn encode_vector_row_fields(
     out.extend_from_slice(&id.to_le_bytes());
     let dim = u32::try_from(values.len()).context("vector row dim does not fit u32")?;
     out.extend_from_slice(&dim.to_le_bytes());
-    for value in values {
-        out.extend_from_slice(&value.to_bits().to_le_bytes());
-    }
+    append_f32_le_bytes(&mut out, values);
     if let Some(posting) = posting_u64 {
         out.extend_from_slice(&posting.to_le_bytes());
     }
     Ok(out)
+}
+
+#[inline]
+fn append_f32_le_bytes(out: &mut Vec<u8>, values: &[f32]) {
+    #[cfg(target_endian = "little")]
+    {
+        let bytes_len = values.len().saturating_mul(std::mem::size_of::<f32>());
+        // SAFETY: `f32` is plain-old-data and we only reinterpret a valid contiguous
+        // slice as bytes for immediate copy into `out`.
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), bytes_len) };
+        out.extend_from_slice(bytes);
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for value in values {
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+    }
 }
 
 pub(crate) fn decode_vector_row_value(raw: &[u8]) -> anyhow::Result<VectorRecord> {
@@ -730,9 +746,7 @@ fn encode_wal_frame(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
 fn encode_wal_f32_vec(payload: &mut Vec<u8>, values: &[f32]) -> anyhow::Result<()> {
     let len = u32::try_from(values.len()).context("wal f32 vector len does not fit u32")?;
     payload.extend_from_slice(&len.to_le_bytes());
-    for value in values {
-        payload.extend_from_slice(&value.to_bits().to_le_bytes());
-    }
+    append_f32_le_bytes(payload, values);
     Ok(())
 }
 
@@ -865,7 +879,14 @@ pub(crate) fn encode_wal_touch_batch_ids(ids: &[u64]) -> anyhow::Result<Vec<u8>>
 }
 
 pub(crate) fn encode_wal_vector_upsert_batch(rows: &[(u64, Vec<f32>)]) -> anyhow::Result<Vec<u8>> {
-    let mut payload = Vec::with_capacity(1 + 4 + rows.len().saturating_mul(16));
+    let mut payload_len = 1usize + 4usize;
+    for (_id, values) in rows {
+        payload_len = payload_len
+            .saturating_add(8) // id
+            .saturating_add(4) // vector len
+            .saturating_add(values.len().saturating_mul(std::mem::size_of::<f32>()));
+    }
+    let mut payload = Vec::with_capacity(payload_len);
     payload.push(WAL_KIND_VECTOR_UPSERT_BATCH);
     let len = u32::try_from(rows.len()).context("wal vector upsert-batch len does not fit u32")?;
     payload.extend_from_slice(&len.to_le_bytes());
@@ -892,7 +913,22 @@ pub(crate) fn encode_wal_diskmeta_upsert_batch(
     old_states: &FxHashMap<u64, Option<(usize, Vec<f32>)>>,
     new_postings: &FxHashMap<u64, usize>,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut payload = Vec::with_capacity(1 + 4 + rows.len().saturating_mul(16));
+    let mut payload_len = 1usize + 4usize;
+    for (id, new_values) in rows {
+        payload_len = payload_len
+            .saturating_add(8) // id
+            .saturating_add(1) // old-state flags
+            .saturating_add(8) // new posting
+            .saturating_add(4) // new vector len
+            .saturating_add(new_values.len().saturating_mul(std::mem::size_of::<f32>()));
+        if let Some(Some((_old_posting, old_values))) = old_states.get(id) {
+            payload_len = payload_len
+                .saturating_add(8) // old posting
+                .saturating_add(4) // old vector len
+                .saturating_add(old_values.len().saturating_mul(std::mem::size_of::<f32>()));
+        }
+    }
+    let mut payload = Vec::with_capacity(payload_len);
     payload.push(WAL_KIND_DISKMETA_UPSERT_BATCH);
     let len =
         u32::try_from(rows.len()).context("wal diskmeta upsert-batch len does not fit u32")?;
@@ -920,7 +956,17 @@ pub(crate) fn encode_wal_diskmeta_delete_batch(
     ids: &[u64],
     old_states: &FxHashMap<u64, Option<(usize, Vec<f32>)>>,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut payload = Vec::with_capacity(1 + 4 + ids.len().saturating_mul(12));
+    let mut payload_len = 1usize + 4usize;
+    for id in ids {
+        payload_len = payload_len.saturating_add(8).saturating_add(1); // id + old-state flags
+        if let Some(Some((_old_posting, old_values))) = old_states.get(id) {
+            payload_len = payload_len
+                .saturating_add(8) // old posting
+                .saturating_add(4) // old vector len
+                .saturating_add(old_values.len().saturating_mul(std::mem::size_of::<f32>()));
+        }
+    }
+    let mut payload = Vec::with_capacity(payload_len);
     payload.push(WAL_KIND_DISKMETA_DELETE_BATCH);
     let len = u32::try_from(ids.len()).context("wal diskmeta delete-batch len does not fit u32")?;
     payload.extend_from_slice(&len.to_le_bytes());

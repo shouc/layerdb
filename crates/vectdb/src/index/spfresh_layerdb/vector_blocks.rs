@@ -20,6 +20,24 @@ const INDEX_RECORD_PAYLOAD_SIZE: usize = 8 + 1 + 8;
 const INDEX_RECORD_SIZE: usize = INDEX_RECORD_PAYLOAD_SIZE + 4;
 const DISTANCE_SCAN_PREFETCH_DISTANCE: usize = 16;
 
+#[inline]
+fn append_f32_le_bytes(out: &mut Vec<u8>, values: &[f32]) {
+    #[cfg(target_endian = "little")]
+    {
+        let bytes_len = values.len().saturating_mul(std::mem::size_of::<f32>());
+        // SAFETY: `f32` is a plain value type and we only reinterpret a live slice
+        // as bytes for immediate copy into `out`.
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), bytes_len) };
+        out.extend_from_slice(bytes);
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for value in values {
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+    }
+}
+
 fn record_size(dim: usize) -> usize {
     8 + 1 + 8 + dim.saturating_mul(4)
 }
@@ -258,9 +276,7 @@ impl VectorBlockStore {
             buf.extend_from_slice(&id.to_le_bytes());
             buf.push(flags);
             buf.extend_from_slice(&posting_u64.unwrap_or_default().to_le_bytes());
-            for value in values {
-                buf.extend_from_slice(&value.to_bits().to_le_bytes());
-            }
+            append_f32_le_bytes(&mut buf, values);
             Self::push_index_record(&mut index_buf, *id, flags, record_offset);
             self.offsets.insert(*id, offset);
             offset = offset
@@ -305,9 +321,7 @@ impl VectorBlockStore {
         buf.extend_from_slice(&id.to_le_bytes());
         buf.push(flags);
         buf.extend_from_slice(&posting_u64.unwrap_or_default().to_le_bytes());
-        for value in values {
-            buf.extend_from_slice(&value.to_bits().to_le_bytes());
-        }
+        append_f32_le_bytes(&mut buf, values);
         self.file
             .write_all(&buf)
             .context("append vector block upsert")?;

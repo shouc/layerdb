@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 
@@ -56,22 +57,27 @@ pub struct SpFreshLayerDbShardedIndex {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct HeapNeighbor(Neighbor);
 
+#[cfg(test)]
 impl PartialEq for HeapNeighbor {
     fn eq(&self, other: &Self) -> bool {
         self.0.id == other.0.id && self.0.distance.to_bits() == other.0.distance.to_bits()
     }
 }
 
+#[cfg(test)]
 impl Eq for HeapNeighbor {}
 
+#[cfg(test)]
 impl PartialOrd for HeapNeighbor {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
+#[cfg(test)]
 impl Ord for HeapNeighbor {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0
@@ -82,11 +88,13 @@ impl Ord for HeapNeighbor {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct ShardCursor {
     shard_id: usize,
     neighbor_idx: usize,
 }
 
+#[cfg(test)]
 impl Ord for ShardCursor {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Ordering is supplied at call-site through heap payload tuple.
@@ -96,6 +104,7 @@ impl Ord for ShardCursor {
     }
 }
 
+#[cfg(test)]
 impl PartialOrd for ShardCursor {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -417,6 +426,7 @@ impl SpFreshLayerDbShardedIndex {
         top
     }
 
+    #[cfg(test)]
     fn merge_sorted_neighbors(per_shard: &[Vec<Neighbor>], k: usize) -> Vec<Neighbor> {
         if k == 0 || per_shard.is_empty() {
             return Vec::new();
@@ -455,13 +465,57 @@ impl SpFreshLayerDbShardedIndex {
         out
     }
 
+    fn merge_two_sorted_neighbors(
+        left: Vec<Neighbor>,
+        right: Vec<Neighbor>,
+        k: usize,
+    ) -> Vec<Neighbor> {
+        if k == 0 {
+            return Vec::new();
+        }
+        if left.is_empty() {
+            return right.into_iter().take(k).collect();
+        }
+        if right.is_empty() {
+            return left.into_iter().take(k).collect();
+        }
+        let mut left_iter = left.into_iter().peekable();
+        let mut right_iter = right.into_iter().peekable();
+        let mut out = Vec::with_capacity(k);
+        while out.len() < k {
+            match (left_iter.peek(), right_iter.peek()) {
+                (Some(l), Some(r)) => {
+                    if Self::neighbor_cmp(l, r).is_le() {
+                        if let Some(next) = left_iter.next() {
+                            out.push(next);
+                        }
+                    } else if let Some(next) = right_iter.next() {
+                        out.push(next);
+                    }
+                }
+                (Some(_), None) => {
+                    if let Some(next) = left_iter.next() {
+                        out.push(next);
+                    }
+                }
+                (None, Some(_)) => {
+                    if let Some(next) = right_iter.next() {
+                        out.push(next);
+                    }
+                }
+                (None, None) => break,
+            }
+        }
+        out
+    }
+
     fn search_all_shards_parallel(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
-        let per_shard: Vec<Vec<Neighbor>> = self
-            .shards
+        self.shards
             .par_iter()
             .map(|shard| shard.search(query, k))
-            .collect();
-        Self::merge_sorted_neighbors(per_shard.as_slice(), k)
+            .reduce(Vec::new, |left, right| {
+                Self::merge_two_sorted_neighbors(left, right, k)
+            })
     }
 
     fn search_with_exact_shard_prune(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
@@ -1047,6 +1101,65 @@ mod tests {
         );
         let ids: Vec<u64> = merged.into_iter().map(|n| n.id).collect();
         assert_eq!(ids, vec![21, 11, 31, 22]);
+    }
+
+    #[test]
+    fn merge_two_sorted_neighbors_matches_kway_merge() {
+        let per_shard = vec![
+            vec![
+                Neighbor {
+                    id: 10,
+                    distance: 0.10,
+                },
+                Neighbor {
+                    id: 12,
+                    distance: 0.30,
+                },
+                Neighbor {
+                    id: 13,
+                    distance: 0.90,
+                },
+            ],
+            vec![
+                Neighbor {
+                    id: 20,
+                    distance: 0.05,
+                },
+                Neighbor {
+                    id: 21,
+                    distance: 0.25,
+                },
+            ],
+            vec![
+                Neighbor {
+                    id: 30,
+                    distance: 0.15,
+                },
+                Neighbor {
+                    id: 31,
+                    distance: 0.35,
+                },
+            ],
+        ];
+        let k = 5usize;
+        let want = SpFreshLayerDbShardedIndex::merge_sorted_neighbors(per_shard.as_slice(), k);
+        let got = per_shard
+            .into_iter()
+            .reduce(|left, right| {
+                SpFreshLayerDbShardedIndex::merge_two_sorted_neighbors(left, right, k)
+            })
+            .unwrap_or_default();
+        assert_eq!(got.len(), want.len());
+        for (lhs, rhs) in got.iter().zip(want.iter()) {
+            assert_eq!(lhs.id, rhs.id);
+            assert!(
+                (lhs.distance - rhs.distance).abs() < 1e-6,
+                "distance mismatch id={} got={} want={}",
+                lhs.id,
+                lhs.distance,
+                rhs.distance
+            );
+        }
     }
 
     #[test]

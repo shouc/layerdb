@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -16,12 +16,15 @@ use clap::{Parser, ValueEnum};
 use etcd_client::{
     Client as EtcdClient, Compare, CompareOp, ConnectOptions, PutOptions, Txn, TxnOp,
 };
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::future::BoxFuture;
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Infallible, Serialize as RkyvSerialize};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use vectdb::cluster::etcd_leader_endpoint_key;
 use vectdb::index::{
     MutationCommitMode, SpFreshConfig, SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig,
@@ -164,11 +167,23 @@ impl From<CommitModeArg> for MutationCommitMode {
     }
 }
 
-const REPLICATION_JOURNAL_SCHEMA_VERSION: u32 = 1;
+impl From<MutationCommitMode> for CommitModeArg {
+    fn from(value: MutationCommitMode) -> Self {
+        match value {
+            MutationCommitMode::Durable => CommitModeArg::Durable,
+            MutationCommitMode::Acknowledged => CommitModeArg::Acknowledged,
+        }
+    }
+}
+
+const REPLICATION_JOURNAL_SCHEMA_VERSION: u32 = 2;
 const REPLICATION_PAYLOAD_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_PAYLOAD_SCHEMA_VERSION: u32 = 1;
+const INTERNAL_PARTITION_MUTATIONS_SCHEMA_VERSION: u32 = 1;
+const INTERNAL_PARTITION_SEARCH_SCHEMA_VERSION: u32 = 1;
 const CLUSTER_TOPOLOGY_SCHEMA_VERSION: u32 = 1;
 const LOG_RANGE_FRAME_MAX_ENTRIES: usize = 4096;
+const REPLICATION_LOG_RECORD_HEADER_BYTES: u64 = 20;
 const INTERNAL_AUTH_HEADER: &str = "x-vectdb-internal-token";
 
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -202,6 +217,18 @@ impl From<MutationInput> for WireMutation {
     }
 }
 
+impl From<&MutationInput> for WireMutation {
+    fn from(value: &MutationInput) -> Self {
+        match value {
+            MutationInput::Upsert { id, values } => Self::Upsert {
+                id: *id,
+                values: values.clone(),
+            },
+            MutationInput::Delete { id } => Self::Delete { id: *id },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
 struct ReplicationPayload {
@@ -214,9 +241,8 @@ struct ReplicationPayload {
 }
 
 impl ReplicationPayload {
-    fn to_runtime_mutations(&self) -> Vec<VectorMutation> {
+    fn into_runtime_mutations(self) -> Vec<VectorMutation> {
         self.mutations
-            .clone()
             .into_iter()
             .map(WireMutation::into_runtime)
             .collect()
@@ -260,9 +286,8 @@ struct SnapshotPayload {
 }
 
 impl SnapshotPayload {
-    fn to_runtime_rows(&self) -> Vec<VectorRecord> {
+    fn into_runtime_rows(self) -> Vec<VectorRecord> {
         self.rows
-            .clone()
             .into_iter()
             .map(WireSnapshotRow::into_runtime)
             .collect()
@@ -353,18 +378,34 @@ impl ReplicationJournal {
                 }
             }
             let len = u32::from_le_bytes(len_buf);
+            let mut seq_buf = [0u8; 8];
+            file.read_exact(&mut seq_buf)
+                .with_context(|| format!("read {} seq header", log_path.display()))?;
+            let seq = u64::from_le_bytes(seq_buf);
+            let mut checksum_buf = [0u8; 8];
+            file.read_exact(&mut checksum_buf)
+                .with_context(|| format!("read {} checksum header", log_path.display()))?;
+            let checksum = u64::from_le_bytes(checksum_buf);
             let mut raw = vec![0u8; len as usize];
             file.read_exact(&mut raw)
                 .with_context(|| format!("read {} payload len={}", log_path.display(), len))?;
-            let seq = decode_replication_payload_seq(&raw)?;
+            let actual_checksum = checksum_replication_record(seq, raw.as_slice());
+            if checksum != actual_checksum {
+                anyhow::bail!(
+                    "replication log checksum mismatch at seq={} got={} expected={}",
+                    seq,
+                    checksum,
+                    actual_checksum
+                );
+            }
             index.insert(
                 seq,
                 JournalIndexEntry {
-                    offset: offset + 4,
+                    offset: offset + REPLICATION_LOG_RECORD_HEADER_BYTES,
                     len,
                 },
             );
-            offset = offset.saturating_add(4 + len as u64);
+            offset = offset.saturating_add(REPLICATION_LOG_RECORD_HEADER_BYTES + len as u64);
         }
         file.seek(SeekFrom::End(0))
             .context("seek replication log to end")?;
@@ -393,15 +434,25 @@ impl ReplicationJournal {
         };
 
         if let Some((&min_seq, _)) = index.first_key_value() {
+            let max_seq = index
+                .last_key_value()
+                .map(|(seq, _)| *seq)
+                .unwrap_or(min_seq);
             meta.first_seq = min_seq;
+            // The on-disk log is authoritative after restart; never advance next_seq past it.
+            meta.next_seq = max_seq.saturating_add(1);
+            if meta.last_applied_seq.saturating_add(1) < min_seq {
+                meta.last_applied_seq = min_seq.saturating_sub(1);
+            }
+            if meta.last_applied_seq > max_seq {
+                meta.last_applied_seq = max_seq;
+            }
         } else {
             meta.first_seq = meta.next_seq.max(1);
-        }
-        if let Some((&max_seq, _)) = index.last_key_value() {
-            meta.next_seq = meta.next_seq.max(max_seq.saturating_add(1));
-        }
-        if meta.last_applied_seq.saturating_add(1) < meta.first_seq {
-            meta.last_applied_seq = meta.first_seq.saturating_sub(1);
+            meta.next_seq = meta
+                .next_seq
+                .max(meta.last_applied_seq.saturating_add(1))
+                .max(1);
         }
 
         let mut out = Self {
@@ -454,6 +505,7 @@ impl ReplicationJournal {
         self.meta.max_term_seen
     }
 
+    #[cfg(test)]
     fn append_entry(&mut self, seq: u64, raw_payload: &[u8], sync: bool) -> anyhow::Result<()> {
         if seq != self.meta.next_seq {
             anyhow::bail!(
@@ -467,9 +519,16 @@ impl ReplicationJournal {
             .file
             .seek(SeekFrom::End(0))
             .context("seek replication log to append")?;
+        let record_checksum = checksum_replication_record(seq, raw_payload);
         self.file
             .write_all(&len.to_le_bytes())
             .context("append replication record length")?;
+        self.file
+            .write_all(&seq.to_le_bytes())
+            .context("append replication record seq")?;
+        self.file
+            .write_all(&record_checksum.to_le_bytes())
+            .context("append replication record checksum")?;
         self.file
             .write_all(raw_payload)
             .context("append replication record payload")?;
@@ -479,7 +538,7 @@ impl ReplicationJournal {
         self.index.insert(
             seq,
             JournalIndexEntry {
-                offset: record_start + 4,
+                offset: record_start + REPLICATION_LOG_RECORD_HEADER_BYTES,
                 len,
             },
         );
@@ -490,6 +549,7 @@ impl ReplicationJournal {
         Ok(())
     }
 
+    #[cfg(test)]
     fn mark_applied(&mut self, seq: u64, term: u64, sync: bool) -> anyhow::Result<()> {
         if seq < self.meta.last_applied_seq {
             return Ok(());
@@ -499,6 +559,61 @@ impl ReplicationJournal {
             self.meta.max_term_seen = term;
         }
         self.persist_meta(sync)
+    }
+
+    fn append_and_mark_applied(
+        &mut self,
+        seq: u64,
+        term: u64,
+        raw_payload: &[u8],
+        sync: bool,
+    ) -> anyhow::Result<()> {
+        if seq != self.meta.next_seq {
+            anyhow::bail!(
+                "invalid replication seq: got {}, expected {}",
+                seq,
+                self.meta.next_seq
+            );
+        }
+        let len = u32::try_from(raw_payload.len()).context("payload too large for log entry")?;
+        let record_start = self
+            .file
+            .seek(SeekFrom::End(0))
+            .context("seek replication log to append")?;
+        let record_checksum = checksum_replication_record(seq, raw_payload);
+        self.file
+            .write_all(&len.to_le_bytes())
+            .context("append replication record length")?;
+        self.file
+            .write_all(&seq.to_le_bytes())
+            .context("append replication record seq")?;
+        self.file
+            .write_all(&record_checksum.to_le_bytes())
+            .context("append replication record checksum")?;
+        self.file
+            .write_all(raw_payload)
+            .context("append replication record payload")?;
+        if sync {
+            self.file.sync_data().context("sync replication record")?;
+        }
+        self.index.insert(
+            seq,
+            JournalIndexEntry {
+                offset: record_start + REPLICATION_LOG_RECORD_HEADER_BYTES,
+                len,
+            },
+        );
+        self.meta.next_seq = seq.saturating_add(1);
+        self.meta.first_seq = self.first_seq();
+        if seq >= self.meta.last_applied_seq {
+            self.meta.last_applied_seq = seq;
+        }
+        if term > self.meta.max_term_seen {
+            self.meta.max_term_seen = term;
+        }
+        self.persist_meta(sync)?;
+        self.compact_if_needed()?;
+        Ok(())
     }
 
     fn reset_to_applied(&mut self, applied_seq: u64, term: u64, sync: bool) -> anyhow::Result<()> {
@@ -536,6 +651,15 @@ impl ReplicationJournal {
     }
 
     fn read_range(&mut self, from_seq: u64, max_entries: usize) -> anyhow::Result<Vec<Bytes>> {
+        let with_seq = self.read_range_with_seq(from_seq, max_entries)?;
+        Ok(with_seq.into_iter().map(|(_, raw)| raw).collect())
+    }
+
+    fn read_range_with_seq(
+        &mut self,
+        from_seq: u64,
+        max_entries: usize,
+    ) -> anyhow::Result<Vec<(u64, Bytes)>> {
         let capped = max_entries.clamp(1, LOG_RANGE_FRAME_MAX_ENTRIES);
         let mut out = Vec::with_capacity(capped);
         let seqs: Vec<u64> = self
@@ -546,7 +670,7 @@ impl ReplicationJournal {
             .collect();
         for seq in seqs {
             if let Some(raw) = self.read_entry(seq)? {
-                out.push(raw);
+                out.push((seq, raw));
             }
         }
         Ok(out)
@@ -605,18 +729,23 @@ impl ReplicationJournal {
                 anyhow::bail!("missing seq={} during compaction", seq);
             };
             let len = u32::try_from(raw.len()).context("compaction payload too large")?;
+            let record_checksum = checksum_replication_record(seq, raw.as_ref());
             tmp.write_all(&len.to_le_bytes())
                 .context("write compacted replication record length")?;
+            tmp.write_all(&seq.to_le_bytes())
+                .context("write compacted replication record seq")?;
+            tmp.write_all(&record_checksum.to_le_bytes())
+                .context("write compacted replication record checksum")?;
             tmp.write_all(raw.as_ref())
                 .context("write compacted replication record payload")?;
             new_index.insert(
                 seq,
                 JournalIndexEntry {
-                    offset: offset + 4,
+                    offset: offset + REPLICATION_LOG_RECORD_HEADER_BYTES,
                     len,
                 },
             );
-            offset = offset.saturating_add(4 + len as u64);
+            offset = offset.saturating_add(REPLICATION_LOG_RECORD_HEADER_BYTES + len as u64);
         }
         tmp.sync_data()
             .with_context(|| format!("sync {}", tmp_path.display()))?;
@@ -660,6 +789,21 @@ fn checksum_fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+fn checksum_replication_record(seq: u64, payload: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for byte in seq.to_le_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    for byte in payload {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 fn encode_commit_mode(mode: MutationCommitMode) -> u8 {
     match mode {
         MutationCommitMode::Durable => 0,
@@ -675,16 +819,21 @@ fn decode_commit_mode(mode: u8) -> anyhow::Result<MutationCommitMode> {
     }
 }
 
+fn encode_framed_payload_bytes(payload_bytes: &[u8], label: &str) -> anyhow::Result<Bytes> {
+    let checksum = checksum_fnv1a64(payload_bytes);
+    let mut out = Vec::with_capacity(12 + payload_bytes.len());
+    out.extend_from_slice(&checksum.to_le_bytes());
+    let len =
+        u32::try_from(payload_bytes.len()).with_context(|| format!("{label} payload too large"))?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(payload_bytes);
+    Ok(Bytes::from(out))
+}
+
 fn encode_replication_payload(payload: &ReplicationPayload) -> anyhow::Result<Bytes> {
     let payload_bytes =
         rkyv::to_bytes::<_, 4096>(payload).context("serialize replication payload")?;
-    let checksum = checksum_fnv1a64(payload_bytes.as_ref());
-    let mut out = Vec::with_capacity(12 + payload_bytes.len());
-    out.extend_from_slice(&checksum.to_le_bytes());
-    let len = u32::try_from(payload_bytes.len()).context("replication payload too large")?;
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(payload_bytes.as_ref());
-    Ok(Bytes::from(out))
+    encode_framed_payload_bytes(payload_bytes.as_ref(), "replication")
 }
 
 fn decode_framed_payload<'a>(raw: &'a [u8], label: &str) -> anyhow::Result<&'a [u8]> {
@@ -720,6 +869,7 @@ fn decode_framed_payload<'a>(raw: &'a [u8], label: &str) -> anyhow::Result<&'a [
     Ok(payload_bytes)
 }
 
+#[cfg(test)]
 fn decode_replication_payload_seq(raw: &[u8]) -> anyhow::Result<u64> {
     let payload_bytes = decode_framed_payload(raw, "replication")?;
     let mut aligned = rkyv::AlignedVec::with_capacity(payload_bytes.len());
@@ -757,13 +907,7 @@ fn decode_replication_payload(raw: &[u8]) -> anyhow::Result<ReplicationPayload> 
 
 fn encode_snapshot_payload(payload: &SnapshotPayload) -> anyhow::Result<Bytes> {
     let payload_bytes = rkyv::to_bytes::<_, 4096>(payload).context("serialize snapshot payload")?;
-    let checksum = checksum_fnv1a64(payload_bytes.as_ref());
-    let mut out = Vec::with_capacity(12 + payload_bytes.len());
-    out.extend_from_slice(&checksum.to_le_bytes());
-    let len = u32::try_from(payload_bytes.len()).context("snapshot payload too large")?;
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(payload_bytes.as_ref());
-    Ok(Bytes::from(out))
+    encode_framed_payload_bytes(payload_bytes.as_ref(), "snapshot")
 }
 
 fn decode_snapshot_payload(raw: &[u8]) -> anyhow::Result<SnapshotPayload> {
@@ -780,6 +924,130 @@ fn decode_snapshot_payload(raw: &[u8]) -> anyhow::Result<SnapshotPayload> {
             "snapshot payload schema mismatch: got {}, expected {}",
             payload.schema_version,
             SNAPSHOT_PAYLOAD_SCHEMA_VERSION
+        );
+    }
+    Ok(payload)
+}
+
+fn encode_internal_partition_mutations_wire_request(
+    payload: &InternalPartitionMutationsWireRequest,
+) -> anyhow::Result<Bytes> {
+    let payload_bytes =
+        rkyv::to_bytes::<_, 4096>(payload).context("serialize internal mutations request")?;
+    encode_framed_payload_bytes(payload_bytes.as_ref(), "internal-mutations-request")
+}
+
+fn decode_internal_partition_mutations_wire_request(
+    raw: &[u8],
+) -> anyhow::Result<InternalPartitionMutationsWireRequest> {
+    let payload_bytes = decode_framed_payload(raw, "internal-mutations-request")?;
+    let mut aligned = rkyv::AlignedVec::with_capacity(payload_bytes.len());
+    aligned.extend_from_slice(payload_bytes);
+    let archived =
+        rkyv::check_archived_root::<InternalPartitionMutationsWireRequest>(aligned.as_ref())
+            .map_err(|err| {
+                anyhow::anyhow!("validate archived internal mutations request: {err}")
+            })?;
+    let payload: InternalPartitionMutationsWireRequest = archived
+        .deserialize(&mut Infallible)
+        .map_err(|err| anyhow::anyhow!("deserialize internal mutations request: {err}"))?;
+    if payload.schema_version != INTERNAL_PARTITION_MUTATIONS_SCHEMA_VERSION {
+        anyhow::bail!(
+            "internal mutations schema mismatch: got {}, expected {}",
+            payload.schema_version,
+            INTERNAL_PARTITION_MUTATIONS_SCHEMA_VERSION
+        );
+    }
+    Ok(payload)
+}
+
+fn encode_internal_partition_mutations_wire_response(
+    payload: &InternalPartitionMutationsWireResponse,
+) -> anyhow::Result<Bytes> {
+    let payload_bytes =
+        rkyv::to_bytes::<_, 4096>(payload).context("serialize internal mutations response")?;
+    encode_framed_payload_bytes(payload_bytes.as_ref(), "internal-mutations-response")
+}
+
+fn decode_internal_partition_mutations_wire_response(
+    raw: &[u8],
+) -> anyhow::Result<InternalPartitionMutationsWireResponse> {
+    let payload_bytes = decode_framed_payload(raw, "internal-mutations-response")?;
+    let mut aligned = rkyv::AlignedVec::with_capacity(payload_bytes.len());
+    aligned.extend_from_slice(payload_bytes);
+    let archived =
+        rkyv::check_archived_root::<InternalPartitionMutationsWireResponse>(aligned.as_ref())
+            .map_err(|err| {
+                anyhow::anyhow!("validate archived internal mutations response: {err}")
+            })?;
+    let payload: InternalPartitionMutationsWireResponse = archived
+        .deserialize(&mut Infallible)
+        .map_err(|err| anyhow::anyhow!("deserialize internal mutations response: {err}"))?;
+    if payload.schema_version != INTERNAL_PARTITION_MUTATIONS_SCHEMA_VERSION {
+        anyhow::bail!(
+            "internal mutations schema mismatch: got {}, expected {}",
+            payload.schema_version,
+            INTERNAL_PARTITION_MUTATIONS_SCHEMA_VERSION
+        );
+    }
+    Ok(payload)
+}
+
+fn encode_internal_partition_search_wire_request(
+    payload: &InternalPartitionSearchWireRequest,
+) -> anyhow::Result<Bytes> {
+    let payload_bytes =
+        rkyv::to_bytes::<_, 4096>(payload).context("serialize internal search request")?;
+    encode_framed_payload_bytes(payload_bytes.as_ref(), "internal-search-request")
+}
+
+fn decode_internal_partition_search_wire_request(
+    raw: &[u8],
+) -> anyhow::Result<InternalPartitionSearchWireRequest> {
+    let payload_bytes = decode_framed_payload(raw, "internal-search-request")?;
+    let mut aligned = rkyv::AlignedVec::with_capacity(payload_bytes.len());
+    aligned.extend_from_slice(payload_bytes);
+    let archived =
+        rkyv::check_archived_root::<InternalPartitionSearchWireRequest>(aligned.as_ref())
+            .map_err(|err| anyhow::anyhow!("validate archived internal search request: {err}"))?;
+    let payload: InternalPartitionSearchWireRequest = archived
+        .deserialize(&mut Infallible)
+        .map_err(|err| anyhow::anyhow!("deserialize internal search request: {err}"))?;
+    if payload.schema_version != INTERNAL_PARTITION_SEARCH_SCHEMA_VERSION {
+        anyhow::bail!(
+            "internal search schema mismatch: got {}, expected {}",
+            payload.schema_version,
+            INTERNAL_PARTITION_SEARCH_SCHEMA_VERSION
+        );
+    }
+    Ok(payload)
+}
+
+fn encode_internal_partition_search_wire_response(
+    payload: &InternalPartitionSearchWireResponse,
+) -> anyhow::Result<Bytes> {
+    let payload_bytes =
+        rkyv::to_bytes::<_, 4096>(payload).context("serialize internal search response")?;
+    encode_framed_payload_bytes(payload_bytes.as_ref(), "internal-search-response")
+}
+
+fn decode_internal_partition_search_wire_response(
+    raw: &[u8],
+) -> anyhow::Result<InternalPartitionSearchWireResponse> {
+    let payload_bytes = decode_framed_payload(raw, "internal-search-response")?;
+    let mut aligned = rkyv::AlignedVec::with_capacity(payload_bytes.len());
+    aligned.extend_from_slice(payload_bytes);
+    let archived =
+        rkyv::check_archived_root::<InternalPartitionSearchWireResponse>(aligned.as_ref())
+            .map_err(|err| anyhow::anyhow!("validate archived internal search response: {err}"))?;
+    let payload: InternalPartitionSearchWireResponse = archived
+        .deserialize(&mut Infallible)
+        .map_err(|err| anyhow::anyhow!("deserialize internal search response: {err}"))?;
+    if payload.schema_version != INTERNAL_PARTITION_SEARCH_SCHEMA_VERSION {
+        anyhow::bail!(
+            "internal search schema mismatch: got {}, expected {}",
+            payload.schema_version,
+            INTERNAL_PARTITION_SEARCH_SCHEMA_VERSION
         );
     }
     Ok(payload)
@@ -1082,12 +1350,25 @@ struct AppState {
 
 struct PartitionRuntime {
     partition_id: u32,
-    replica_peers: Vec<String>,
+    replication_workers: Vec<ReplicationWorkerHandle>,
     quorum_size: usize,
     index: Arc<RwLock<SpFreshLayerDbShardedIndex>>,
     leader: Arc<EtcdLeaderElector>,
     journal: Arc<Mutex<ReplicationJournal>>,
     mutation_gate: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Clone)]
+struct ReplicationWorkerHandle {
+    peer: String,
+    tx: mpsc::Sender<ReplicationWorkerItem>,
+}
+
+struct ReplicationWorkerItem {
+    seq: u64,
+    leader_term: u64,
+    payload: Bytes,
+    response: oneshot::Sender<Result<(), String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1219,6 +1500,186 @@ struct InternalPartitionSyncRequest {
 #[derive(Debug, Deserialize, Serialize)]
 struct SyncToS3Response {
     moved_files: usize,
+}
+
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+struct InternalPartitionMutationsWireRequest {
+    schema_version: u32,
+    partition_id: u32,
+    commit_mode: u8,
+    mutations: Vec<WireMutation>,
+}
+
+impl InternalPartitionMutationsWireRequest {
+    fn from_parts(
+        partition_id: u32,
+        commit_mode: CommitModeArg,
+        mutations: &[MutationInput],
+    ) -> Self {
+        let mode = commit_mode;
+        Self {
+            schema_version: INTERNAL_PARTITION_MUTATIONS_SCHEMA_VERSION,
+            partition_id,
+            commit_mode: encode_commit_mode(mode.into()),
+            mutations: mutations.iter().map(WireMutation::from).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+struct InternalReplicationSummaryWire {
+    attempted: u64,
+    succeeded: u64,
+    failed: Vec<String>,
+}
+
+impl From<ReplicationSummary> for InternalReplicationSummaryWire {
+    fn from(value: ReplicationSummary) -> Self {
+        Self {
+            attempted: value.attempted as u64,
+            succeeded: value.succeeded as u64,
+            failed: value.failed,
+        }
+    }
+}
+
+impl TryFrom<InternalReplicationSummaryWire> for ReplicationSummary {
+    type Error = anyhow::Error;
+
+    fn try_from(value: InternalReplicationSummaryWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            attempted: usize::try_from(value.attempted)
+                .context("internal replication attempted does not fit usize")?,
+            succeeded: usize::try_from(value.succeeded)
+                .context("internal replication succeeded does not fit usize")?,
+            failed: value.failed,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+struct InternalPartitionMutationsWireResponse {
+    schema_version: u32,
+    applied_upserts: u64,
+    applied_deletes: u64,
+    replicated: InternalReplicationSummaryWire,
+}
+
+impl From<ApplyMutationsResponse> for InternalPartitionMutationsWireResponse {
+    fn from(value: ApplyMutationsResponse) -> Self {
+        Self {
+            schema_version: INTERNAL_PARTITION_MUTATIONS_SCHEMA_VERSION,
+            applied_upserts: value.applied_upserts as u64,
+            applied_deletes: value.applied_deletes as u64,
+            replicated: value.replicated.into(),
+        }
+    }
+}
+
+impl TryFrom<InternalPartitionMutationsWireResponse> for ApplyMutationsResponse {
+    type Error = anyhow::Error;
+
+    fn try_from(value: InternalPartitionMutationsWireResponse) -> Result<Self, Self::Error> {
+        if value.schema_version != INTERNAL_PARTITION_MUTATIONS_SCHEMA_VERSION {
+            anyhow::bail!(
+                "internal mutations schema mismatch: got {}, expected {}",
+                value.schema_version,
+                INTERNAL_PARTITION_MUTATIONS_SCHEMA_VERSION
+            );
+        }
+        Ok(Self {
+            applied_upserts: usize::try_from(value.applied_upserts)
+                .context("internal response upserts does not fit usize")?,
+            applied_deletes: usize::try_from(value.applied_deletes)
+                .context("internal response deletes does not fit usize")?,
+            replicated: value.replicated.try_into()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+struct InternalPartitionSearchWireRequest {
+    schema_version: u32,
+    partition_id: u32,
+    query: Vec<f32>,
+    k: u32,
+}
+
+impl InternalPartitionSearchWireRequest {
+    fn from_parts(partition_id: u32, query: &[f32], k: usize) -> anyhow::Result<Self> {
+        Ok(Self {
+            schema_version: INTERNAL_PARTITION_SEARCH_SCHEMA_VERSION,
+            partition_id,
+            query: query.to_vec(),
+            k: u32::try_from(k).context("search k too large for internal wire")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+struct InternalNeighborWire {
+    id: u64,
+    distance: f32,
+}
+
+impl From<Neighbor> for InternalNeighborWire {
+    fn from(value: Neighbor) -> Self {
+        Self {
+            id: value.id,
+            distance: value.distance,
+        }
+    }
+}
+
+impl From<InternalNeighborWire> for Neighbor {
+    fn from(value: InternalNeighborWire) -> Self {
+        Self {
+            id: value.id,
+            distance: value.distance,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+struct InternalPartitionSearchWireResponse {
+    schema_version: u32,
+    neighbors: Vec<InternalNeighborWire>,
+}
+
+impl From<SearchResponse> for InternalPartitionSearchWireResponse {
+    fn from(value: SearchResponse) -> Self {
+        Self {
+            schema_version: INTERNAL_PARTITION_SEARCH_SCHEMA_VERSION,
+            neighbors: value
+                .neighbors
+                .into_iter()
+                .map(InternalNeighborWire::from)
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<InternalPartitionSearchWireResponse> for SearchResponse {
+    type Error = anyhow::Error;
+
+    fn try_from(value: InternalPartitionSearchWireResponse) -> Result<Self, Self::Error> {
+        if value.schema_version != INTERNAL_PARTITION_SEARCH_SCHEMA_VERSION {
+            anyhow::bail!(
+                "internal search schema mismatch: got {}, expected {}",
+                value.schema_version,
+                INTERNAL_PARTITION_SEARCH_SCHEMA_VERSION
+            );
+        }
+        Ok(Self {
+            neighbors: value.neighbors.into_iter().map(Neighbor::from).collect(),
+        })
+    }
 }
 
 fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
@@ -1384,16 +1845,20 @@ fn sum_partition_stats(items: Vec<SpFreshLayerDbShardedStats>) -> SpFreshLayerDb
 fn collect_partition_mutations(
     topology: &ClusterTopology,
     mutations: Vec<MutationInput>,
-) -> BTreeMap<u32, Vec<MutationInput>> {
-    let mut grouped = BTreeMap::new();
+) -> Vec<(u32, Vec<MutationInput>)> {
+    let capacity = mutations
+        .len()
+        .min(topology.partition_count as usize)
+        .max(1);
+    let mut grouped: FxHashMap<u32, Vec<MutationInput>> =
+        FxHashMap::with_capacity_and_hasher(capacity, Default::default());
     for mutation in mutations {
         let partition_id = topology.partition_for_id(mutation.id());
-        grouped
-            .entry(partition_id)
-            .or_insert_with(Vec::new)
-            .push(mutation);
+        grouped.entry(partition_id).or_default().push(mutation);
     }
-    grouped
+    let mut out: Vec<(u32, Vec<MutationInput>)> = grouped.into_iter().collect();
+    out.sort_unstable_by_key(|(partition_id, _)| *partition_id);
+    out
 }
 
 fn ordered_partition_endpoints(
@@ -1439,17 +1904,151 @@ fn mark_partition_preferred_endpoint(state: &AppState, partition_id: u32, endpoi
     }
 }
 
-fn merge_neighbors_topk(mut all: Vec<Neighbor>, k: usize) -> Vec<Neighbor> {
+#[derive(Debug)]
+struct HeapNeighbor(Neighbor);
+
+impl PartialEq for HeapNeighbor {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id && self.0.distance.to_bits() == other.0.distance.to_bits()
+    }
+}
+
+impl Eq for HeapNeighbor {}
+
+impl PartialOrd for HeapNeighbor {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapNeighbor {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .distance
+            .total_cmp(&other.0.distance)
+            .then_with(|| self.0.id.cmp(&other.0.id))
+    }
+}
+
+fn neighbor_cmp(lhs: &Neighbor, rhs: &Neighbor) -> std::cmp::Ordering {
+    lhs.distance
+        .total_cmp(&rhs.distance)
+        .then_with(|| lhs.id.cmp(&rhs.id))
+}
+
+fn push_heap_topk(heap: &mut BinaryHeap<HeapNeighbor>, neighbor: Neighbor, k: usize) {
     if k == 0 {
+        return;
+    }
+    if heap.len() < k {
+        heap.push(HeapNeighbor(neighbor));
+        return;
+    }
+    let replace = heap
+        .peek()
+        .map(|worst| neighbor_cmp(&neighbor, &worst.0).is_lt())
+        .unwrap_or(true);
+    if replace {
+        let _ = heap.pop();
+        heap.push(HeapNeighbor(neighbor));
+    }
+}
+
+fn finalize_heap_topk(heap: BinaryHeap<HeapNeighbor>) -> Vec<Neighbor> {
+    let mut out: Vec<Neighbor> = heap.into_iter().map(|entry| entry.0).collect();
+    out.sort_unstable_by(neighbor_cmp);
+    out
+}
+
+async fn collect_partition_apply_results_until_done<S>(
+    results: &mut S,
+) -> Result<ApplyMutationsResponse, ApiError>
+where
+    S: futures::Stream<Item = Result<ApplyMutationsResponse, ApiError>> + Unpin,
+{
+    let mut out = ApplyMutationsResponse {
+        applied_upserts: 0,
+        applied_deletes: 0,
+        replicated: ReplicationSummary {
+            attempted: 0,
+            succeeded: 0,
+            failed: Vec::new(),
+        },
+    };
+    let mut first_error: Option<ApiError> = None;
+    while let Some(result) = results.next().await {
+        match result {
+            Ok(part) => {
+                out.applied_upserts = out.applied_upserts.saturating_add(part.applied_upserts);
+                out.applied_deletes = out.applied_deletes.saturating_add(part.applied_deletes);
+                out.replicated.attempted = out
+                    .replicated
+                    .attempted
+                    .saturating_add(part.replicated.attempted);
+                out.replicated.succeeded = out
+                    .replicated
+                    .succeeded
+                    .saturating_add(part.replicated.succeeded);
+                out.replicated.failed.extend(part.replicated.failed);
+            }
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+fn merge_neighbors_topk(all: Vec<Neighbor>, k: usize) -> Vec<Neighbor> {
+    if k == 0 || all.is_empty() {
         return Vec::new();
     }
-    all.sort_by(|lhs, rhs| {
-        lhs.distance
-            .total_cmp(&rhs.distance)
-            .then_with(|| lhs.id.cmp(&rhs.id))
-    });
-    all.truncate(k);
-    all
+    if all.len() <= k {
+        let mut out = all;
+        out.sort_unstable_by(neighbor_cmp);
+        return out;
+    }
+    let mut heap = BinaryHeap::with_capacity(k);
+    for neighbor in all {
+        push_heap_topk(&mut heap, neighbor, k);
+    }
+    finalize_heap_topk(heap)
+}
+
+fn partition_parallelism(partition_count: usize) -> usize {
+    let cpu = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4);
+    let target = cpu.saturating_mul(4).max(8);
+    partition_count.max(1).min(target)
+}
+
+fn search_local_partitions_topk(
+    partitions: Vec<Arc<PartitionRuntime>>,
+    query: Arc<Vec<f32>>,
+    k: usize,
+) -> anyhow::Result<Vec<Neighbor>> {
+    if k == 0 || partitions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut top = BinaryHeap::with_capacity(k);
+    for partition in partitions {
+        let index = partition
+            .index
+            .read()
+            .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
+        for neighbor in index.search(query.as_slice(), k) {
+            push_heap_topk(&mut top, neighbor, k);
+        }
+    }
+    Ok(finalize_heap_topk(top))
 }
 
 async fn role(State(state): State<Arc<AppState>>) -> ApiResult<RoleResponse> {
@@ -1516,28 +2115,67 @@ async fn search(
     }
 
     let SearchRequest { query, k } = req;
-    let mut futures = FuturesUnordered::new();
-    for partition_id in 0..state.topology.partition_count {
-        let state = state.clone();
-        let query = query.clone();
-        futures.push(async move { route_partition_search(state, partition_id, query, k).await });
-    }
-
-    let mut all = Vec::new();
+    let query = Arc::new(query);
+    let local_partitions: Vec<Arc<PartitionRuntime>> = state.partitions.values().cloned().collect();
+    let remote_partition_ids: Vec<u32> = (0..state.topology.partition_count)
+        .filter(|partition_id| !state.partitions.contains_key(partition_id))
+        .collect();
+    let local_query = query.clone();
+    let local_search_task = if local_partitions.is_empty() {
+        None
+    } else {
+        Some(tokio::task::spawn_blocking(move || {
+            search_local_partitions_topk(local_partitions, local_query, k)
+        }))
+    };
+    let parallelism = partition_parallelism(remote_partition_ids.len());
+    let mut futures = stream::iter(remote_partition_ids.into_iter())
+        .map(|partition_id| {
+            let state = state.clone();
+            let query = query.clone();
+            async move { route_partition_search(state, partition_id, query, k).await }
+        })
+        .buffer_unordered(parallelism);
+    let mut top = BinaryHeap::with_capacity(k);
     while let Some(result) = futures.next().await {
         let partition_neighbors = result?;
-        all.extend(partition_neighbors);
+        for neighbor in partition_neighbors {
+            push_heap_topk(&mut top, neighbor, k);
+        }
+    }
+    if let Some(task) = local_search_task {
+        let local_neighbors = task
+            .await
+            .map_err(|err| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("join local partition search task: {err}"),
+                )
+            })
+            .and_then(|result| {
+                result.map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+            })?;
+        for neighbor in local_neighbors {
+            push_heap_topk(&mut top, neighbor, k);
+        }
     }
 
     Ok(Json(SearchResponse {
-        neighbors: merge_neighbors_topk(all, k),
+        neighbors: finalize_heap_topk(top),
     }))
 }
 
 async fn force_rebuild(State(state): State<Arc<AppState>>) -> ApiResult<serde_json::Value> {
     ensure_global_leader(&state)?;
-    for partition_id in 0..state.topology.partition_count {
-        route_partition_force_rebuild(state.clone(), partition_id).await?;
+    let parallelism = partition_parallelism(state.topology.partition_count as usize);
+    let mut futures = stream::iter(0..state.topology.partition_count)
+        .map(|partition_id| {
+            let state = state.clone();
+            async move { route_partition_force_rebuild(state, partition_id).await }
+        })
+        .buffer_unordered(parallelism);
+    while let Some(result) = futures.next().await {
+        result?;
     }
 
     Ok(Json(serde_json::json!({"ok": true})))
@@ -1548,12 +2186,17 @@ async fn sync_to_s3(
     Json(req): Json<SyncToS3Request>,
 ) -> ApiResult<SyncToS3Response> {
     ensure_global_leader(&state)?;
+    let parallelism = partition_parallelism(state.topology.partition_count as usize);
+    let max_files_per_shard = req.max_files_per_shard;
+    let mut futures = stream::iter(0..state.topology.partition_count)
+        .map(|partition_id| {
+            let state = state.clone();
+            async move { route_partition_sync_to_s3(state, partition_id, max_files_per_shard).await }
+        })
+        .buffer_unordered(parallelism);
     let mut moved = 0usize;
-    for partition_id in 0..state.topology.partition_count {
-        moved = moved.saturating_add(
-            route_partition_sync_to_s3(state.clone(), partition_id, req.max_files_per_shard)
-                .await?,
-        );
+    while let Some(result) = futures.next().await {
+        moved = moved.saturating_add(result?);
     }
 
     Ok(Json(SyncToS3Response { moved_files: moved }))
@@ -1578,31 +2221,44 @@ async fn apply_mutations(
             "cross-partition mutation batch rejected: would be partial-commit; retry with allow_partial=true if this is intended",
         ));
     }
-    let mut out = ApplyMutationsResponse {
-        applied_upserts: 0,
-        applied_deletes: 0,
-        replicated: ReplicationSummary {
-            attempted: 0,
-            succeeded: 0,
-            failed: Vec::new(),
-        },
-    };
-
-    for (partition_id, mutations) in grouped {
-        let part =
-            route_partition_mutations(state.clone(), partition_id, mutations, mode_arg).await?;
-        out.applied_upserts = out.applied_upserts.saturating_add(part.applied_upserts);
-        out.applied_deletes = out.applied_deletes.saturating_add(part.applied_deletes);
-        out.replicated.attempted = out
-            .replicated
-            .attempted
-            .saturating_add(part.replicated.attempted);
-        out.replicated.succeeded = out
-            .replicated
-            .succeeded
-            .saturating_add(part.replicated.succeeded);
-        out.replicated.failed.extend(part.replicated.failed);
+    if grouped.len() <= 1 || !req.allow_partial {
+        let mut out = ApplyMutationsResponse {
+            applied_upserts: 0,
+            applied_deletes: 0,
+            replicated: ReplicationSummary {
+                attempted: 0,
+                succeeded: 0,
+                failed: Vec::new(),
+            },
+        };
+        for (partition_id, mutations) in grouped {
+            let part =
+                route_partition_mutations(state.clone(), partition_id, mutations, mode_arg).await?;
+            out.applied_upserts = out.applied_upserts.saturating_add(part.applied_upserts);
+            out.applied_deletes = out.applied_deletes.saturating_add(part.applied_deletes);
+            out.replicated.attempted = out
+                .replicated
+                .attempted
+                .saturating_add(part.replicated.attempted);
+            out.replicated.succeeded = out
+                .replicated
+                .succeeded
+                .saturating_add(part.replicated.succeeded);
+            out.replicated.failed.extend(part.replicated.failed);
+        }
+        return Ok(Json(out));
     }
+
+    let parallelism = partition_parallelism(grouped.len());
+    let mut futures = stream::iter(grouped.into_iter())
+        .map(|(partition_id, mutations)| {
+            let state = state.clone();
+            async move { route_partition_mutations(state, partition_id, mutations, mode_arg).await }
+        })
+        .buffer_unordered(parallelism);
+
+    // Drain all partition writes before returning so allow_partial semantics are deterministic.
+    let out = collect_partition_apply_results_until_done(&mut futures).await?;
 
     Ok(Json(out))
 }
@@ -1623,6 +2279,49 @@ async fn apply_partition_mutations_internal(
     apply_partition_mutations_local(state, req.partition_id, req.mutations, mode, true).await
 }
 
+async fn apply_partition_mutations_internal_wire(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Bytes, ApiError> {
+    ensure_internal_auth(&state, &headers)?;
+    let payload =
+        decode_internal_partition_mutations_wire_request(body.as_ref()).map_err(|err| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("decode internal mutations wire request: {err:#}"),
+            )
+        })?;
+    if payload.mutations.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "mutations must not be empty",
+        ));
+    }
+    let mode = decode_commit_mode(payload.commit_mode).map_err(|err| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("invalid internal mutations commit mode: {err:#}"),
+        )
+    })?;
+    let response = apply_partition_mutations_local_wire(
+        state,
+        payload.partition_id,
+        payload.mutations,
+        mode,
+        true,
+    )
+    .await?
+    .0;
+    let payload = InternalPartitionMutationsWireResponse::from(response);
+    encode_internal_partition_mutations_wire_response(&payload).map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("encode internal mutations wire response: {err:#}"),
+        )
+    })
+}
+
 async fn partition_search_internal(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1639,8 +2338,47 @@ async fn partition_search_internal(
         ));
     }
     let neighbors =
-        search_partition_local(state, req.partition_id, req.query, req.k, false).await?;
+        search_partition_local(state, req.partition_id, Arc::new(req.query), req.k, false).await?;
     Ok(Json(SearchResponse { neighbors }))
+}
+
+async fn partition_search_internal_wire(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Bytes, ApiError> {
+    ensure_internal_auth(&state, &headers)?;
+    let payload = decode_internal_partition_search_wire_request(body.as_ref()).map_err(|err| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("decode internal search wire request: {err:#}"),
+        )
+    })?;
+    if payload.k == 0 {
+        return Err(api_error(StatusCode::BAD_REQUEST, "k must be > 0"));
+    }
+    if payload.query.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "query must not be empty",
+        ));
+    }
+    let neighbors = search_partition_local(
+        state,
+        payload.partition_id,
+        Arc::new(payload.query),
+        usize::try_from(payload.k)
+            .map_err(|_| api_error(StatusCode::BAD_REQUEST, "k does not fit usize"))?,
+        false,
+    )
+    .await?;
+    let payload = InternalPartitionSearchWireResponse::from(SearchResponse { neighbors });
+    encode_internal_partition_search_wire_response(&payload).map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("encode internal search wire response: {err:#}"),
+        )
+    })
 }
 
 async fn force_rebuild_partition_local(
@@ -1754,64 +2492,94 @@ async fn parse_remote_error(response: reqwest::Response) -> (StatusCode, String)
 async fn call_remote_partition_mutations(
     state: Arc<AppState>,
     endpoint: &str,
-    request: &InternalPartitionMutationsRequest,
+    request_body: Bytes,
 ) -> Result<ApplyMutationsResponse, (StatusCode, String)> {
-    let url = join_base_url(endpoint, "/v1/internal/partition-mutations");
+    let url = join_base_url(endpoint, "/v1/internal/partition-mutations-wire");
     let mut request_builder = state
         .http
         .post(url.clone())
         .timeout(state.replication_timeout)
-        .header(CONTENT_TYPE, "application/json");
+        .header(CONTENT_TYPE, "application/octet-stream");
     if let Some(token) = &state.internal_auth_token {
-        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token.clone());
+        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token.as_str());
     }
-    let response = request_builder.json(request).send().await.map_err(|err| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("request to {} failed: {}", url, err),
-        )
-    })?;
-    if !response.status().is_success() {
-        return Err(parse_remote_error(response).await);
-    }
-    response
-        .json::<ApplyMutationsResponse>()
+    let response = request_builder
+        .body(request_body)
+        .send()
         .await
         .map_err(|err| {
             (
-                StatusCode::BAD_GATEWAY,
-                format!("decode {} response failed: {}", url, err),
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("request to {} failed: {}", url, err),
             )
-        })
+        })?;
+    if !response.status().is_success() {
+        return Err(parse_remote_error(response).await);
+    }
+    let body = response.bytes().await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("read {} response body failed: {}", url, err),
+        )
+    })?;
+    let decoded =
+        decode_internal_partition_mutations_wire_response(body.as_ref()).map_err(|err| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("decode {} response failed: {err:#}", url),
+            )
+        })?;
+    decoded.try_into().map_err(|err: anyhow::Error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("convert {} response failed: {err:#}", url),
+        )
+    })
 }
 
 async fn call_remote_partition_search(
     state: Arc<AppState>,
     endpoint: &str,
-    request: &InternalPartitionSearchRequest,
+    request_body: Bytes,
 ) -> Result<SearchResponse, (StatusCode, String)> {
-    let url = join_base_url(endpoint, "/v1/internal/partition-search");
+    let url = join_base_url(endpoint, "/v1/internal/partition-search-wire");
     let mut request_builder = state
         .http
         .post(url.clone())
         .timeout(state.replication_timeout)
-        .header(CONTENT_TYPE, "application/json");
+        .header(CONTENT_TYPE, "application/octet-stream");
     if let Some(token) = &state.internal_auth_token {
-        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token.clone());
+        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token.as_str());
     }
-    let response = request_builder.json(request).send().await.map_err(|err| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("request to {} failed: {}", url, err),
-        )
-    })?;
+    let response = request_builder
+        .body(request_body)
+        .send()
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("request to {} failed: {}", url, err),
+            )
+        })?;
     if !response.status().is_success() {
         return Err(parse_remote_error(response).await);
     }
-    response.json::<SearchResponse>().await.map_err(|err| {
+    let body = response.bytes().await.map_err(|err| {
         (
             StatusCode::BAD_GATEWAY,
-            format!("decode {} response failed: {}", url, err),
+            format!("read {} response body failed: {}", url, err),
+        )
+    })?;
+    let decoded = decode_internal_partition_search_wire_response(body.as_ref()).map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("decode {} response failed: {err:#}", url),
+        )
+    })?;
+    decoded.try_into().map_err(|err: anyhow::Error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("convert {} response failed: {err:#}", url),
         )
     })
 }
@@ -1828,7 +2596,7 @@ async fn call_remote_partition_force_rebuild(
         .timeout(state.replication_timeout)
         .header(CONTENT_TYPE, "application/json");
     if let Some(token) = &state.internal_auth_token {
-        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token.clone());
+        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token.as_str());
     }
     let response = request_builder.json(request).send().await.map_err(|err| {
         (
@@ -1854,7 +2622,7 @@ async fn call_remote_partition_sync_to_s3(
         .timeout(state.replication_timeout)
         .header(CONTENT_TYPE, "application/json");
     if let Some(token) = &state.internal_auth_token {
-        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token.clone());
+        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token.as_str());
     }
     let response = request_builder.json(request).send().await.map_err(|err| {
         (
@@ -1876,11 +2644,12 @@ async fn call_remote_partition_sync_to_s3(
 async fn route_partition_search(
     state: Arc<AppState>,
     partition_id: u32,
-    query: Vec<f32>,
+    query: Arc<Vec<f32>>,
     k: usize,
 ) -> Result<Vec<Neighbor>, ApiError> {
     let endpoints = ordered_partition_endpoints(&state, partition_id)?;
     let mut failures = Vec::new();
+    let mut remote_request_body: Option<Bytes> = None;
     for endpoint in endpoints {
         if endpoint == state.self_url {
             match search_partition_local(state.clone(), partition_id, query.clone(), k, false).await
@@ -1897,12 +2666,31 @@ async fn route_partition_search(
             continue;
         }
 
-        let request = InternalPartitionSearchRequest {
-            partition_id,
-            query: query.clone(),
-            k,
-        };
-        match call_remote_partition_search(state.clone(), endpoint.as_str(), &request).await {
+        if remote_request_body.is_none() {
+            let wire_request =
+                InternalPartitionSearchWireRequest::from_parts(partition_id, query.as_slice(), k)
+                    .map_err(|err| {
+                    api_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("encode internal search request failed: {err:#}"),
+                    )
+                })?;
+            let encoded =
+                encode_internal_partition_search_wire_request(&wire_request).map_err(|err| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("encode internal search wire request failed: {err:#}"),
+                    )
+                })?;
+            remote_request_body = Some(encoded);
+        }
+        match call_remote_partition_search(
+            state.clone(),
+            endpoint.as_str(),
+            remote_request_body.as_ref().expect("set above").clone(),
+        )
+        .await
+        {
             Ok(response) => {
                 mark_partition_preferred_endpoint(&state, partition_id, endpoint);
                 return Ok(response.neighbors);
@@ -2051,8 +2839,18 @@ async fn route_partition_mutations(
 ) -> Result<ApplyMutationsResponse, ApiError> {
     let endpoints = ordered_partition_endpoints(&state, partition_id)?;
     let mut failures = Vec::new();
+    let mut remote_request_body: Option<Bytes> = None;
     for endpoint in endpoints {
         if endpoint == state.self_url {
+            if let Some(local_partition) = state.partitions.get(&partition_id) {
+                if !local_partition.leader.is_leader() {
+                    failures.push(format!(
+                        "partition {} write rejected: this node is not leader",
+                        partition_id
+                    ));
+                    continue;
+                }
+            }
             match apply_partition_mutations_local(
                 state.clone(),
                 partition_id,
@@ -2074,12 +2872,28 @@ async fn route_partition_mutations(
             continue;
         }
 
-        let request = InternalPartitionMutationsRequest {
-            partition_id,
-            mutations: mutations.clone(),
-            commit_mode: Some(mode_arg),
-        };
-        match call_remote_partition_mutations(state.clone(), endpoint.as_str(), &request).await {
+        if remote_request_body.is_none() {
+            let wire_request = InternalPartitionMutationsWireRequest::from_parts(
+                partition_id,
+                mode_arg,
+                mutations.as_slice(),
+            );
+            let encoded =
+                encode_internal_partition_mutations_wire_request(&wire_request).map_err(|err| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("encode internal mutations wire request failed: {err:#}"),
+                    )
+                })?;
+            remote_request_body = Some(encoded);
+        }
+        match call_remote_partition_mutations(
+            state.clone(),
+            endpoint.as_str(),
+            remote_request_body.as_ref().expect("set above").clone(),
+        )
+        .await
+        {
             Ok(response) => {
                 mark_partition_preferred_endpoint(&state, partition_id, endpoint);
                 return Ok(response);
@@ -2112,7 +2926,7 @@ async fn route_partition_mutations(
 async fn search_partition_local(
     state: Arc<AppState>,
     partition_id: u32,
-    query: Vec<f32>,
+    query: Arc<Vec<f32>>,
     k: usize,
     require_leader: bool,
 ) -> Result<Vec<Neighbor>, ApiError> {
@@ -2132,7 +2946,7 @@ async fn search_partition_local(
         let index = index
             .read()
             .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
-        Ok::<_, anyhow::Error>(index.search(&query, k))
+        Ok::<_, anyhow::Error>(index.search(query.as_slice(), k))
     })
     .await
     .map_err(|err| {
@@ -2150,6 +2964,23 @@ async fn apply_partition_mutations_local(
     state: Arc<AppState>,
     partition_id: u32,
     mutations: Vec<MutationInput>,
+    mode: MutationCommitMode,
+    require_leader: bool,
+) -> ApiResult<ApplyMutationsResponse> {
+    apply_partition_mutations_local_wire(
+        state,
+        partition_id,
+        mutations.into_iter().map(WireMutation::from).collect(),
+        mode,
+        require_leader,
+    )
+    .await
+}
+
+async fn apply_partition_mutations_local_wire(
+    state: Arc<AppState>,
+    partition_id: u32,
+    mutations: Vec<WireMutation>,
     mode: MutationCommitMode,
     require_leader: bool,
 ) -> ApiResult<ApplyMutationsResponse> {
@@ -2200,7 +3031,7 @@ async fn apply_partition_mutations_local(
         seq,
         term,
         commit_mode: encode_commit_mode(mode),
-        mutations: mutations.into_iter().map(WireMutation::from).collect(),
+        mutations,
     };
     let encoded = encode_replication_payload(&payload).map_err(|err| {
         api_error(
@@ -2209,9 +3040,8 @@ async fn apply_partition_mutations_local(
         )
     })?;
 
-    let applied =
-        apply_local_mutations_runtime(partition.clone(), payload.to_runtime_mutations(), mode)
-            .await?;
+    let runtime_mutations = payload.into_runtime_mutations();
+    let applied = apply_local_mutations_runtime(partition.clone(), runtime_mutations, mode).await?;
     let sync_journal = matches!(mode, MutationCommitMode::Durable);
     {
         let mut journal = partition
@@ -2219,36 +3049,23 @@ async fn apply_partition_mutations_local(
             .lock()
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
         journal
-            .append_entry(seq, encoded.as_ref(), sync_journal)
+            .append_and_mark_applied(seq, term, encoded.as_ref(), sync_journal)
             .map_err(|err| {
                 api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!(
-                        "append replication journal partition={} seq={}: {err:#}",
-                        partition_id, seq
-                    ),
-                )
-            })?;
-        journal
-            .mark_applied(seq, term, sync_journal)
-            .map_err(|err| {
-                api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "mark replication journal partition={} seq={} applied: {err:#}",
+                        "commit replication journal partition={} seq={}: {err:#}",
                         partition_id, seq
                     ),
                 )
             })?;
     }
 
-    let peers = partition.replica_peers.clone();
     let replicated = if matches!(mode, MutationCommitMode::Durable) {
         let follower_quorum = partition.quorum_size.saturating_sub(1);
         let replicated = replicate_to_followers_until_quorum(
             state.clone(),
             partition.clone(),
-            peers.clone(),
             seq,
             term,
             encoded.clone(),
@@ -2260,28 +3077,13 @@ async fn apply_partition_mutations_local(
             let tail_partition = partition.clone();
             let tail_payload = encoded.clone();
             tokio::spawn(async move {
-                let _ = replicate_to_followers(
-                    tail_state,
-                    tail_partition,
-                    peers,
-                    seq,
-                    term,
-                    tail_payload,
-                )
-                .await;
+                let _ = replicate_to_followers(tail_state, tail_partition, seq, term, tail_payload)
+                    .await;
             });
         }
         replicated
     } else {
-        replicate_to_followers(
-            state.clone(),
-            partition.clone(),
-            peers,
-            seq,
-            term,
-            encoded.clone(),
-        )
-        .await
+        replicate_to_followers(state.clone(), partition.clone(), seq, term, encoded.clone()).await
     };
 
     if matches!(mode, MutationCommitMode::Durable) {
@@ -2357,7 +3159,10 @@ async fn apply_replication(
             ));
         }
     }
-    let partition = local_partition_state(&state, payload.partition_id)?;
+    let partition_id = payload.partition_id;
+    let seq = payload.seq;
+    let term = payload.term;
+    let partition = local_partition_state(&state, partition_id)?;
     let _gate = partition.mutation_gate.lock().await;
     {
         let mut journal = partition
@@ -2365,21 +3170,21 @@ async fn apply_replication(
             .lock()
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
         let expected = journal.expected_next_seq();
-        if payload.term < journal.max_term_seen() {
+        if term < journal.max_term_seen() {
             return Err(replication_reject_error(
                 format!(
                     "stale term {} < max_term_seen {}",
-                    payload.term,
+                    term,
                     journal.max_term_seen()
                 ),
                 &journal,
             ));
         }
-        if payload.seq < expected {
-            if let Some(existing) = journal.read_entry(payload.seq).map_err(|err| {
+        if seq < expected {
+            if let Some(existing) = journal.read_entry(seq).map_err(|err| {
                 api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("read replication seq={} from journal: {err:#}", payload.seq),
+                    format!("read replication seq={} from journal: {err:#}", seq),
                 )
             })? {
                 if existing.as_ref() == body.as_ref() {
@@ -2395,16 +3200,13 @@ async fn apply_replication(
                 }
             }
             return Err(replication_reject_error(
-                format!(
-                    "duplicate or stale seq {} expected {}",
-                    payload.seq, expected
-                ),
+                format!("duplicate or stale seq {} expected {}", seq, expected),
                 &journal,
             ));
         }
-        if payload.seq > expected {
+        if seq > expected {
             return Err(replication_reject_error(
-                format!("out-of-order seq {} expected {}", payload.seq, expected),
+                format!("out-of-order seq {} expected {}", seq, expected),
                 &journal,
             ));
         }
@@ -2416,9 +3218,8 @@ async fn apply_replication(
             format!("invalid replication commit mode: {err:#}"),
         )
     })?;
-    let applied =
-        apply_local_mutations_runtime(partition.clone(), payload.to_runtime_mutations(), mode)
-            .await?;
+    let runtime_mutations = payload.into_runtime_mutations();
+    let applied = apply_local_mutations_runtime(partition.clone(), runtime_mutations, mode).await?;
     let sync_journal = matches!(mode, MutationCommitMode::Durable);
     {
         let mut journal = partition
@@ -2426,19 +3227,11 @@ async fn apply_replication(
             .lock()
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
         journal
-            .append_entry(payload.seq, body.as_ref(), sync_journal)
+            .append_and_mark_applied(seq, term, body.as_ref(), sync_journal)
             .map_err(|err| {
                 api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("append replication seq={}: {err:#}", payload.seq),
-                )
-            })?;
-        journal
-            .mark_applied(payload.seq, payload.term, sync_journal)
-            .map_err(|err| {
-                api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("mark replication seq={} applied: {err:#}", payload.seq),
+                    format!("commit replication seq={}: {err:#}", seq),
                 )
             })?;
     }
@@ -2466,32 +3259,35 @@ async fn install_snapshot(
             format!("decode snapshot payload: {err:#}"),
         )
     })?;
-    let rows = payload.to_runtime_rows();
-    for row in &rows {
+    let partition_id = payload.partition_id;
+    let applied_seq = payload.applied_seq;
+    let term = payload.term;
+    for row in &payload.rows {
         let expected = state.topology.partition_for_id(row.id);
-        if expected != payload.partition_id {
+        if expected != partition_id {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
                 format!(
                     "snapshot row id {} belongs to partition {}, not {}",
-                    row.id, expected, payload.partition_id
+                    row.id, expected, partition_id
                 ),
             ));
         }
     }
+    let rows = payload.into_runtime_rows();
     let row_count = rows.len();
-    let partition = local_partition_state(&state, payload.partition_id)?;
+    let partition = local_partition_state(&state, partition_id)?;
     let _gate = partition.mutation_gate.lock().await;
     {
         let journal = partition
             .journal
             .lock()
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
-        if payload.term < journal.max_term_seen() {
+        if term < journal.max_term_seen() {
             return Err(replication_reject_error(
                 format!(
                     "stale snapshot term {} < max_term_seen {}",
-                    payload.term,
+                    term,
                     journal.max_term_seen()
                 ),
                 &journal,
@@ -2525,20 +3321,17 @@ async fn install_snapshot(
             .lock()
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
         journal
-            .reset_to_applied(payload.applied_seq, payload.term, true)
+            .reset_to_applied(applied_seq, term, true)
             .map_err(|err| {
                 api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "reset replication journal to seq={}: {err:#}",
-                        payload.applied_seq
-                    ),
+                    format!("reset replication journal to seq={}: {err:#}", applied_seq),
                 )
             })?;
     }
 
     Ok(Json(SnapshotInstallResponse {
-        applied_seq: payload.applied_seq,
+        applied_seq,
         rows: row_count,
     }))
 }
@@ -2671,6 +3464,80 @@ fn collect_replication_peers(self_url: &str, replica_urls: &[String]) -> Vec<Str
         .filter(|url| self_base != *url)
         .filter(|url| seen.insert(url.clone()))
         .collect()
+}
+
+fn replication_worker_handles(partition: &PartitionRuntime) -> Vec<ReplicationWorkerHandle> {
+    partition.replication_workers.clone()
+}
+
+fn schedule_replication_worker(
+    state: Arc<AppState>,
+    partition: Arc<PartitionRuntime>,
+    worker: ReplicationWorkerHandle,
+    seq: u64,
+    leader_term: u64,
+    payload: Bytes,
+) -> BoxFuture<'static, Result<(), String>> {
+    let peer = worker.peer.clone();
+    let (response_tx, response_rx) = oneshot::channel();
+    let item = ReplicationWorkerItem {
+        seq,
+        leader_term,
+        payload,
+        response: response_tx,
+    };
+    match worker.tx.try_send(item) {
+        Ok(()) => Box::pin(async move {
+            match response_rx.await {
+                Ok(result) => result,
+                Err(_) => Err(format!(
+                    "{peer}: replication worker response channel closed"
+                )),
+            }
+        }),
+        Err(TrySendError::Full(item)) => {
+            let ReplicationWorkerItem {
+                seq,
+                leader_term,
+                payload,
+                ..
+            } = item;
+            Box::pin(async move {
+                replicate_to_peer(state, partition, peer, seq, leader_term, payload).await
+            })
+        }
+        Err(TrySendError::Closed(item)) => {
+            let ReplicationWorkerItem {
+                seq,
+                leader_term,
+                payload,
+                ..
+            } = item;
+            Box::pin(async move {
+                replicate_to_peer(state, partition, peer, seq, leader_term, payload).await
+            })
+        }
+    }
+}
+
+async fn replication_worker_loop(
+    state: Arc<AppState>,
+    partition: Arc<PartitionRuntime>,
+    peer: String,
+    mut rx: mpsc::Receiver<ReplicationWorkerItem>,
+) {
+    while let Some(item) = rx.recv().await {
+        let result = replicate_to_peer(
+            state.clone(),
+            partition.clone(),
+            peer.clone(),
+            item.seq,
+            item.leader_term,
+            item.payload,
+        )
+        .await;
+        let _ = item.response.send(result);
+    }
 }
 
 #[derive(Debug)]
@@ -2855,7 +3722,7 @@ async fn catch_up_peer(
                 ));
             }
             journal
-                .read_range(next_seq, state.replication_catchup_batch)
+                .read_range_with_seq(next_seq, state.replication_catchup_batch)
                 .map_err(|err| {
                     format!("{peer}: read replication range from seq={next_seq}: {err:#}")
                 })?
@@ -2868,10 +3735,7 @@ async fn catch_up_peer(
         }
 
         let mut restart_from = None;
-        for raw in entries {
-            let entry_seq = decode_replication_payload_seq(raw.as_ref()).map_err(|err| {
-                format!("{peer}: decode local replication seq during catch-up: {err:#}")
-            })?;
+        for (entry_seq, raw) in entries {
             if entry_seq < next_seq {
                 continue;
             }
@@ -3035,12 +3899,12 @@ where
 async fn replicate_to_followers(
     state: Arc<AppState>,
     partition: Arc<PartitionRuntime>,
-    peers: Vec<String>,
     seq: u64,
     leader_term: u64,
     payload: Bytes,
 ) -> ReplicationSummary {
-    if peers.is_empty() {
+    let workers = replication_worker_handles(partition.as_ref());
+    if workers.is_empty() {
         return ReplicationSummary {
             attempted: 0,
             succeeded: 0,
@@ -3048,12 +3912,12 @@ async fn replicate_to_followers(
         };
     }
 
-    let attempted = peers.len();
-    let futures = peers.iter().map(|peer| {
-        replicate_to_peer(
+    let attempted = workers.len();
+    let futures = workers.into_iter().map(|worker| {
+        schedule_replication_worker(
             state.clone(),
             partition.clone(),
-            peer.clone(),
+            worker,
             seq,
             leader_term,
             payload.clone(),
@@ -3065,13 +3929,13 @@ async fn replicate_to_followers(
 async fn replicate_to_followers_until_quorum(
     state: Arc<AppState>,
     partition: Arc<PartitionRuntime>,
-    peers: Vec<String>,
     seq: u64,
     leader_term: u64,
     payload: Bytes,
     required_successes: usize,
 ) -> ReplicationSummary {
-    if peers.is_empty() {
+    let workers = replication_worker_handles(partition.as_ref());
+    if workers.is_empty() {
         return ReplicationSummary {
             attempted: 0,
             succeeded: 0,
@@ -3079,13 +3943,13 @@ async fn replicate_to_followers_until_quorum(
         };
     }
 
-    let attempted = peers.len();
+    let attempted = workers.len();
     let required = required_successes.min(attempted);
-    let futures = peers.iter().map(|peer| {
-        replicate_to_peer(
+    let futures = workers.into_iter().map(|worker| {
+        schedule_replication_worker(
             state.clone(),
             partition.clone(),
-            peer.clone(),
+            worker,
             seq,
             leader_term,
             payload.clone(),
@@ -3311,6 +4175,11 @@ async fn main() -> anyhow::Result<()> {
     let leader_task = tokio::spawn(leader.clone().run());
 
     let mut partitions = HashMap::new();
+    let mut replication_worker_receivers: Vec<(
+        Arc<PartitionRuntime>,
+        String,
+        mpsc::Receiver<ReplicationWorkerItem>,
+    )> = Vec::new();
     let mut partition_leader_tasks = Vec::new();
     for partition_id in topology.hosted_partitions(self_url.as_str()) {
         let placement = topology
@@ -3346,19 +4215,30 @@ async fn main() -> anyhow::Result<()> {
         );
         partition_leader_tasks.push(tokio::spawn(partition_leader.clone().run()));
         let replica_peers = collect_replication_peers(self_url.as_str(), &placement.replicas);
+        let mut replication_workers = Vec::with_capacity(replica_peers.len());
+        let mut partition_receivers = Vec::with_capacity(replica_peers.len());
+        for peer in replica_peers.iter().cloned() {
+            let (tx, rx) = mpsc::channel(1024);
+            replication_workers.push(ReplicationWorkerHandle {
+                peer: peer.clone(),
+                tx,
+            });
+            partition_receivers.push((peer, rx));
+        }
         let quorum_size = placement.replicas.len() / 2 + 1;
-        partitions.insert(
+        let partition_runtime = Arc::new(PartitionRuntime {
             partition_id,
-            Arc::new(PartitionRuntime {
-                partition_id,
-                replica_peers,
-                quorum_size,
-                index: Arc::new(RwLock::new(index)),
-                leader: partition_leader,
-                journal: Arc::new(Mutex::new(journal)),
-                mutation_gate: Arc::new(AsyncMutex::new(())),
-            }),
-        );
+            replication_workers,
+            quorum_size,
+            index: Arc::new(RwLock::new(index)),
+            leader: partition_leader,
+            journal: Arc::new(Mutex::new(journal)),
+            mutation_gate: Arc::new(AsyncMutex::new(())),
+        });
+        for (peer, rx) in partition_receivers {
+            replication_worker_receivers.push((partition_runtime.clone(), peer, rx));
+        }
+        partitions.insert(partition_id, partition_runtime);
     }
 
     let http = build_http_client()?;
@@ -3378,6 +4258,13 @@ async fn main() -> anyhow::Result<()> {
         internal_auth_token,
         http,
     });
+    let mut replication_worker_tasks = Vec::new();
+    for (partition, peer, rx) in replication_worker_receivers {
+        let worker_state = state.clone();
+        replication_worker_tasks.push(tokio::spawn(async move {
+            replication_worker_loop(worker_state, partition, peer, rx).await;
+        }));
+    }
 
     let app = Router::new()
         .route("/v1/role", get(role))
@@ -3389,8 +4276,16 @@ async fn main() -> anyhow::Result<()> {
             post(apply_partition_mutations_internal),
         )
         .route(
+            "/v1/internal/partition-mutations-wire",
+            post(apply_partition_mutations_internal_wire),
+        )
+        .route(
             "/v1/internal/partition-search",
             post(partition_search_internal),
+        )
+        .route(
+            "/v1/internal/partition-search-wire",
+            post(partition_search_internal_wire),
         )
         .route(
             "/v1/internal/partition-force-rebuild",
@@ -3452,6 +4347,10 @@ async fn main() -> anyhow::Result<()> {
         task.abort();
         let _ = task.await;
     }
+    for task in replication_worker_tasks {
+        task.abort();
+        let _ = task.await;
+    }
 
     Ok(())
 }
@@ -3459,18 +4358,36 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_http_base_url, collect_cluster_endpoints, collect_replication_peers,
-        collect_replication_results_until_quorum, decode_payload_frame, decode_replication_payload,
-        decode_replication_payload_seq, decode_snapshot_payload, encode_commit_mode,
-        encode_payload_frame, encode_replication_payload, encode_snapshot_payload,
-        parse_replication_reject, ErrorResponse, EtcdElectionConfig, EtcdLeaderElector,
-        ReplicationJournal, ReplicationPayload, ReplicationRejectResponse, SnapshotPayload,
-        WireMutation, WireSnapshotRow, REPLICATION_PAYLOAD_SCHEMA_VERSION,
-        SNAPSHOT_PAYLOAD_SCHEMA_VERSION,
+        canonicalize_http_base_url, collect_cluster_endpoints,
+        collect_partition_apply_results_until_done, collect_partition_mutations,
+        collect_replication_peers, collect_replication_results_until_quorum,
+        decode_internal_partition_mutations_wire_request,
+        decode_internal_partition_mutations_wire_response,
+        decode_internal_partition_search_wire_request,
+        decode_internal_partition_search_wire_response, decode_payload_frame,
+        decode_replication_payload, decode_replication_payload_seq, decode_snapshot_payload,
+        encode_commit_mode, encode_internal_partition_mutations_wire_request,
+        encode_internal_partition_mutations_wire_response,
+        encode_internal_partition_search_wire_request,
+        encode_internal_partition_search_wire_response, encode_payload_frame,
+        encode_replication_payload, encode_snapshot_payload, merge_neighbors_topk,
+        parse_replication_reject, partition_parallelism, ApiError, ApplyMutationsResponse,
+        ErrorResponse, EtcdElectionConfig, EtcdLeaderElector,
+        InternalPartitionMutationsWireRequest, InternalPartitionMutationsWireResponse,
+        InternalPartitionSearchWireRequest, InternalPartitionSearchWireResponse, MutationInput,
+        ReplicationJournal, ReplicationPayload, ReplicationRejectResponse, ReplicationSummary,
+        SearchResponse, SnapshotPayload, WireMutation, WireSnapshotRow,
+        REPLICATION_PAYLOAD_SCHEMA_VERSION, SNAPSHOT_PAYLOAD_SCHEMA_VERSION,
     };
+    use axum::http::StatusCode;
     use bytes::Bytes;
+    use futures::stream::FuturesUnordered;
+    use std::collections::BTreeMap;
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::time::Duration;
     use vectdb::index::MutationCommitMode;
+    use vectdb::topology::ClusterTopology;
+    use vectdb::types::Neighbor;
 
     #[test]
     fn collect_replication_peers_dedups_and_skips_self() {
@@ -3567,6 +4484,32 @@ mod tests {
         }
     }
 
+    async fn delayed_apply_result(
+        ms: u64,
+        result: Result<ApplyMutationsResponse, ApiError>,
+    ) -> Result<ApplyMutationsResponse, ApiError> {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        result
+    }
+
+    fn sample_apply_response(
+        upserts: usize,
+        deletes: usize,
+        attempted: usize,
+        succeeded: usize,
+        failed: &[&str],
+    ) -> ApplyMutationsResponse {
+        ApplyMutationsResponse {
+            applied_upserts: upserts,
+            applied_deletes: deletes,
+            replicated: ReplicationSummary {
+                attempted,
+                succeeded,
+                failed: failed.iter().map(|entry| (*entry).to_string()).collect(),
+            },
+        }
+    }
+
     #[tokio::test]
     async fn collect_replication_results_stops_after_quorum() {
         let started = std::time::Instant::now();
@@ -3596,6 +4539,59 @@ mod tests {
         assert_eq!(summary.attempted, 3);
         assert_eq!(summary.succeeded, 1);
         assert_eq!(summary.failed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn collect_partition_apply_results_sums_successes() {
+        let mut futures = FuturesUnordered::new();
+        futures.push(Box::pin(delayed_apply_result(
+            15,
+            Ok(sample_apply_response(2, 1, 3, 3, &[])),
+        )));
+        futures.push(Box::pin(delayed_apply_result(
+            10,
+            Ok(sample_apply_response(4, 0, 2, 2, &[])),
+        )));
+        futures.push(Box::pin(delayed_apply_result(
+            5,
+            Ok(sample_apply_response(1, 3, 2, 1, &["peer-x"])),
+        )));
+        let out = collect_partition_apply_results_until_done(&mut futures)
+            .await
+            .expect("aggregate apply result");
+        assert_eq!(out.applied_upserts, 7);
+        assert_eq!(out.applied_deletes, 4);
+        assert_eq!(out.replicated.attempted, 7);
+        assert_eq!(out.replicated.succeeded, 6);
+        assert_eq!(out.replicated.failed, vec!["peer-x".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn collect_partition_apply_results_waits_for_inflight_successes_before_error() {
+        let started = std::time::Instant::now();
+        let mut futures = FuturesUnordered::new();
+        futures.push(Box::pin(delayed_apply_result(
+            5,
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(ErrorResponse {
+                    error: "partition unavailable".to_string(),
+                    replication_reject: None,
+                }),
+            )),
+        )));
+        futures.push(Box::pin(delayed_apply_result(
+            60,
+            Ok(sample_apply_response(2, 0, 1, 1, &[])),
+        )));
+        let err = collect_partition_apply_results_until_done(&mut futures)
+            .await
+            .expect_err("should surface first partition error");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "collector should drain all in-flight partition writes before returning"
+        );
     }
 
     fn build_payload(seq: u64, term: u64) -> Bytes {
@@ -3652,6 +4648,89 @@ mod tests {
         let encoded = encode_payload_frame(&entries).expect("encode frame");
         let decoded = decode_payload_frame(encoded.as_ref()).expect("decode frame");
         assert_eq!(entries, decoded);
+    }
+
+    #[test]
+    fn internal_mutations_wire_request_roundtrip() {
+        let request = InternalPartitionMutationsWireRequest {
+            schema_version: 1,
+            partition_id: 3,
+            commit_mode: encode_commit_mode(MutationCommitMode::Acknowledged),
+            mutations: vec![
+                WireMutation::Upsert {
+                    id: 7,
+                    values: vec![0.1, 0.2],
+                },
+                WireMutation::Delete { id: 9 },
+            ],
+        };
+        let encoded =
+            encode_internal_partition_mutations_wire_request(&request).expect("encode request");
+        let decoded = decode_internal_partition_mutations_wire_request(encoded.as_ref())
+            .expect("decode request");
+        assert_eq!(decoded.schema_version, request.schema_version);
+        assert_eq!(decoded.partition_id, request.partition_id);
+        assert_eq!(decoded.commit_mode, request.commit_mode);
+        assert_eq!(decoded.mutations.len(), request.mutations.len());
+    }
+
+    #[test]
+    fn internal_mutations_wire_response_roundtrip() {
+        let response = InternalPartitionMutationsWireResponse::from(sample_apply_response(
+            5,
+            2,
+            4,
+            3,
+            &["peer-a"],
+        ));
+        let encoded =
+            encode_internal_partition_mutations_wire_response(&response).expect("encode response");
+        let decoded = decode_internal_partition_mutations_wire_response(encoded.as_ref())
+            .expect("decode response");
+        assert_eq!(decoded.schema_version, response.schema_version);
+        assert_eq!(decoded.applied_upserts, 5);
+        assert_eq!(decoded.applied_deletes, 2);
+        assert_eq!(decoded.replicated.attempted, 4);
+        assert_eq!(decoded.replicated.succeeded, 3);
+        assert_eq!(decoded.replicated.failed, vec!["peer-a".to_string()]);
+    }
+
+    #[test]
+    fn internal_search_wire_request_response_roundtrip() {
+        let request = InternalPartitionSearchWireRequest {
+            schema_version: 1,
+            partition_id: 2,
+            query: vec![0.2, 0.4, 0.6],
+            k: 7,
+        };
+        let encoded =
+            encode_internal_partition_search_wire_request(&request).expect("encode search request");
+        let decoded = decode_internal_partition_search_wire_request(encoded.as_ref())
+            .expect("decode search request");
+        assert_eq!(decoded.schema_version, request.schema_version);
+        assert_eq!(decoded.partition_id, request.partition_id);
+        assert_eq!(decoded.query, request.query);
+        assert_eq!(decoded.k, request.k);
+
+        let response = InternalPartitionSearchWireResponse::from(SearchResponse {
+            neighbors: vec![
+                Neighbor {
+                    id: 3,
+                    distance: 0.1,
+                },
+                Neighbor {
+                    id: 4,
+                    distance: 0.2,
+                },
+            ],
+        });
+        let encoded = encode_internal_partition_search_wire_response(&response)
+            .expect("encode search response");
+        let decoded = decode_internal_partition_search_wire_response(encoded.as_ref())
+            .expect("decode search response");
+        assert_eq!(decoded.schema_version, response.schema_version);
+        assert_eq!(decoded.neighbors.len(), 2);
+        assert_eq!(decoded.neighbors[0].id, 3);
     }
 
     #[test]
@@ -3721,6 +4800,70 @@ mod tests {
     }
 
     #[test]
+    fn replication_journal_reopen_clamps_stale_meta_ahead_of_log() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let payload = build_payload(1, 1);
+
+        let mut journal = ReplicationJournal::open(root, 8).expect("open journal");
+        journal
+            .append_and_mark_applied(1, 1, payload.as_ref(), true)
+            .expect("append committed entry");
+
+        let mut meta: super::ReplicationJournalMeta =
+            serde_json::from_slice(&std::fs::read(&journal.meta_path).expect("read meta"))
+                .expect("decode meta");
+        meta.next_seq = 99;
+        meta.last_applied_seq = 88;
+        std::fs::write(
+            &journal.meta_path,
+            serde_json::to_vec(&meta).expect("encode meta"),
+        )
+        .expect("write poisoned meta");
+        drop(journal);
+
+        let reopened = ReplicationJournal::open(root, 8).expect("reopen journal");
+        assert_eq!(reopened.first_seq(), 1);
+        assert_eq!(reopened.next_seq(), 2);
+        assert_eq!(reopened.last_applied_seq(), 1);
+    }
+
+    #[test]
+    fn replication_journal_detects_record_checksum_corruption() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let payload = build_payload(1, 1);
+
+        {
+            let mut journal = ReplicationJournal::open(root, 8).expect("open journal");
+            journal
+                .append_and_mark_applied(1, 1, payload.as_ref(), true)
+                .expect("append committed entry");
+        }
+
+        let log_path = root.join("replication").join("ops.log");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&log_path)
+            .expect("open log for corruption");
+        file.seek(SeekFrom::Start(12))
+            .expect("seek to record checksum");
+        let mut checksum = [0u8; 8];
+        file.read_exact(&mut checksum).expect("read checksum");
+        checksum[0] ^= 0x55;
+        file.seek(SeekFrom::Start(12)).expect("rewind to checksum");
+        file.write_all(&checksum).expect("write corrupted checksum");
+        file.flush().expect("flush corruption");
+        drop(file);
+
+        match ReplicationJournal::open(root, 8) {
+            Ok(_) => panic!("corruption must fail reopen"),
+            Err(err) => assert!(err.to_string().contains("checksum mismatch")),
+        }
+    }
+
+    #[test]
     fn replication_journal_compacts_old_entries() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
@@ -3772,5 +4915,83 @@ mod tests {
         assert_eq!(journal.max_term_seen(), 3);
         assert!(journal.read_entry(1).expect("read seq 1").is_none());
         assert!(journal.read_entry(2).expect("read seq 2").is_none());
+    }
+
+    #[test]
+    fn partition_parallelism_is_bounded_and_non_zero() {
+        assert_eq!(partition_parallelism(0), 1);
+        assert_eq!(partition_parallelism(1), 1);
+        let p = partition_parallelism(10_000);
+        assert!(p > 0);
+        assert!(p <= 10_000);
+    }
+
+    #[test]
+    fn merge_neighbors_topk_matches_sorted_baseline() {
+        let neighbors = vec![
+            Neighbor {
+                id: 11,
+                distance: 0.7,
+            },
+            Neighbor {
+                id: 8,
+                distance: 0.2,
+            },
+            Neighbor {
+                id: 5,
+                distance: 0.2,
+            },
+            Neighbor {
+                id: 9,
+                distance: 0.4,
+            },
+            Neighbor {
+                id: 1,
+                distance: 0.9,
+            },
+            Neighbor {
+                id: 2,
+                distance: 0.3,
+            },
+        ];
+
+        let mut expected = neighbors.clone();
+        expected.sort_by(|lhs, rhs| {
+            lhs.distance
+                .total_cmp(&rhs.distance)
+                .then_with(|| lhs.id.cmp(&rhs.id))
+        });
+        expected.truncate(4);
+
+        let actual = merge_neighbors_topk(neighbors, 4);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn collect_partition_mutations_groups_by_partition() {
+        let topology =
+            ClusterTopology::build_deterministic(1, 8, 1, &["http://node-a:8080".to_string()])
+                .expect("topology");
+        let grouped = collect_partition_mutations(
+            &topology,
+            vec![
+                MutationInput::Upsert {
+                    id: 1,
+                    values: vec![0.1, 0.2],
+                },
+                MutationInput::Delete { id: 9 },
+                MutationInput::Upsert {
+                    id: 2,
+                    values: vec![0.3, 0.4],
+                },
+            ],
+        );
+        assert_eq!(grouped.len(), 2);
+        let by_partition: BTreeMap<u32, usize> = grouped
+            .into_iter()
+            .map(|(partition_id, mutations)| (partition_id, mutations.len()))
+            .collect();
+        assert_eq!(by_partition.get(&1).copied(), Some(2));
+        assert_eq!(by_partition.get(&2).copied(), Some(1));
     }
 }

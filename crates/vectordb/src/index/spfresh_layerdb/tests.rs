@@ -8,6 +8,7 @@ use tempfile::TempDir;
 
 use crate::types::{VectorIndex, VectorRecord};
 
+pub(super) use super::open_recovery::decode_startup_manifest;
 pub(super) use super::{
     config, storage, PersistedStartupManifest, STARTUP_MANIFEST_SCHEMA_VERSION,
 };

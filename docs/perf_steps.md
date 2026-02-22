@@ -1101,3 +1101,37 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.5371`
 - `search_qps_ratio=3.0918`
+
+## Step 44 (`startup-manifest-crc-frame`)
+
+Change:
+- Replaced startup manifest payload with fixed framed codec:
+  - tag + fixed fields + CRC32
+  - explicit optional flag for `applied_wal_seq`
+- Startup now decodes manifest strictly and fails closed on corruption instead of silently falling back.
+- Updated manifest persistence/read path to use the new codec.
+- Added startup regression coverage:
+  - `startup_fails_closed_on_corrupted_startup_manifest`
+  - existing manifest persistence test now decodes via the new codec.
+
+Impact:
+- Hardens restart correctness guarantees by preventing ambiguous epoch boot on corrupted manifests.
+- Keeps startup manifest parse path branch-light and allocation-free.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=199844.28`
+- `search_qps=2528.32`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=127795.18`
+- `search_qps=920.48`
+- `recall_at_k=0.4580`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.5638`
+- `search_qps_ratio=2.7467`

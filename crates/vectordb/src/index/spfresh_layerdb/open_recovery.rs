@@ -1,5 +1,112 @@
 use super::*;
 
+const STARTUP_MANIFEST_BIN_TAG: &[u8] = b"smf1";
+const STARTUP_MANIFEST_FLAG_HAS_APPLIED_WAL_SEQ: u8 = 1 << 0;
+const STARTUP_MANIFEST_CRC_SIZE: usize = 4;
+const STARTUP_MANIFEST_BIN_ENCODED_LEN: usize =
+    STARTUP_MANIFEST_BIN_TAG.len() + 4 + 8 + 1 + 8 + 8 + 8 + 4;
+
+fn read_manifest_u8(raw: &[u8], cursor: &mut usize) -> anyhow::Result<u8> {
+    let Some(byte) = raw.get(*cursor).copied() else {
+        anyhow::bail!("startup manifest decode underflow for u8");
+    };
+    *cursor = cursor.saturating_add(1);
+    Ok(byte)
+}
+
+fn read_manifest_u32(raw: &[u8], cursor: &mut usize) -> anyhow::Result<u32> {
+    let end = cursor.saturating_add(4);
+    let Some(bytes) = raw.get(*cursor..end) else {
+        anyhow::bail!("startup manifest decode underflow for u32");
+    };
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(bytes);
+    *cursor = end;
+    Ok(u32::from_le_bytes(arr))
+}
+
+fn read_manifest_u64(raw: &[u8], cursor: &mut usize) -> anyhow::Result<u64> {
+    let end = cursor.saturating_add(8);
+    let Some(bytes) = raw.get(*cursor..end) else {
+        anyhow::bail!("startup manifest decode underflow for u64");
+    };
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    *cursor = end;
+    Ok(u64::from_le_bytes(arr))
+}
+
+fn encode_startup_manifest(manifest: &PersistedStartupManifest) -> Vec<u8> {
+    let mut out = Vec::with_capacity(STARTUP_MANIFEST_BIN_ENCODED_LEN);
+    out.extend_from_slice(STARTUP_MANIFEST_BIN_TAG);
+    out.extend_from_slice(&manifest.schema_version.to_le_bytes());
+    out.extend_from_slice(&manifest.generation.to_le_bytes());
+    let mut flags = 0u8;
+    if manifest.applied_wal_seq.is_some() {
+        flags |= STARTUP_MANIFEST_FLAG_HAS_APPLIED_WAL_SEQ;
+    }
+    out.push(flags);
+    out.extend_from_slice(&manifest.applied_wal_seq.unwrap_or_default().to_le_bytes());
+    out.extend_from_slice(&manifest.posting_event_next_seq.to_le_bytes());
+    out.extend_from_slice(&manifest.epoch.to_le_bytes());
+    let payload_start = STARTUP_MANIFEST_BIN_TAG.len();
+    let checksum = crc32fast::hash(&out[payload_start..]);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out
+}
+
+pub(super) fn decode_startup_manifest(raw: &[u8]) -> anyhow::Result<PersistedStartupManifest> {
+    if !raw.starts_with(STARTUP_MANIFEST_BIN_TAG) {
+        anyhow::bail!("unsupported startup manifest tag");
+    }
+    if raw.len() != STARTUP_MANIFEST_BIN_ENCODED_LEN {
+        anyhow::bail!(
+            "invalid startup manifest length: {} (expected {})",
+            raw.len(),
+            STARTUP_MANIFEST_BIN_ENCODED_LEN
+        );
+    }
+    let payload_start = STARTUP_MANIFEST_BIN_TAG.len();
+    let checksum_offset = raw.len().saturating_sub(STARTUP_MANIFEST_CRC_SIZE);
+    let expected = u32::from_le_bytes(
+        raw[checksum_offset..]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("startup manifest checksum parse failed"))?,
+    );
+    let actual = crc32fast::hash(&raw[payload_start..checksum_offset]);
+    if expected != actual {
+        anyhow::bail!(
+            "startup manifest checksum mismatch: expected={expected:#010x} actual={actual:#010x}"
+        );
+    }
+    let mut cursor = payload_start;
+    let schema_version = read_manifest_u32(raw, &mut cursor)?;
+    let generation = read_manifest_u64(raw, &mut cursor)?;
+    let flags = read_manifest_u8(raw, &mut cursor)?;
+    let unknown_flags = flags & !STARTUP_MANIFEST_FLAG_HAS_APPLIED_WAL_SEQ;
+    if unknown_flags != 0 {
+        anyhow::bail!("startup manifest unknown flags: {unknown_flags:#x}");
+    }
+    let applied_raw = read_manifest_u64(raw, &mut cursor)?;
+    let posting_event_next_seq = read_manifest_u64(raw, &mut cursor)?;
+    let epoch = read_manifest_u64(raw, &mut cursor)?;
+    if cursor != checksum_offset {
+        anyhow::bail!("startup manifest payload length mismatch");
+    }
+    let applied_wal_seq = if (flags & STARTUP_MANIFEST_FLAG_HAS_APPLIED_WAL_SEQ) != 0 {
+        Some(applied_raw)
+    } else {
+        None
+    };
+    Ok(PersistedStartupManifest {
+        schema_version,
+        generation,
+        applied_wal_seq,
+        posting_event_next_seq,
+        epoch,
+    })
+}
+
 impl SpFreshLayerDbIndex {
     pub fn open(path: impl AsRef<Path>, mut cfg: SpFreshLayerDbConfig) -> anyhow::Result<Self> {
         validate_config(&cfg)?;
@@ -53,13 +160,20 @@ impl SpFreshLayerDbIndex {
         let generation = ensure_active_generation(&db)?;
         let wal_next_seq = ensure_wal_next_seq(&db)?;
         let posting_event_next_seq = ensure_posting_event_next_seq(&db)?;
-        let manifest_epoch = load_startup_manifest_bytes(&db)?
-            .and_then(|raw| bincode::deserialize::<PersistedStartupManifest>(&raw).ok())
-            .filter(|m| {
-                m.schema_version == STARTUP_MANIFEST_SCHEMA_VERSION && m.generation == generation
-            })
-            .map(|m| m.epoch)
-            .unwrap_or(0);
+        let manifest_epoch = match load_startup_manifest_bytes(&db)? {
+            None => 0,
+            Some(raw) => {
+                let manifest = decode_startup_manifest(raw.as_ref())
+                    .context("decode spfresh startup manifest")?;
+                if manifest.schema_version == STARTUP_MANIFEST_SCHEMA_VERSION
+                    && manifest.generation == generation
+                {
+                    manifest.epoch
+                } else {
+                    0
+                }
+            }
+        };
         let (mut index_state, applied_wal_seq) =
             Self::load_or_rebuild_index(&db, &cfg, generation, wal_next_seq)?;
         cfg.memory_mode = match &index_state {
@@ -348,8 +462,7 @@ impl SpFreshLayerDbIndex {
             posting_event_next_seq,
             epoch,
         };
-        let manifest_bytes =
-            bincode::serialize(&manifest).context("encode spfresh startup manifest")?;
+        let manifest_bytes = encode_startup_manifest(&manifest);
         persist_startup_manifest_bytes(&self.db, manifest_bytes, true)?;
         if let Err(err) = prune_wal_before(&self.db, next_wal_seq, false) {
             eprintln!("spfresh-layerdb wal prune failed: {err:#}");

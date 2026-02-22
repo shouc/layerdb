@@ -182,7 +182,7 @@ fn startup_manifest_persists_with_checkpoint() -> anyhow::Result<()> {
             layerdb::ReadOptions::default(),
         )?
         .ok_or_else(|| anyhow::anyhow!("startup manifest missing"))?;
-    let manifest: super::PersistedStartupManifest = bincode::deserialize(raw.as_ref())?;
+    let manifest: super::PersistedStartupManifest = super::decode_startup_manifest(raw.as_ref())?;
     assert_eq!(
         manifest.schema_version,
         super::STARTUP_MANIFEST_SCHEMA_VERSION

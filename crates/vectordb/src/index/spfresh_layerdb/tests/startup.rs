@@ -121,6 +121,44 @@ fn startup_fails_closed_on_corrupted_wal_tail_entry() -> anyhow::Result<()> {
 }
 
 #[test]
+fn startup_fails_closed_on_corrupted_startup_manifest() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig::default();
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(1, vec![0.1; cfg.spfresh.dim])?;
+        idx.close()?;
+    }
+
+    let db = Db::open(dir.path(), cfg.db_options.clone())?;
+    let mut raw = db
+        .get(
+            super::config::META_STARTUP_MANIFEST_KEY,
+            layerdb::ReadOptions::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("startup manifest missing"))?
+        .to_vec();
+    raw[6] ^= 0x55;
+    db.put(
+        super::config::META_STARTUP_MANIFEST_KEY,
+        raw,
+        WriteOptions { sync: true },
+    )?;
+
+    let err = match SpFreshLayerDbIndex::open_existing(dir.path(), cfg.db_options.clone()) {
+        Ok(_) => anyhow::bail!("corrupted startup manifest should fail startup"),
+        Err(err) => err,
+    };
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("decode spfresh startup manifest")
+            && rendered.contains("checksum mismatch"),
+        "unexpected startup error: {rendered}"
+    );
+    Ok(())
+}
+
+#[test]
 fn offheap_diskmeta_wal_tail_rebuilds_from_rows() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let cfg = SpFreshLayerDbConfig {

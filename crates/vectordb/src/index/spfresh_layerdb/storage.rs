@@ -676,8 +676,16 @@ pub(crate) fn wal_key(seq: u64) -> String {
 pub(crate) enum IndexWalEntry {
     Touch { id: u64 },
     TouchBatch { ids: Vec<u64> },
+    VectorUpsertBatch { rows: Vec<VectorWalUpsertRow> },
+    VectorDeleteBatch { ids: Vec<u64> },
     DiskMetaUpsertBatch { rows: Vec<DiskMetaWalUpsertRow> },
     DiskMetaDeleteBatch { rows: Vec<DiskMetaWalDeleteRow> },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct VectorWalUpsertRow {
+    pub id: u64,
+    pub values: Vec<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -697,8 +705,10 @@ pub(crate) struct DiskMetaWalDeleteRow {
 const WAL_BIN_TAG: &[u8] = b"wl3";
 const WAL_KIND_TOUCH: u8 = 1;
 const WAL_KIND_TOUCH_BATCH: u8 = 2;
-const WAL_KIND_DISKMETA_UPSERT_BATCH: u8 = 3;
-const WAL_KIND_DISKMETA_DELETE_BATCH: u8 = 4;
+const WAL_KIND_VECTOR_UPSERT_BATCH: u8 = 3;
+const WAL_KIND_VECTOR_DELETE_BATCH: u8 = 4;
+const WAL_KIND_DISKMETA_UPSERT_BATCH: u8 = 5;
+const WAL_KIND_DISKMETA_DELETE_BATCH: u8 = 6;
 const WAL_DISKMETA_FLAG_HAS_OLD: u8 = 1 << 0;
 const WAL_FRAME_HEADER_SIZE: usize = 4 + 4;
 
@@ -787,6 +797,25 @@ pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>>
                 payload.extend_from_slice(&id.to_le_bytes());
             }
         }
+        IndexWalEntry::VectorUpsertBatch { rows } => {
+            payload.push(WAL_KIND_VECTOR_UPSERT_BATCH);
+            let len = u32::try_from(rows.len())
+                .context("wal vector upsert-batch len does not fit u32")?;
+            payload.extend_from_slice(&len.to_le_bytes());
+            for row in rows {
+                payload.extend_from_slice(&row.id.to_le_bytes());
+                encode_wal_f32_vec(&mut payload, row.values.as_slice())?;
+            }
+        }
+        IndexWalEntry::VectorDeleteBatch { ids } => {
+            payload.push(WAL_KIND_VECTOR_DELETE_BATCH);
+            let len =
+                u32::try_from(ids.len()).context("wal vector delete-batch len does not fit u32")?;
+            payload.extend_from_slice(&len.to_le_bytes());
+            for id in ids {
+                payload.extend_from_slice(&id.to_le_bytes());
+            }
+        }
         IndexWalEntry::DiskMetaUpsertBatch { rows } => {
             payload.push(WAL_KIND_DISKMETA_UPSERT_BATCH);
             let len = u32::try_from(rows.len())
@@ -823,10 +852,34 @@ pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>>
     encode_wal_frame(payload.as_slice())
 }
 
+#[cfg(test)]
 pub(crate) fn encode_wal_touch_batch_ids(ids: &[u64]) -> anyhow::Result<Vec<u8>> {
     let mut payload = Vec::with_capacity(1 + 4 + ids.len().saturating_mul(8));
     payload.push(WAL_KIND_TOUCH_BATCH);
     let len = u32::try_from(ids.len()).context("wal touch-batch len does not fit u32")?;
+    payload.extend_from_slice(&len.to_le_bytes());
+    for id in ids {
+        payload.extend_from_slice(&id.to_le_bytes());
+    }
+    encode_wal_frame(payload.as_slice())
+}
+
+pub(crate) fn encode_wal_vector_upsert_batch(rows: &[(u64, Vec<f32>)]) -> anyhow::Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(1 + 4 + rows.len().saturating_mul(16));
+    payload.push(WAL_KIND_VECTOR_UPSERT_BATCH);
+    let len = u32::try_from(rows.len()).context("wal vector upsert-batch len does not fit u32")?;
+    payload.extend_from_slice(&len.to_le_bytes());
+    for (id, values) in rows {
+        payload.extend_from_slice(&id.to_le_bytes());
+        encode_wal_f32_vec(&mut payload, values.as_slice())?;
+    }
+    encode_wal_frame(payload.as_slice())
+}
+
+pub(crate) fn encode_wal_vector_delete_batch(ids: &[u64]) -> anyhow::Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(1 + 4 + ids.len().saturating_mul(8));
+    payload.push(WAL_KIND_VECTOR_DELETE_BATCH);
+    let len = u32::try_from(ids.len()).context("wal vector delete-batch len does not fit u32")?;
     payload.extend_from_slice(&len.to_le_bytes());
     for id in ids {
         payload.extend_from_slice(&id.to_le_bytes());
@@ -917,6 +970,26 @@ pub(crate) fn decode_wal_entry(raw: &[u8]) -> anyhow::Result<IndexWalEntry> {
                 ids.push(read_u64(payload, &mut cursor)?);
             }
             IndexWalEntry::TouchBatch { ids }
+        }
+        WAL_KIND_VECTOR_UPSERT_BATCH => {
+            let len = usize::try_from(read_u32(payload, &mut cursor)?)
+                .context("wal vector upsert-batch len overflow")?;
+            let mut rows = Vec::with_capacity(len);
+            for _ in 0..len {
+                let id = read_u64(payload, &mut cursor)?;
+                let values = decode_wal_f32_vec(payload, &mut cursor)?;
+                rows.push(VectorWalUpsertRow { id, values });
+            }
+            IndexWalEntry::VectorUpsertBatch { rows }
+        }
+        WAL_KIND_VECTOR_DELETE_BATCH => {
+            let len = usize::try_from(read_u32(payload, &mut cursor)?)
+                .context("wal vector delete-batch len overflow")?;
+            let mut ids = Vec::with_capacity(len);
+            for _ in 0..len {
+                ids.push(read_u64(payload, &mut cursor)?);
+            }
+            IndexWalEntry::VectorDeleteBatch { ids }
         }
         WAL_KIND_DISKMETA_UPSERT_BATCH => {
             let len = usize::try_from(read_u32(payload, &mut cursor)?)
@@ -1558,6 +1631,38 @@ mod tests {
                 assert_eq!(decoded_rows[1].new_values, vec![1.0, -1.5]);
             }
             other => panic!("expected diskmeta upsert-batch entry, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vector_wal_upsert_batch_codec_roundtrip() -> anyhow::Result<()> {
+        let rows = vec![(5u64, vec![0.25f32, -0.75]), (9u64, vec![1.0f32, 2.0])];
+        let encoded = encode_wal_vector_upsert_batch(rows.as_slice())?;
+        let decoded = decode_wal_entry(encoded.as_slice())?;
+        match decoded {
+            IndexWalEntry::VectorUpsertBatch { rows: decoded_rows } => {
+                assert_eq!(decoded_rows.len(), 2);
+                assert_eq!(decoded_rows[0].id, 5);
+                assert_eq!(decoded_rows[0].values, vec![0.25, -0.75]);
+                assert_eq!(decoded_rows[1].id, 9);
+                assert_eq!(decoded_rows[1].values, vec![1.0, 2.0]);
+            }
+            other => panic!("expected vector upsert-batch entry, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vector_wal_delete_batch_codec_roundtrip() -> anyhow::Result<()> {
+        let ids = vec![101u64, 205u64, 307u64];
+        let encoded = encode_wal_vector_delete_batch(ids.as_slice())?;
+        let decoded = decode_wal_entry(encoded.as_slice())?;
+        match decoded {
+            IndexWalEntry::VectorDeleteBatch { ids: decoded_ids } => {
+                assert_eq!(decoded_ids, ids);
+            }
+            other => panic!("expected vector delete-batch entry, got {other:?}"),
         }
         Ok(())
     }

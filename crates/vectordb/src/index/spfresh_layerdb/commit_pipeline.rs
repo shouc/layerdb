@@ -133,15 +133,4 @@ impl SpFreshLayerDbIndex {
         self.wal_next_seq.store(next_seq, Ordering::Relaxed);
         Ok(())
     }
-
-    pub(super) fn persist_with_wal_touch_batch_ids(
-        &self,
-        ids: &[u64],
-        row_ops: Vec<layerdb::Op>,
-        trailer_ops: Vec<layerdb::Op>,
-        commit_mode: MutationCommitMode,
-    ) -> anyhow::Result<()> {
-        let wal_value = encode_wal_touch_batch_ids(ids)?;
-        self.persist_with_wal_payload(wal_value, ids.len(), row_ops, trailer_ops, commit_mode)
-    }
 }

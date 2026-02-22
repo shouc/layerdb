@@ -1336,3 +1336,36 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.8355`
 - `search_qps_ratio=2.7558`
+
+## Step 51 (`typed-vector-wal-replay`)
+
+Change:
+- Added explicit typed WAL payloads for resident/offheap mutation batches:
+  - `VectorUpsertBatch { rows }`
+  - `VectorDeleteBatch { ids }`
+- Durable non-diskmeta upsert/delete paths now persist typed WAL payloads instead of legacy touch-only batches.
+- Startup WAL replay now applies typed vector entries directly in-memory (resident/offheap), while preserving legacy touch-batch fallback for older WAL tails.
+- Added codec roundtrip coverage for typed vector WAL entries.
+
+Impact:
+- Removes startup dependence on reading authoritative vector rows for current WAL-tail operations in resident/offheap modes.
+- Preserves backward compatibility by retaining legacy touch-based replay fallback.
+- Improves startup determinism and reduces recovery IO on fresh WAL tails.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=185188.05`
+- `search_qps=2784.30`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=127595.78`
+- `search_qps=920.40`
+- `recall_at_k=0.4860`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.4514`
+- `search_qps_ratio=3.0251`

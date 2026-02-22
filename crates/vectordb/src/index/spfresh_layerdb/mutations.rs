@@ -544,15 +544,15 @@ impl SpFreshLayerDbIndex {
 
         if !self.use_nondurable_fast_path() {
             let mut batch_ops = Vec::with_capacity(mutations.len());
-            let mut touched_ids = Vec::with_capacity(mutations.len());
             for (id, vector) in &mutations {
                 let value = encode_vector_row_fields(*id, 0, false, vector.as_slice(), None)
                     .context("serialize vector row")?;
                 batch_ops.push(layerdb::Op::put(vector_key(generation, *id), value));
-                touched_ids.push(*id);
             }
-            if let Err(err) = self.persist_with_wal_touch_batch_ids(
-                touched_ids.as_slice(),
+            let wal_payload = encode_wal_vector_upsert_batch(mutations.as_slice())?;
+            if let Err(err) = self.persist_with_wal_payload(
+                wal_payload,
+                mutations.len(),
                 batch_ops,
                 Vec::new(),
                 commit_mode,
@@ -759,13 +759,13 @@ impl SpFreshLayerDbIndex {
 
         if !self.use_nondurable_fast_path() {
             let mut batch_ops = Vec::with_capacity(mutations.len());
-            let mut touched_ids = Vec::with_capacity(mutations.len());
             for id in &mutations {
                 batch_ops.push(layerdb::Op::delete(vector_key(generation, *id)));
-                touched_ids.push(*id);
             }
-            if let Err(err) = self.persist_with_wal_touch_batch_ids(
-                touched_ids.as_slice(),
+            let wal_payload = encode_wal_vector_delete_batch(mutations.as_slice())?;
+            if let Err(err) = self.persist_with_wal_payload(
+                wal_payload,
+                mutations.len(),
                 batch_ops,
                 Vec::new(),
                 commit_mode,

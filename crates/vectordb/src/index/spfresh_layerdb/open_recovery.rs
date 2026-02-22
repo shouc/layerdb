@@ -498,7 +498,10 @@ impl SpFreshLayerDbIndex {
                         let _ = index.apply_delete(row.old);
                     }
                 }
-                IndexWalEntry::Touch { .. } | IndexWalEntry::TouchBatch { .. } => {
+                IndexWalEntry::Touch { .. }
+                | IndexWalEntry::TouchBatch { .. }
+                | IndexWalEntry::VectorUpsertBatch { .. }
+                | IndexWalEntry::VectorDeleteBatch { .. } => {
                     replay_supported = false;
                 }
             }
@@ -532,6 +535,51 @@ impl SpFreshLayerDbIndex {
                 }
                 IndexWalEntry::TouchBatch { ids } => {
                     touched.extend(ids);
+                }
+                IndexWalEntry::VectorUpsertBatch { rows } => {
+                    for row in rows {
+                        let id = row.id;
+                        let values = row.values;
+                        match index {
+                            RuntimeSpFreshIndex::Resident(index) => index.upsert(id, values),
+                            RuntimeSpFreshIndex::OffHeap(index) => {
+                                let mut loader = Self::loader_for(
+                                    db,
+                                    vector_cache,
+                                    vector_blocks,
+                                    generation,
+                                    Some((id, values.clone())),
+                                );
+                                index.upsert_with(id, values, &mut loader)?;
+                            }
+                            RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
+                                let posting = index.choose_posting(&values).unwrap_or_default();
+                                index.apply_upsert(None, posting, values);
+                            }
+                        }
+                    }
+                }
+                IndexWalEntry::VectorDeleteBatch { ids } => {
+                    for id in ids {
+                        match index {
+                            RuntimeSpFreshIndex::Resident(index) => {
+                                let _ = index.delete(id);
+                            }
+                            RuntimeSpFreshIndex::OffHeap(index) => {
+                                let mut loader = Self::loader_for(
+                                    db,
+                                    vector_cache,
+                                    vector_blocks,
+                                    generation,
+                                    None,
+                                );
+                                let _ = index.delete_with(id, &mut loader)?;
+                            }
+                            RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
+                                let _ = index.apply_delete(None);
+                            }
+                        }
+                    }
                 }
                 IndexWalEntry::DiskMetaUpsertBatch { rows } => {
                     touched.extend(rows.into_iter().map(|row| row.id));

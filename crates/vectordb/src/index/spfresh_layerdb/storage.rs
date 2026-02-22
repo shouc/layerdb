@@ -76,6 +76,116 @@ pub(crate) fn encode_u64_fixed(value: u64) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
+fn parse_decimal_u64_ascii(raw: &[u8]) -> Option<u64> {
+    if raw.is_empty() {
+        return None;
+    }
+    let mut out = 0u64;
+    for byte in raw {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        out = out.checked_mul(10)?;
+        out = out.checked_add(u64::from(byte - b'0'))?;
+    }
+    Some(out)
+}
+
+fn parse_wal_seq_key(key: &[u8]) -> Option<u64> {
+    let prefix = INDEX_WAL_PREFIX.as_bytes();
+    if !key.starts_with(prefix) {
+        return None;
+    }
+    parse_decimal_u64_ascii(&key[prefix.len()..])
+}
+
+fn parse_posting_member_event_seq_key(key: &[u8]) -> Option<u64> {
+    let prefix = POSTING_MEMBERS_ROOT_PREFIX.as_bytes();
+    if !key.starts_with(prefix) {
+        return None;
+    }
+    // Key layout:
+    // {POSTING_MEMBERS_ROOT_PREFIX}{generation:016x}/{posting:010}/{seq:020}/{id:020}
+    let generation_len = 16usize;
+    let posting_len = 10usize;
+    let seq_len = 20usize;
+    let id_len = 20usize;
+    let start = prefix.len();
+    let seq_start = start
+        .checked_add(generation_len + 1 + posting_len + 1)
+        .filter(|idx| *idx <= key.len())?;
+    let seq_end = seq_start.checked_add(seq_len)?;
+    let id_end = seq_end.checked_add(1 + id_len)?;
+    if id_end != key.len() {
+        return None;
+    }
+    if key.get(start + generation_len) != Some(&b'/')
+        || key.get(start + generation_len + 1 + posting_len) != Some(&b'/')
+        || key.get(seq_end) != Some(&b'/')
+    {
+        return None;
+    }
+    parse_decimal_u64_ascii(key.get(seq_start..seq_end)?)
+}
+
+fn recover_wal_next_seq(db: &Db) -> anyhow::Result<u64> {
+    let prefix_bytes = INDEX_WAL_PREFIX.as_bytes().to_vec();
+    let end = prefix_exclusive_end(prefix_bytes.as_slice())?;
+    let mut iter = db.iter(
+        Range {
+            start: Bound::Included(Bytes::from(prefix_bytes.clone())),
+            end: Bound::Excluded(Bytes::from(end)),
+        },
+        ReadOptions::default(),
+    )?;
+    iter.seek_to_first();
+    let mut max_seq: Option<u64> = None;
+    for next in iter {
+        let (key, value) = next?;
+        if value.is_none() || !key.starts_with(prefix_bytes.as_slice()) {
+            continue;
+        }
+        if let Some(seq) = parse_wal_seq_key(key.as_ref()) {
+            max_seq = Some(max_seq.map_or(seq, |current| current.max(seq)));
+        }
+    }
+    match max_seq {
+        Some(v) => v
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("recover wal next seq overflow from max={v}")),
+        None => Ok(0),
+    }
+}
+
+fn recover_posting_event_next_seq(db: &Db) -> anyhow::Result<u64> {
+    let prefix_bytes = POSTING_MEMBERS_ROOT_PREFIX.as_bytes().to_vec();
+    let end = prefix_exclusive_end(prefix_bytes.as_slice())?;
+    let mut iter = db.iter(
+        Range {
+            start: Bound::Included(Bytes::from(prefix_bytes.clone())),
+            end: Bound::Excluded(Bytes::from(end)),
+        },
+        ReadOptions::default(),
+    )?;
+    iter.seek_to_first();
+    let mut max_seq: Option<u64> = None;
+    for next in iter {
+        let (key, value) = next?;
+        if value.is_none() || !key.starts_with(prefix_bytes.as_slice()) {
+            continue;
+        }
+        if let Some(seq) = parse_posting_member_event_seq_key(key.as_ref()) {
+            max_seq = Some(max_seq.map_or(seq, |current| current.max(seq)));
+        }
+    }
+    match max_seq {
+        Some(v) => v
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("recover posting-event next seq overflow from max={v}")),
+        None => Ok(0),
+    }
+}
+
 pub(crate) fn encode_vector_row_value(row: &VectorRecord) -> anyhow::Result<Vec<u8>> {
     encode_vector_row_fields(row.id, row.version, row.deleted, &row.values, None)
 }
@@ -311,10 +421,19 @@ pub(crate) fn ensure_wal_next_seq(db: &Db) -> anyhow::Result<u64> {
         .get(META_INDEX_WAL_NEXT_SEQ_KEY, ReadOptions::default())
         .context("read spfresh wal next seq")?
     {
-        Some(bytes) => decode_u64_fixed(bytes.as_ref(), "wal next seq"),
+        Some(bytes) => match decode_u64_fixed(bytes.as_ref(), "wal next seq") {
+            Ok(next) => Ok(next),
+            Err(err) => {
+                eprintln!("spfresh-layerdb: wal next seq decode failed, recovering: {err:#}");
+                let recovered = recover_wal_next_seq(db)?;
+                set_wal_next_seq(db, recovered, true)?;
+                Ok(recovered)
+            }
+        },
         None => {
-            set_wal_next_seq(db, 0, true)?;
-            Ok(0)
+            let recovered = recover_wal_next_seq(db)?;
+            set_wal_next_seq(db, recovered, true)?;
+            Ok(recovered)
         }
     }
 }
@@ -330,10 +449,21 @@ pub(crate) fn ensure_posting_event_next_seq(db: &Db) -> anyhow::Result<u64> {
         .get(META_POSTING_EVENT_NEXT_SEQ_KEY, ReadOptions::default())
         .context("read spfresh posting-event next seq")?
     {
-        Some(bytes) => decode_u64_fixed(bytes.as_ref(), "posting-event next seq"),
+        Some(bytes) => match decode_u64_fixed(bytes.as_ref(), "posting-event next seq") {
+            Ok(next) => Ok(next),
+            Err(err) => {
+                eprintln!(
+                    "spfresh-layerdb: posting-event next seq decode failed, recovering: {err:#}"
+                );
+                let recovered = recover_posting_event_next_seq(db)?;
+                set_posting_event_next_seq(db, recovered, true)?;
+                Ok(recovered)
+            }
+        },
         None => {
-            set_posting_event_next_seq(db, 0, true)?;
-            Ok(0)
+            let recovered = recover_posting_event_next_seq(db)?;
+            set_posting_event_next_seq(db, recovered, true)?;
+            Ok(recovered)
         }
     }
 }
@@ -1081,6 +1211,71 @@ mod tests {
         let encoded = encode_u64_fixed(value);
         let decoded = decode_u64_fixed(encoded.as_slice(), "test_u64")?;
         assert_eq!(decoded, value);
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_wal_next_seq_recovers_from_corrupt_meta() -> anyhow::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let db = Db::open(dir.path(), layerdb::DbOptions::default())?;
+        db.put(
+            wal_key(0),
+            encode_wal_touch_batch_ids(&[1, 2, 3])?,
+            WriteOptions { sync: true },
+        )?;
+        db.put(
+            wal_key(1),
+            encode_wal_touch_batch_ids(&[4, 5])?,
+            WriteOptions { sync: true },
+        )?;
+        db.put(
+            META_INDEX_WAL_NEXT_SEQ_KEY,
+            b"bad".to_vec(),
+            WriteOptions { sync: true },
+        )?;
+
+        let recovered = ensure_wal_next_seq(&db)?;
+        assert_eq!(recovered, 2);
+        let meta = db
+            .get(META_INDEX_WAL_NEXT_SEQ_KEY, ReadOptions::default())?
+            .ok_or_else(|| anyhow::anyhow!("wal next seq metadata missing after recovery"))?;
+        assert_eq!(decode_u64_fixed(meta.as_ref(), "wal next seq")?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_posting_event_next_seq_recovers_from_corrupt_meta() -> anyhow::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let db = Db::open(dir.path(), layerdb::DbOptions::default())?;
+        let generation = 9u64;
+        let posting_id = 7usize;
+        db.put(
+            posting_member_event_key(generation, posting_id, 4, 10),
+            posting_member_event_tombstone_value(10)?,
+            WriteOptions { sync: true },
+        )?;
+        db.put(
+            posting_member_event_key(generation, posting_id, 8, 11),
+            posting_member_event_tombstone_value(11)?,
+            WriteOptions { sync: true },
+        )?;
+        db.put(
+            META_POSTING_EVENT_NEXT_SEQ_KEY,
+            b"oops".to_vec(),
+            WriteOptions { sync: true },
+        )?;
+
+        let recovered = ensure_posting_event_next_seq(&db)?;
+        assert_eq!(recovered, 9);
+        let meta = db
+            .get(META_POSTING_EVENT_NEXT_SEQ_KEY, ReadOptions::default())?
+            .ok_or_else(|| {
+                anyhow::anyhow!("posting-event next seq metadata missing after recovery")
+            })?;
+        assert_eq!(
+            decode_u64_fixed(meta.as_ref(), "posting-event next seq")?,
+            9
+        );
         Ok(())
     }
 

@@ -819,6 +819,14 @@ impl VectorBlockStore {
         self.remap()
     }
 
+    pub(crate) fn remap_if_pending(&mut self) -> anyhow::Result<bool> {
+        if self.pending_remap_records == 0 {
+            return Ok(false);
+        }
+        self.remap()?;
+        Ok(true)
+    }
+
     fn remap(&mut self) -> anyhow::Result<()> {
         self.file
             .flush()

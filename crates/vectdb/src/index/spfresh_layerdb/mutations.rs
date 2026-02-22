@@ -247,7 +247,7 @@ impl SpFreshLayerDbIndex {
 
         let mut unresolved = Vec::new();
         {
-            let blocks = lock_mutex(&self.vector_blocks);
+            let mut blocks = lock_mutex(&self.vector_blocks);
             for (idx, id) in ids.iter().copied().enumerate() {
                 if let Some(state) = blocks.get_state(id) {
                     if let Some(posting_id) = state.posting_id {
@@ -257,6 +257,21 @@ impl SpFreshLayerDbIndex {
                     }
                 } else {
                     unresolved.push((idx, id));
+                }
+            }
+
+            if !unresolved.is_empty() && blocks.remap_if_pending()? {
+                let retry = std::mem::take(&mut unresolved);
+                for (idx, id) in retry {
+                    if let Some(state) = blocks.get_state(id) {
+                        if let Some(posting_id) = state.posting_id {
+                            out[idx] = Some((posting_id, state.values));
+                        } else {
+                            unresolved.push((idx, id));
+                        }
+                    } else {
+                        unresolved.push((idx, id));
+                    }
                 }
             }
         }

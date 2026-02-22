@@ -194,7 +194,7 @@ impl SpFreshLayerDbIndex {
             return Ok(());
         }
         let generation = self.active_generation.load(Ordering::Relaxed);
-        let mut refreshed: EphemeralPostingMembers = HashMap::new();
+        let mut refreshed: EphemeralPostingMembers = FxHashMap::default();
         if let Some(snapshot) = self.diskmeta_search_snapshot.load_full() {
             for posting_id in snapshot.posting_ids() {
                 let loaded = load_posting_members(&self.db, generation, posting_id)
@@ -220,7 +220,8 @@ impl SpFreshLayerDbIndex {
         }
         let generation = self.active_generation.load(Ordering::Relaxed);
         let (rows, assignments) = load_rows_with_posting_assignments(&self.db, generation)?;
-        let mut refreshed: EphemeralRowStates = HashMap::with_capacity(rows.len());
+        let mut refreshed: EphemeralRowStates =
+            FxHashMap::with_capacity_and_hasher(rows.len(), Default::default());
         for row in rows {
             let Some(posting_id) = assignments.get(&row.id).copied() else {
                 continue;
@@ -233,7 +234,7 @@ impl SpFreshLayerDbIndex {
 
     pub(super) fn load_ephemeral_row_states_for_ids(&self, ids: &[u64]) -> DiskMetaStateMap {
         let guard = lock_mutex(&self.ephemeral_row_states);
-        let mut out = HashMap::with_capacity(ids.len());
+        let mut out = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         if let Some(states) = guard.as_ref() {
             for id in ids {
                 out.insert(*id, states.get(id).cloned());

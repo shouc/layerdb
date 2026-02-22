@@ -131,7 +131,8 @@ impl SpFreshLayerDbIndex {
         if self.use_nondurable_fast_path()
             && self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta
         {
-            let mut ephemeral_states = HashMap::with_capacity(rows.len());
+            let mut ephemeral_states =
+                FxHashMap::with_capacity_and_hasher(rows.len(), Default::default());
             if let Some(assignments) = disk_assignments.as_ref() {
                 for row in rows {
                     let Some(posting_id) = assignments.get(&row.id).copied() else {
@@ -251,7 +252,7 @@ impl SpFreshLayerDbIndex {
         generation: u64,
         ids: &[u64],
     ) -> anyhow::Result<DiskMetaStateMap> {
-        let mut out = HashMap::with_capacity(ids.len());
+        let mut out = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         if ids.is_empty() {
             return Ok(out);
         }

@@ -13,7 +13,7 @@ mod vector_blocks;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -83,9 +83,9 @@ pub enum MutationCommitMode {
 }
 
 type DiskMetaRowState = Option<(usize, Vec<f32>)>;
-type DiskMetaStateMap = HashMap<u64, DiskMetaRowState>;
-type EphemeralPostingMembers = HashMap<usize, FxHashSet<u64>>;
-type EphemeralRowStates = HashMap<u64, (usize, Vec<f32>)>;
+type DiskMetaStateMap = FxHashMap<u64, DiskMetaRowState>;
+type EphemeralPostingMembers = FxHashMap<usize, FxHashSet<u64>>;
+type EphemeralRowStates = FxHashMap<u64, (usize, Vec<f32>)>;
 type DistanceRow = (u64, f32);
 type DistanceLoadResult = (Vec<DistanceRow>, Vec<u64>);
 const POSTING_LOG_COMPACT_MIN_EVENTS: usize = 512;

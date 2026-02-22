@@ -586,3 +586,31 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7113`
 - `search_qps_ratio=3.3756`
+
+## Step 24 (`diskmeta-state-fxhash-maps`)
+
+Change:
+- Switched diskmeta/ephemeral state maps from std `HashMap` to `FxHashMap`:
+  - `DiskMetaStateMap`
+  - `EphemeralPostingMembers`
+  - `EphemeralRowStates`
+- Updated map construction sites in mutation/runtime helpers to use `FxHashMap` capacity builders.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step25-spfresh.json`,
+  `target/vectordb-step25-lancedb.json`.
+
+SPFresh:
+- `update_qps=189088.03`
+- `search_qps=2649.76`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=123445.36`
+- `search_qps=744.00`
+- `recall_at_k=0.4670`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.5318`
+- `search_qps_ratio=3.5615`

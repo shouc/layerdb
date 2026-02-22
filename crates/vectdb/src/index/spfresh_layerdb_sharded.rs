@@ -1030,13 +1030,19 @@ impl SpFreshLayerDbShardedIndex {
 
 impl VectorIndex for SpFreshLayerDbShardedIndex {
     fn upsert(&mut self, id: u64, vector: Vec<f32>) {
-        self.try_upsert(id, vector)
-            .unwrap_or_else(|err| panic!("sharded spfresh upsert failed for id={id}: {err:#}"));
+        if let Err(err) = self.try_upsert(id, vector) {
+            eprintln!("sharded spfresh upsert failed for id={id}: {err:#}");
+        }
     }
 
     fn delete(&mut self, id: u64) -> bool {
-        self.try_delete(id)
-            .unwrap_or_else(|err| panic!("sharded spfresh delete failed for id={id}: {err:#}"))
+        match self.try_delete(id) {
+            Ok(deleted) => deleted,
+            Err(err) => {
+                eprintln!("sharded spfresh delete failed for id={id}: {err:#}");
+                false
+            }
+        }
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {

@@ -175,7 +175,8 @@ impl SpFreshLayerDbIndex {
             layerdb::Op::put(snapshot_key, snapshot_value),
             layerdb::Op::delete_range(prefix_bytes, end),
         ];
-        self.submit_commit(ops, false, true)
+        // Keep read-path latency bounded by avoiding synchronous ack wait here.
+        self.submit_commit(ops, false, false)
             .context("compact posting-member append log")?;
         Ok(())
     }

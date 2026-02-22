@@ -1,19 +1,17 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
+use crate::index::SpFreshLayerDbShardedStats;
+use crate::Neighbor;
 use bytes::Bytes;
 use etcd_client::{Client as EtcdClient, ConnectOptions};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Client, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock as AsyncRwLock;
-
-use crate::index::SpFreshLayerDbShardedStats;
-use crate::Neighbor;
 
 const LEADER_FAILOVER_MAX_ROUNDS: usize = 4;
 const LEADER_FAILOVER_BACKOFF_MS: u64 = 150;
@@ -36,7 +34,7 @@ struct VectDbClusterClientInner {
     http: Client,
     preferred: AtomicUsize,
     etcd_discovery: Option<EtcdDiscoveryConfig>,
-    discovered_leader: AsyncRwLock<Option<Url>>,
+    discovered_leader: StdRwLock<Option<Url>>,
 }
 
 #[derive(Clone, Debug)]
@@ -127,13 +125,14 @@ impl VectDbClusterClient {
                 http,
                 preferred: AtomicUsize::new(0),
                 etcd_discovery,
-                discovered_leader: AsyncRwLock::new(None),
+                discovered_leader: StdRwLock::new(None),
             }),
         })
     }
 
-    pub fn base_url(&self) -> &Url {
-        &self.inner.endpoints[self.preferred_index()]
+    pub fn base_url(&self) -> Url {
+        self.cached_discovered_endpoint()
+            .unwrap_or_else(|| self.inner.endpoints[self.preferred_index()].clone())
     }
 
     pub fn endpoints(&self) -> &[Url] {
@@ -142,18 +141,18 @@ impl VectDbClusterClient {
 
     pub async fn discover_leader(&self) -> Result<RoleResponse, ClusterClientError> {
         let mut last_error = None;
-        if let Some(cached) = self.cached_discovered_endpoint().await {
+        if let Some(cached) = self.cached_discovered_endpoint() {
             match self.get_json_url::<RoleResponse>(&cached, "v1/role").await {
                 Ok(role) => {
                     if role.leader {
                         self.maybe_mark_preferred_url(&cached);
                         return Ok(role);
                     }
-                    self.clear_cached_discovered_endpoint_if(&cached).await;
+                    self.clear_cached_discovered_endpoint_if(&cached);
                 }
                 Err(err) => {
                     last_error = Some(err);
-                    self.clear_cached_discovered_endpoint_if(&cached).await;
+                    self.clear_cached_discovered_endpoint_if(&cached);
                 }
             }
         }
@@ -182,10 +181,10 @@ impl VectDbClusterClient {
             match self.get_json_url::<RoleResponse>(&url, "v1/role").await {
                 Ok(role) => {
                     if role.leader {
-                        self.set_cached_discovered_endpoint(url).await;
+                        self.set_cached_discovered_endpoint(url);
                         return Ok(role);
                     }
-                    self.clear_cached_discovered_endpoint_if(&url).await;
+                    self.clear_cached_discovered_endpoint_if(&url);
                 }
                 Err(err) => last_error = Some(err),
             }
@@ -239,6 +238,7 @@ impl VectDbClusterClient {
         self.apply_mutations(&ApplyMutationsRequest {
             mutations: vec![Mutation::Upsert { id, values }],
             commit_mode: Some(commit_mode),
+            allow_partial: false,
         })
         .await
     }
@@ -251,6 +251,7 @@ impl VectDbClusterClient {
         self.apply_mutations(&ApplyMutationsRequest {
             mutations: vec![Mutation::Delete { id }],
             commit_mode: Some(commit_mode),
+            allow_partial: false,
         })
         .await
     }
@@ -266,7 +267,7 @@ impl VectDbClusterClient {
         let mut last_error = None;
         for round in 0..failover.max_rounds() {
             let mut attempted_cached = None;
-            if let Some(cached) = self.cached_discovered_endpoint().await {
+            if let Some(cached) = self.cached_discovered_endpoint() {
                 attempted_cached = Some(cached.clone());
                 match self.get_json_url(&cached, path).await {
                     Ok(decoded) => {
@@ -276,7 +277,7 @@ impl VectDbClusterClient {
                     Err(err) => {
                         if should_retry(&err, failover) {
                             last_error = Some(err);
-                            self.clear_cached_discovered_endpoint_if(&cached).await;
+                            self.clear_cached_discovered_endpoint_if(&cached);
                         } else {
                             return Err(err);
                         }
@@ -316,14 +317,14 @@ impl VectDbClusterClient {
             if let Some(url) = discovered {
                 match self.get_json_url(&url, path).await {
                     Ok(decoded) => {
-                        self.set_cached_discovered_endpoint(url.clone()).await;
+                        self.set_cached_discovered_endpoint(url.clone());
                         self.maybe_mark_preferred_url(&url);
                         return Ok(decoded);
                     }
                     Err(err) => {
                         if should_retry(&err, failover) {
                             last_error = Some(err);
-                            self.clear_cached_discovered_endpoint_if(&url).await;
+                            self.clear_cached_discovered_endpoint_if(&url);
                         } else {
                             return Err(err);
                         }
@@ -358,7 +359,7 @@ impl VectDbClusterClient {
         let mut last_error = None;
         for round in 0..failover.max_rounds() {
             let mut attempted_cached = None;
-            if let Some(cached) = self.cached_discovered_endpoint().await {
+            if let Some(cached) = self.cached_discovered_endpoint() {
                 attempted_cached = Some(cached.clone());
                 match self.post_json_url(&cached, path, body.clone()).await {
                     Ok(decoded) => {
@@ -368,7 +369,7 @@ impl VectDbClusterClient {
                     Err(err) => {
                         if should_retry(&err, failover) {
                             last_error = Some(err);
-                            self.clear_cached_discovered_endpoint_if(&cached).await;
+                            self.clear_cached_discovered_endpoint_if(&cached);
                         } else {
                             return Err(err);
                         }
@@ -408,14 +409,14 @@ impl VectDbClusterClient {
             if let Some(url) = discovered {
                 match self.post_json_url(&url, path, body.clone()).await {
                     Ok(decoded) => {
-                        self.set_cached_discovered_endpoint(url.clone()).await;
+                        self.set_cached_discovered_endpoint(url.clone());
                         self.maybe_mark_preferred_url(&url);
                         return Ok(decoded);
                     }
                     Err(err) => {
                         if should_retry(&err, failover) {
                             last_error = Some(err);
-                            self.clear_cached_discovered_endpoint_if(&url).await;
+                            self.clear_cached_discovered_endpoint_if(&url);
                         } else {
                             return Err(err);
                         }
@@ -566,18 +567,36 @@ impl VectDbClusterClient {
         Ok(Some(resolved))
     }
 
-    async fn cached_discovered_endpoint(&self) -> Option<Url> {
-        self.inner.discovered_leader.read().await.clone()
+    fn cached_discovered_endpoint(&self) -> Option<Url> {
+        match self.inner.discovered_leader.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
-    async fn set_cached_discovered_endpoint(&self, url: Url) {
-        *self.inner.discovered_leader.write().await = Some(url);
+    fn set_cached_discovered_endpoint(&self, url: Url) {
+        match self.inner.discovered_leader.write() {
+            Ok(mut guard) => *guard = Some(url),
+            Err(poisoned) => {
+                let mut inner = poisoned.into_inner();
+                *inner = Some(url);
+            }
+        }
     }
 
-    async fn clear_cached_discovered_endpoint_if(&self, url: &Url) {
-        let mut cached = self.inner.discovered_leader.write().await;
-        if cached.as_ref() == Some(url) {
-            *cached = None;
+    fn clear_cached_discovered_endpoint_if(&self, url: &Url) {
+        match self.inner.discovered_leader.write() {
+            Ok(mut cached) => {
+                if cached.as_ref() == Some(url) {
+                    *cached = None;
+                }
+            }
+            Err(poisoned) => {
+                let mut cached = poisoned.into_inner();
+                if cached.as_ref() == Some(url) {
+                    *cached = None;
+                }
+            }
         }
     }
 }
@@ -936,6 +955,8 @@ pub struct RoleResponse {
     pub role: String,
     pub leader: bool,
     pub replication: ReplicationState,
+    #[serde(default)]
+    pub local_partition_replication: Vec<PartitionReplicationState>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -945,6 +966,18 @@ pub struct HealthResponse {
     pub leader: bool,
     pub stats: SpFreshLayerDbShardedStats,
     pub replication: ReplicationState,
+    #[serde(default)]
+    pub local_partition_replication: Vec<PartitionReplicationState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartitionReplicationState {
+    pub partition_id: u32,
+    pub leader: bool,
+    pub first_seq: u64,
+    pub next_seq: u64,
+    pub last_applied_seq: u64,
+    pub max_term_seen: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -974,6 +1007,12 @@ pub struct ApplyMutationsRequest {
     pub mutations: Vec<Mutation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_mode: Option<CommitMode>,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub allow_partial: bool,
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1116,6 +1155,7 @@ mod tests {
                 role: "leader".to_string(),
                 leader: true,
                 replication: sample_replication_state(),
+                local_partition_replication: Vec::new(),
             },
             health: HealthResponse {
                 node_id: "node-a".to_string(),
@@ -1137,6 +1177,7 @@ mod tests {
                     pending_ops: 0,
                 },
                 replication: sample_replication_state(),
+                local_partition_replication: Vec::new(),
             },
         };
 
@@ -1234,6 +1275,7 @@ mod tests {
             role: role.to_string(),
             leader,
             replication: sample_replication_state(),
+            local_partition_replication: Vec::new(),
         })
     }
 
@@ -1313,6 +1355,7 @@ mod tests {
             .apply_mutations(&ApplyMutationsRequest {
                 mutations: Vec::new(),
                 commit_mode: Some(CommitMode::Durable),
+                allow_partial: false,
             })
             .await
             .expect_err("expected bad request");
@@ -1398,7 +1441,7 @@ mod tests {
 
         let client = VectDbClusterClient::from_endpoints([stale_url.as_str()])?;
         let discovered = parse_endpoint(leader_url.as_str())?;
-        client.set_cached_discovered_endpoint(discovered).await;
+        client.set_cached_discovered_endpoint(discovered);
 
         let first = client
             .upsert(41, vec![0.1, 0.2], CommitMode::Durable)
@@ -1408,6 +1451,10 @@ mod tests {
             .upsert(42, vec![0.2, 0.3], CommitMode::Durable)
             .await?;
         assert_eq!(second.applied_upserts, 1);
+        assert_eq!(
+            client.base_url().as_str(),
+            normalize_base(leader_url.as_str())
+        );
 
         assert_eq!(
             stale_hits.load(AtomicOrdering::Relaxed),

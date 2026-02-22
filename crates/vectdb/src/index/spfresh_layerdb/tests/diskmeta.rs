@@ -177,11 +177,9 @@ fn diskmeta_search_fails_closed_when_exact_payloads_are_missing() -> anyhow::Res
     fs::remove_dir_all(dir.path().join("vector_blocks"))?;
 
     let idx = SpFreshLayerDbIndex::open(dir.path(), cfg)?;
-    let search = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = idx.search(&[0.2; 16], 1);
-    }));
+    let got = idx.search(&[0.2; 16], 1);
     assert!(
-        search.is_err(),
+        got.is_empty(),
         "search should fail closed when vectors are missing"
     );
     Ok(())

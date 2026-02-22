@@ -101,22 +101,32 @@ impl Drop for SpFreshLayerDbIndex {
 
 impl VectorIndex for SpFreshLayerDbIndex {
     fn upsert(&mut self, id: u64, vector: Vec<f32>) {
-        self.try_upsert(id, vector)
-            .unwrap_or_else(|err| panic!("spfresh-layerdb upsert failed for id={id}: {err:#}"));
+        if let Err(err) = self.try_upsert(id, vector) {
+            eprintln!("spfresh-layerdb upsert failed for id={id}: {err:#}");
+        }
     }
 
     fn delete(&mut self, id: u64) -> bool {
-        self.try_delete(id)
-            .unwrap_or_else(|err| panic!("spfresh-layerdb delete failed for id={id}: {err:#}"))
+        match self.try_delete(id) {
+            Ok(deleted) => deleted,
+            Err(err) => {
+                eprintln!("spfresh-layerdb delete failed for id={id}: {err:#}");
+                false
+            }
+        }
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
+        if k == 0 {
+            return Vec::new();
+        }
         let started = Instant::now();
         let generation = self.active_generation.load(Ordering::Relaxed);
         let diskmeta_snapshot = self.diskmeta_search_snapshot.load_full();
         let out = if let Some(index) = diskmeta_snapshot {
             let mut top = Vec::with_capacity(k);
             let mut worst_idx = None;
+            let mut failed_closed = false;
             let postings = index.choose_probe_postings_with_bounds(query, k);
             for (posting_id, lower_bound_sq) in postings {
                 if top.len() >= k {
@@ -134,23 +144,38 @@ impl VectorIndex for SpFreshLayerDbIndex {
                         break;
                     }
                 }
-                let members = self
-                    .load_posting_members_for(generation, posting_id)
-                    .unwrap_or_else(|err| panic!("offheap-diskmeta load members failed: {err:#}"));
+                let members = match self.load_posting_members_for(generation, posting_id) {
+                    Ok(members) => members,
+                    Err(err) => {
+                        eprintln!(
+                            "offheap-diskmeta load members failed generation={} posting={}: {err:#}",
+                            generation, posting_id
+                        );
+                        failed_closed = true;
+                        break;
+                    }
+                };
                 if members.is_empty() {
                     continue;
                 }
-                let (selected_exact, missing_selected_ids) = Self::load_distances_for_ids(
+                let (selected_exact, missing_selected_ids) = match Self::load_distances_for_ids(
                     &self.db,
                     &self.vector_cache,
                     &self.vector_blocks,
                     generation,
                     members.as_ref(),
                     query,
-                )
-                .unwrap_or_else(|err| {
-                    panic!("offheap-diskmeta load selected distances failed: {err:#}")
-                });
+                ) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        eprintln!(
+                            "offheap-diskmeta load selected distances failed generation={} posting={}: {err:#}",
+                            generation, posting_id
+                        );
+                        failed_closed = true;
+                        break;
+                    }
+                };
                 for (id, distance) in selected_exact {
                     Self::push_neighbor_topk(
                         &mut top,
@@ -163,17 +188,24 @@ impl VectorIndex for SpFreshLayerDbIndex {
                 // If selected candidates miss exact payloads, retry exact evaluation only for the
                 // unresolved ids and fail closed if any referenced row remains missing.
                 if !missing_selected_ids.is_empty() {
-                    let (fallback_exact, fallback_missing) = Self::load_distances_for_ids(
+                    let (fallback_exact, fallback_missing) = match Self::load_distances_for_ids(
                         &self.db,
                         &self.vector_cache,
                         &self.vector_blocks,
                         generation,
                         &missing_selected_ids,
                         query,
-                    )
-                    .unwrap_or_else(|err| {
-                        panic!("offheap-diskmeta load fallback distances failed: {err:#}")
-                    });
+                    ) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            eprintln!(
+                                "offheap-diskmeta load fallback distances failed generation={} posting={}: {err:#}",
+                                generation, posting_id
+                            );
+                            failed_closed = true;
+                            break;
+                        }
+                    };
                     for (id, distance) in fallback_exact {
                         Self::push_neighbor_topk(
                             &mut top,
@@ -183,16 +215,22 @@ impl VectorIndex for SpFreshLayerDbIndex {
                         );
                     }
                     if !fallback_missing.is_empty() {
-                        panic!(
+                        eprintln!(
                             "offheap-diskmeta search missing exact vector payloads for {} ids in posting {}",
                             fallback_missing.len(),
                             posting_id
                         );
+                        failed_closed = true;
+                        break;
                     }
                 }
             }
-            top.sort_by(Self::neighbor_cmp);
-            top
+            if failed_closed {
+                Vec::new()
+            } else {
+                top.sort_by(Self::neighbor_cmp);
+                top
+            }
         } else {
             match &*lock_read(&self.index) {
                 RuntimeSpFreshIndex::Resident(index) => index.search(query, k),
@@ -206,7 +244,10 @@ impl VectorIndex for SpFreshLayerDbIndex {
                     );
                     match index.search_with(query, k, &mut loader) {
                         Ok(out) => out,
-                        Err(err) => panic!("spfresh-layerdb offheap search failed: {err:#}"),
+                        Err(err) => {
+                            eprintln!("spfresh-layerdb offheap search failed: {err:#}");
+                            Vec::new()
+                        }
                     }
                 }
                 RuntimeSpFreshIndex::OffHeapDiskMeta(_) => unreachable!("diskmeta handled above"),

@@ -165,6 +165,17 @@ fn health_check_reports_stats_and_integrity() -> anyhow::Result<()> {
 }
 
 #[test]
+fn search_with_zero_k_returns_empty() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig::default();
+    let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+    idx.try_upsert(1, vec![0.1; cfg.spfresh.dim])?;
+    let got = idx.search(&vec![0.1; cfg.spfresh.dim], 0);
+    assert!(got.is_empty());
+    Ok(())
+}
+
+#[test]
 fn startup_manifest_persists_with_checkpoint() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let cfg = SpFreshLayerDbConfig::default();

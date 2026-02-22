@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
@@ -73,6 +73,9 @@ struct Args {
 
     #[arg(long)]
     etcd_password: Option<String>,
+
+    #[arg(long)]
+    internal_auth_token: Option<String>,
 
     #[arg(long, default_value_t = 1_500)]
     replication_timeout_ms: u64,
@@ -164,7 +167,9 @@ impl From<CommitModeArg> for MutationCommitMode {
 const REPLICATION_JOURNAL_SCHEMA_VERSION: u32 = 1;
 const REPLICATION_PAYLOAD_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_PAYLOAD_SCHEMA_VERSION: u32 = 1;
+const CLUSTER_TOPOLOGY_SCHEMA_VERSION: u32 = 1;
 const LOG_RANGE_FRAME_MAX_ENTRIES: usize = 4096;
+const INTERNAL_AUTH_HEADER: &str = "x-vectdb-internal-token";
 
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
@@ -295,6 +300,12 @@ struct ReplicationJournalMeta {
     next_seq: u64,
     last_applied_seq: u64,
     max_term_seen: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterTopologyEnvelope {
+    schema_version: u32,
+    topology: ClusterTopology,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1065,6 +1076,7 @@ struct AppState {
     replication_snapshot_timeout: Duration,
     replication_catchup_batch: usize,
     leader: Arc<EtcdLeaderElector>,
+    internal_auth_token: Option<String>,
     http: Client,
 }
 
@@ -1094,6 +1106,7 @@ struct RoleResponse {
     role: String,
     leader: bool,
     replication: ReplicationState,
+    local_partition_replication: Vec<PartitionReplicationState>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1103,6 +1116,17 @@ struct HealthResponse {
     leader: bool,
     stats: SpFreshLayerDbShardedStats,
     replication: ReplicationState,
+    local_partition_replication: Vec<PartitionReplicationState>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PartitionReplicationState {
+    partition_id: u32,
+    leader: bool,
+    first_seq: u64,
+    next_seq: u64,
+    last_applied_seq: u64,
+    max_term_seen: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1125,6 +1149,8 @@ struct ApplyMutationsRequest {
     mutations: Vec<MutationInput>,
     #[serde(default)]
     commit_mode: Option<CommitModeArg>,
+    #[serde(default)]
+    allow_partial: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1178,7 +1204,19 @@ struct SyncToS3Request {
     max_files_per_shard: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct InternalPartitionRequest {
+    partition_id: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct InternalPartitionSyncRequest {
+    partition_id: u32,
+    #[serde(default)]
+    max_files_per_shard: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct SyncToS3Response {
     moved_files: usize,
 }
@@ -1215,6 +1253,22 @@ fn local_partition_state(
     })
 }
 
+fn ensure_internal_auth(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(expected) = state.internal_auth_token.as_deref() else {
+        return Ok(());
+    };
+    let provided = headers
+        .get(INTERNAL_AUTH_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if provided == Some(expected) {
+        return Ok(());
+    }
+    Err(api_error(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized internal request",
+    ))
+}
+
 fn is_not_leader_message(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     normalized.contains("not leader") || normalized.contains("leader term unavailable")
@@ -1235,7 +1289,7 @@ fn aggregate_replication_state(state: &AppState) -> Result<ReplicationState, Api
     }
 
     let mut first_seq = u64::MAX;
-    let mut next_seq = u64::MAX;
+    let mut next_seq = 1u64;
     let mut last_applied_seq = u64::MAX;
     let mut max_term_seen = 0u64;
     for partition in state.partitions.values() {
@@ -1245,7 +1299,7 @@ fn aggregate_replication_state(state: &AppState) -> Result<ReplicationState, Api
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
         let snapshot = journal.snapshot_state();
         first_seq = first_seq.min(snapshot.first_seq);
-        next_seq = next_seq.min(snapshot.next_seq);
+        next_seq = next_seq.max(snapshot.next_seq);
         last_applied_seq = last_applied_seq.min(snapshot.last_applied_seq);
         max_term_seen = max_term_seen.max(snapshot.max_term_seen);
     }
@@ -1256,6 +1310,33 @@ fn aggregate_replication_state(state: &AppState) -> Result<ReplicationState, Api
         last_applied_seq,
         max_term_seen,
     })
+}
+
+fn collect_local_partition_replication(
+    state: &AppState,
+) -> Result<Vec<PartitionReplicationState>, ApiError> {
+    let mut out = Vec::with_capacity(state.partitions.len());
+    let mut ids: Vec<u32> = state.partitions.keys().copied().collect();
+    ids.sort_unstable();
+    for partition_id in ids {
+        let Some(partition) = state.partitions.get(&partition_id) else {
+            continue;
+        };
+        let journal = partition
+            .journal
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "journal lock poisoned"))?;
+        let snapshot = journal.snapshot_state();
+        out.push(PartitionReplicationState {
+            partition_id,
+            leader: partition.leader.is_leader(),
+            first_seq: snapshot.first_seq,
+            next_seq: snapshot.next_seq,
+            last_applied_seq: snapshot.last_applied_seq,
+            max_term_seen: snapshot.max_term_seen,
+        });
+    }
+    Ok(out)
 }
 
 fn sum_partition_stats(items: Vec<SpFreshLayerDbShardedStats>) -> SpFreshLayerDbShardedStats {
@@ -1373,11 +1454,13 @@ fn merge_neighbors_topk(mut all: Vec<Neighbor>, k: usize) -> Vec<Neighbor> {
 
 async fn role(State(state): State<Arc<AppState>>) -> ApiResult<RoleResponse> {
     let replication = aggregate_replication_state(&state)?;
+    let local_partition_replication = collect_local_partition_replication(&state)?;
     Ok(Json(RoleResponse {
         node_id: state.node_id.clone(),
         role: state.leader.role().to_string(),
         leader: state.leader.is_leader(),
         replication,
+        local_partition_replication,
     }))
 }
 
@@ -1406,6 +1489,7 @@ async fn health(State(state): State<Arc<AppState>>) -> ApiResult<HealthResponse>
     })?;
 
     let replication = aggregate_replication_state(&state)?;
+    let local_partition_replication = collect_local_partition_replication(&state)?;
 
     Ok(Json(HealthResponse {
         node_id: state.node_id.clone(),
@@ -1413,6 +1497,7 @@ async fn health(State(state): State<Arc<AppState>>) -> ApiResult<HealthResponse>
         leader: state.leader.is_leader(),
         stats,
         replication,
+        local_partition_replication,
     }))
 }
 
@@ -1451,29 +1536,9 @@ async fn search(
 
 async fn force_rebuild(State(state): State<Arc<AppState>>) -> ApiResult<serde_json::Value> {
     ensure_global_leader(&state)?;
-    let partitions: Vec<Arc<PartitionRuntime>> = state.partitions.values().cloned().collect();
-    tokio::task::spawn_blocking(move || {
-        for partition in partitions {
-            let index = partition
-                .index
-                .read()
-                .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
-            index
-                .force_rebuild()
-                .with_context(|| format!("force rebuild partition {}", partition.partition_id))?;
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .map_err(|err| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("join rebuild task: {err}"),
-        )
-    })
-    .and_then(|result| {
-        result.map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
-    })?;
+    for partition_id in 0..state.topology.partition_count {
+        route_partition_force_rebuild(state.clone(), partition_id).await?;
+    }
 
     Ok(Json(serde_json::json!({"ok": true})))
 }
@@ -1483,31 +1548,13 @@ async fn sync_to_s3(
     Json(req): Json<SyncToS3Request>,
 ) -> ApiResult<SyncToS3Response> {
     ensure_global_leader(&state)?;
-    let partitions: Vec<Arc<PartitionRuntime>> = state.partitions.values().cloned().collect();
-    let moved = tokio::task::spawn_blocking(move || {
-        let mut total = 0usize;
-        for partition in partitions {
-            let index = partition
-                .index
-                .read()
-                .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
-            let moved = index
-                .sync_to_s3(req.max_files_per_shard)
-                .with_context(|| format!("sync partition {}", partition.partition_id))?;
-            total = total.saturating_add(moved);
-        }
-        Ok::<_, anyhow::Error>(total)
-    })
-    .await
-    .map_err(|err| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("join sync task: {err}"),
-        )
-    })
-    .and_then(|result| {
-        result.map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
-    })?;
+    let mut moved = 0usize;
+    for partition_id in 0..state.topology.partition_count {
+        moved = moved.saturating_add(
+            route_partition_sync_to_s3(state.clone(), partition_id, req.max_files_per_shard)
+                .await?,
+        );
+    }
 
     Ok(Json(SyncToS3Response { moved_files: moved }))
 }
@@ -1525,6 +1572,12 @@ async fn apply_mutations(
 
     let mode_arg = req.commit_mode.unwrap_or(CommitModeArg::Durable);
     let grouped = collect_partition_mutations(&state.topology, req.mutations);
+    if grouped.len() > 1 && !req.allow_partial {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "cross-partition mutation batch rejected: would be partial-commit; retry with allow_partial=true if this is intended",
+        ));
+    }
     let mut out = ApplyMutationsResponse {
         applied_upserts: 0,
         applied_deletes: 0,
@@ -1556,8 +1609,10 @@ async fn apply_mutations(
 
 async fn apply_partition_mutations_internal(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<InternalPartitionMutationsRequest>,
 ) -> ApiResult<ApplyMutationsResponse> {
+    ensure_internal_auth(&state, &headers)?;
     if req.mutations.is_empty() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -1570,8 +1625,10 @@ async fn apply_partition_mutations_internal(
 
 async fn partition_search_internal(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<InternalPartitionSearchRequest>,
 ) -> ApiResult<SearchResponse> {
+    ensure_internal_auth(&state, &headers)?;
     if req.k == 0 {
         return Err(api_error(StatusCode::BAD_REQUEST, "k must be > 0"));
     }
@@ -1581,8 +1638,104 @@ async fn partition_search_internal(
             "query must not be empty",
         ));
     }
-    let neighbors = search_partition_local(state, req.partition_id, req.query, req.k, true).await?;
+    let neighbors =
+        search_partition_local(state, req.partition_id, req.query, req.k, false).await?;
     Ok(Json(SearchResponse { neighbors }))
+}
+
+async fn force_rebuild_partition_local(
+    state: Arc<AppState>,
+    partition_id: u32,
+    require_leader: bool,
+) -> Result<(), ApiError> {
+    let partition = local_partition_state(&state, partition_id)?;
+    if require_leader && !partition.leader.is_leader() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "partition {} maintenance rejected: this node is not leader",
+                partition_id
+            ),
+        ));
+    }
+    let index = partition.index.clone();
+    tokio::task::spawn_blocking(move || {
+        let index = index
+            .read()
+            .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
+        index
+            .force_rebuild()
+            .with_context(|| format!("force rebuild partition {}", partition_id))
+    })
+    .await
+    .map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("join rebuild task partition {}: {err}", partition_id),
+        )
+    })
+    .and_then(|result| {
+        result.map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+    })?;
+    Ok(())
+}
+
+async fn sync_partition_to_s3_local(
+    state: Arc<AppState>,
+    partition_id: u32,
+    max_files_per_shard: Option<usize>,
+    require_leader: bool,
+) -> Result<usize, ApiError> {
+    let partition = local_partition_state(&state, partition_id)?;
+    if require_leader && !partition.leader.is_leader() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "partition {} maintenance rejected: this node is not leader",
+                partition_id
+            ),
+        ));
+    }
+    let index = partition.index.clone();
+    tokio::task::spawn_blocking(move || {
+        let index = index
+            .read()
+            .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
+        index
+            .sync_to_s3(max_files_per_shard)
+            .with_context(|| format!("sync partition {}", partition_id))
+    })
+    .await
+    .map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("join sync task partition {}: {err}", partition_id),
+        )
+    })
+    .and_then(|result| {
+        result.map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+    })
+}
+
+async fn partition_force_rebuild_internal(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<InternalPartitionRequest>,
+) -> ApiResult<serde_json::Value> {
+    ensure_internal_auth(&state, &headers)?;
+    force_rebuild_partition_local(state, req.partition_id, true).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn partition_sync_to_s3_internal(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<InternalPartitionSyncRequest>,
+) -> ApiResult<SyncToS3Response> {
+    ensure_internal_auth(&state, &headers)?;
+    let moved =
+        sync_partition_to_s3_local(state, req.partition_id, req.max_files_per_shard, true).await?;
+    Ok(Json(SyncToS3Response { moved_files: moved }))
 }
 
 async fn parse_remote_error(response: reqwest::Response) -> (StatusCode, String) {
@@ -1604,20 +1757,20 @@ async fn call_remote_partition_mutations(
     request: &InternalPartitionMutationsRequest,
 ) -> Result<ApplyMutationsResponse, (StatusCode, String)> {
     let url = join_base_url(endpoint, "/v1/internal/partition-mutations");
-    let response = state
+    let mut request_builder = state
         .http
         .post(url.clone())
         .timeout(state.replication_timeout)
-        .header(CONTENT_TYPE, "application/json")
-        .json(request)
-        .send()
-        .await
-        .map_err(|err| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("request to {} failed: {}", url, err),
-            )
-        })?;
+        .header(CONTENT_TYPE, "application/json");
+    if let Some(token) = &state.internal_auth_token {
+        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token.clone());
+    }
+    let response = request_builder.json(request).send().await.map_err(|err| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("request to {} failed: {}", url, err),
+        )
+    })?;
     if !response.status().is_success() {
         return Err(parse_remote_error(response).await);
     }
@@ -1638,24 +1791,81 @@ async fn call_remote_partition_search(
     request: &InternalPartitionSearchRequest,
 ) -> Result<SearchResponse, (StatusCode, String)> {
     let url = join_base_url(endpoint, "/v1/internal/partition-search");
-    let response = state
+    let mut request_builder = state
         .http
         .post(url.clone())
         .timeout(state.replication_timeout)
-        .header(CONTENT_TYPE, "application/json")
-        .json(request)
-        .send()
-        .await
-        .map_err(|err| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("request to {} failed: {}", url, err),
-            )
-        })?;
+        .header(CONTENT_TYPE, "application/json");
+    if let Some(token) = &state.internal_auth_token {
+        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token.clone());
+    }
+    let response = request_builder.json(request).send().await.map_err(|err| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("request to {} failed: {}", url, err),
+        )
+    })?;
     if !response.status().is_success() {
         return Err(parse_remote_error(response).await);
     }
     response.json::<SearchResponse>().await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("decode {} response failed: {}", url, err),
+        )
+    })
+}
+
+async fn call_remote_partition_force_rebuild(
+    state: Arc<AppState>,
+    endpoint: &str,
+    request: &InternalPartitionRequest,
+) -> Result<(), (StatusCode, String)> {
+    let url = join_base_url(endpoint, "/v1/internal/partition-force-rebuild");
+    let mut request_builder = state
+        .http
+        .post(url.clone())
+        .timeout(state.replication_timeout)
+        .header(CONTENT_TYPE, "application/json");
+    if let Some(token) = &state.internal_auth_token {
+        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token.clone());
+    }
+    let response = request_builder.json(request).send().await.map_err(|err| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("request to {} failed: {}", url, err),
+        )
+    })?;
+    if !response.status().is_success() {
+        return Err(parse_remote_error(response).await);
+    }
+    Ok(())
+}
+
+async fn call_remote_partition_sync_to_s3(
+    state: Arc<AppState>,
+    endpoint: &str,
+    request: &InternalPartitionSyncRequest,
+) -> Result<SyncToS3Response, (StatusCode, String)> {
+    let url = join_base_url(endpoint, "/v1/internal/partition-sync-to-s3");
+    let mut request_builder = state
+        .http
+        .post(url.clone())
+        .timeout(state.replication_timeout)
+        .header(CONTENT_TYPE, "application/json");
+    if let Some(token) = &state.internal_auth_token {
+        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token.clone());
+    }
+    let response = request_builder.json(request).send().await.map_err(|err| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("request to {} failed: {}", url, err),
+        )
+    })?;
+    if !response.status().is_success() {
+        return Err(parse_remote_error(response).await);
+    }
+    response.json::<SyncToS3Response>().await.map_err(|err| {
         (
             StatusCode::BAD_GATEWAY,
             format!("decode {} response failed: {}", url, err),
@@ -1673,7 +1883,7 @@ async fn route_partition_search(
     let mut failures = Vec::new();
     for endpoint in endpoints {
         if endpoint == state.self_url {
-            match search_partition_local(state.clone(), partition_id, query.clone(), k, true).await
+            match search_partition_local(state.clone(), partition_id, query.clone(), k, false).await
             {
                 Ok(neighbors) => {
                     mark_partition_preferred_endpoint(&state, partition_id, endpoint);
@@ -1716,6 +1926,117 @@ async fn route_partition_search(
         StatusCode::SERVICE_UNAVAILABLE,
         format!(
             "partition {} has no reachable leader for search: {}",
+            partition_id,
+            failures.join(" | ")
+        ),
+    ))
+}
+
+async fn route_partition_force_rebuild(
+    state: Arc<AppState>,
+    partition_id: u32,
+) -> Result<(), ApiError> {
+    let endpoints = ordered_partition_endpoints(&state, partition_id)?;
+    let mut failures = Vec::new();
+    for endpoint in endpoints {
+        if endpoint == state.self_url {
+            match force_rebuild_partition_local(state.clone(), partition_id, true).await {
+                Ok(()) => {
+                    mark_partition_preferred_endpoint(&state, partition_id, endpoint);
+                    return Ok(());
+                }
+                Err(err) if is_not_leader_api_error(&err) => {
+                    failures.push(err.1.error.clone());
+                }
+                Err(err) => return Err(err),
+            }
+            continue;
+        }
+
+        let request = InternalPartitionRequest { partition_id };
+        match call_remote_partition_force_rebuild(state.clone(), endpoint.as_str(), &request).await
+        {
+            Ok(()) => {
+                mark_partition_preferred_endpoint(&state, partition_id, endpoint);
+                return Ok(());
+            }
+            Err((status, message))
+                if status == StatusCode::CONFLICT && is_not_leader_message(message.as_str()) =>
+            {
+                failures.push(message);
+            }
+            Err((status, message))
+                if status.is_server_error()
+                    || status == StatusCode::REQUEST_TIMEOUT
+                    || status == StatusCode::TOO_MANY_REQUESTS =>
+            {
+                failures.push(message);
+            }
+            Err((status, message)) => return Err(api_error(status, message)),
+        }
+    }
+    Err(api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "partition {} has no reachable leader for force rebuild: {}",
+            partition_id,
+            failures.join(" | ")
+        ),
+    ))
+}
+
+async fn route_partition_sync_to_s3(
+    state: Arc<AppState>,
+    partition_id: u32,
+    max_files_per_shard: Option<usize>,
+) -> Result<usize, ApiError> {
+    let endpoints = ordered_partition_endpoints(&state, partition_id)?;
+    let mut failures = Vec::new();
+    for endpoint in endpoints {
+        if endpoint == state.self_url {
+            match sync_partition_to_s3_local(state.clone(), partition_id, max_files_per_shard, true)
+                .await
+            {
+                Ok(response) => {
+                    mark_partition_preferred_endpoint(&state, partition_id, endpoint);
+                    return Ok(response);
+                }
+                Err(err) if is_not_leader_api_error(&err) => {
+                    failures.push(err.1.error.clone());
+                }
+                Err(err) => return Err(err),
+            }
+            continue;
+        }
+
+        let request = InternalPartitionSyncRequest {
+            partition_id,
+            max_files_per_shard,
+        };
+        match call_remote_partition_sync_to_s3(state.clone(), endpoint.as_str(), &request).await {
+            Ok(response) => {
+                mark_partition_preferred_endpoint(&state, partition_id, endpoint);
+                return Ok(response.moved_files);
+            }
+            Err((status, message))
+                if status == StatusCode::CONFLICT && is_not_leader_message(message.as_str()) =>
+            {
+                failures.push(message);
+            }
+            Err((status, message))
+                if status.is_server_error()
+                    || status == StatusCode::REQUEST_TIMEOUT
+                    || status == StatusCode::TOO_MANY_REQUESTS =>
+            {
+                failures.push(message);
+            }
+            Err((status, message)) => return Err(api_error(status, message)),
+        }
+    }
+    Err(api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "partition {} has no reachable leader for sync_to_s3: {}",
             partition_id,
             failures.join(" | ")
         ),
@@ -2006,8 +2327,10 @@ fn replication_reject_error(error: String, journal: &ReplicationJournal) -> ApiE
 
 async fn apply_replication(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApplyMutationsResponse> {
+    ensure_internal_auth(&state, &headers)?;
     let payload = decode_replication_payload(body.as_ref()).map_err(|err| {
         api_error(
             StatusCode::BAD_REQUEST,
@@ -2133,8 +2456,10 @@ async fn apply_replication(
 
 async fn install_snapshot(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<SnapshotInstallResponse> {
+    ensure_internal_auth(&state, &headers)?;
     let payload = decode_snapshot_payload(body.as_ref()).map_err(|err| {
         api_error(
             StatusCode::BAD_REQUEST,
@@ -2220,8 +2545,10 @@ async fn install_snapshot(
 
 async fn replication_log_range(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<LogRangeRequest>,
 ) -> Result<Bytes, ApiError> {
+    ensure_internal_auth(&state, &headers)?;
     if req.max_entries == 0 {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -2371,12 +2698,17 @@ async fn send_replication_payload(
     client: &Client,
     endpoint: &str,
     timeout: Duration,
+    internal_auth_token: Option<&str>,
     payload: Bytes,
 ) -> Result<(), ReplicationSendError> {
-    let response = client
+    let mut request_builder = client
         .post(endpoint)
         .timeout(timeout)
-        .header(CONTENT_TYPE, "application/octet-stream")
+        .header(CONTENT_TYPE, "application/octet-stream");
+    if let Some(token) = internal_auth_token {
+        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token);
+    }
+    let response = request_builder
         .body(payload)
         .send()
         .await
@@ -2441,11 +2773,15 @@ async fn install_snapshot_on_peer(
 ) -> Result<(), String> {
     let endpoint = join_base_url(peer, "/v1/internal/install-snapshot");
     let payload = build_snapshot_payload(partition, applied_seq, leader_term).await?;
-    let response = state
+    let mut request_builder = state
         .http
         .post(&endpoint)
         .timeout(state.replication_snapshot_timeout)
-        .header(CONTENT_TYPE, "application/octet-stream")
+        .header(CONTENT_TYPE, "application/octet-stream");
+    if let Some(token) = state.internal_auth_token.as_deref() {
+        request_builder = request_builder.header(INTERNAL_AUTH_HEADER, token);
+    }
+    let response = request_builder
         .body(payload)
         .send()
         .await
@@ -2547,6 +2883,7 @@ async fn catch_up_peer(
                 &state.http,
                 endpoint,
                 state.replication_timeout,
+                state.internal_auth_token.as_deref(),
                 raw.clone(),
             )
             .await
@@ -2593,7 +2930,14 @@ async fn replicate_to_peer(
     payload: Bytes,
 ) -> Result<(), String> {
     let endpoint = join_base_url(&peer, "/v1/internal/replicate");
-    match send_replication_payload(&state.http, &endpoint, state.replication_timeout, payload).await
+    match send_replication_payload(
+        &state.http,
+        &endpoint,
+        state.replication_timeout,
+        state.internal_auth_token.as_deref(),
+        payload,
+    )
+    .await
     {
         Ok(()) => Ok(()),
         Err(ReplicationSendError::Reject(reject)) => {
@@ -2788,6 +3132,111 @@ fn partition_election_key(base_election_key: &str, partition_id: u32) -> String 
     )
 }
 
+fn topology_key(base_election_key: &str) -> String {
+    format!(
+        "{}/topology/current",
+        base_election_key.trim_end_matches('/')
+    )
+}
+
+async fn ensure_cluster_topology(
+    cfg: &EtcdElectionConfig,
+    key: &str,
+    candidate: &ClusterTopology,
+) -> anyhow::Result<ClusterTopology> {
+    let options = {
+        let mut opts = ConnectOptions::new()
+            .with_require_leader(true)
+            .with_connect_timeout(cfg.connect_timeout)
+            .with_timeout(cfg.request_timeout)
+            .with_keep_alive(Duration::from_secs(2), Duration::from_secs(2))
+            .with_keep_alive_while_idle(true);
+        if let (Some(username), Some(password)) = (&cfg.username, &cfg.password) {
+            opts = opts.with_user(username.clone(), password.clone());
+        }
+        opts
+    };
+
+    let mut client = EtcdClient::connect(cfg.endpoints.clone(), Some(options))
+        .await
+        .with_context(|| format!("connect to etcd endpoints {}", cfg.endpoints.join(",")))?;
+
+    let parse_existing = |raw: &[u8]| -> anyhow::Result<ClusterTopology> {
+        let payload: ClusterTopologyEnvelope =
+            serde_json::from_slice(raw).context("decode etcd topology payload")?;
+        if payload.schema_version != CLUSTER_TOPOLOGY_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported topology schema version {}, expected {}",
+                payload.schema_version,
+                CLUSTER_TOPOLOGY_SCHEMA_VERSION
+            );
+        }
+        payload
+            .topology
+            .validate()
+            .context("validate stored topology")?;
+        Ok(payload.topology)
+    };
+
+    let validate_compatible = |stored: &ClusterTopology| -> anyhow::Result<()> {
+        if stored.partition_count != candidate.partition_count {
+            anyhow::bail!(
+                "topology partition_count mismatch: stored={} candidate={}",
+                stored.partition_count,
+                candidate.partition_count
+            );
+        }
+        if stored.replication_factor != candidate.replication_factor {
+            anyhow::bail!(
+                "topology replication_factor mismatch: stored={} candidate={}",
+                stored.replication_factor,
+                candidate.replication_factor
+            );
+        }
+        if stored.placements != candidate.placements {
+            anyhow::bail!("topology placement mismatch with stored topology");
+        }
+        Ok(())
+    };
+
+    let existing = client
+        .get(key.as_bytes(), None)
+        .await
+        .with_context(|| format!("read topology key {}", key))?;
+    if let Some(kv) = existing.kvs().first() {
+        let stored = parse_existing(kv.value())?;
+        validate_compatible(&stored)?;
+        return Ok(stored);
+    }
+
+    let payload = ClusterTopologyEnvelope {
+        schema_version: CLUSTER_TOPOLOGY_SCHEMA_VERSION,
+        topology: candidate.clone(),
+    };
+    let encoded = serde_json::to_vec(&payload).context("encode topology payload")?;
+    let txn = Txn::new()
+        .when([Compare::version(key.as_bytes(), CompareOp::Equal, 0)])
+        .and_then([TxnOp::put(key.as_bytes(), encoded, None)]);
+    let response = client
+        .txn(txn)
+        .await
+        .with_context(|| format!("create topology key {}", key))?;
+    if response.succeeded() {
+        return Ok(candidate.clone());
+    }
+
+    let stored = client
+        .get(key.as_bytes(), None)
+        .await
+        .with_context(|| format!("read topology key {}", key))?;
+    let Some(kv) = stored.kvs().first() else {
+        anyhow::bail!("topology key {} disappeared after create race", key);
+    };
+    let parsed = parse_existing(kv.value())?;
+    validate_compatible(&parsed)?;
+    Ok(parsed)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -2803,6 +3252,11 @@ async fn main() -> anyhow::Result<()> {
     if args.diskmeta_probe_multiplier == 0 {
         anyhow::bail!("--diskmeta-probe-multiplier must be > 0");
     }
+    let internal_auth_token = args
+        .internal_auth_token
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let self_url = canonicalize_http_base_url(args.self_url.as_str(), "--self-url")?;
     let mut replica_urls = Vec::with_capacity(args.replica_urls.len());
     for replica in &args.replica_urls {
@@ -2814,15 +3268,12 @@ async fn main() -> anyhow::Result<()> {
     } else {
         args.replication_factor
     };
-    let topology = Arc::new(
-        ClusterTopology::build_deterministic(
-            1,
-            args.logical_partitions as u32,
-            replication_factor as u32,
-            &cluster_endpoints,
-        )
-        .context("build deterministic cluster topology")?,
-    );
+    if cluster_endpoints.len() > 1 && internal_auth_token.is_none() {
+        anyhow::bail!(
+            "--internal-auth-token is required for multi-node deployments (cluster nodes={})",
+            cluster_endpoints.len()
+        );
+    }
 
     let global_election_cfg = EtcdElectionConfig {
         endpoints: args.etcd_endpoints.clone(),
@@ -2836,6 +3287,23 @@ async fn main() -> anyhow::Result<()> {
         username: args.etcd_username.clone(),
         password: args.etcd_password.clone(),
     };
+    let candidate_topology = ClusterTopology::build_deterministic(
+        1,
+        args.logical_partitions as u32,
+        replication_factor as u32,
+        &cluster_endpoints,
+    )
+    .context("build deterministic cluster topology")?;
+    let topology_store_key = topology_key(&args.etcd_election_key);
+    let topology = Arc::new(
+        ensure_cluster_topology(
+            &global_election_cfg,
+            topology_store_key.as_str(),
+            &candidate_topology,
+        )
+        .await
+        .context("ensure cluster topology in etcd")?,
+    );
     let leader = Arc::new(
         EtcdLeaderElector::new(args.node_id.clone(), global_election_cfg)
             .context("init etcd global election")?,
@@ -2907,6 +3375,7 @@ async fn main() -> anyhow::Result<()> {
         ),
         replication_catchup_batch: args.replication_catchup_batch,
         leader,
+        internal_auth_token,
         http,
     });
 
@@ -2922,6 +3391,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/internal/partition-search",
             post(partition_search_internal),
+        )
+        .route(
+            "/v1/internal/partition-force-rebuild",
+            post(partition_force_rebuild_internal),
+        )
+        .route(
+            "/v1/internal/partition-sync-to-s3",
+            post(partition_sync_to_s3_internal),
         )
         .route("/v1/internal/replicate", post(apply_replication))
         .route("/v1/internal/install-snapshot", post(install_snapshot))

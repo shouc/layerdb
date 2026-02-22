@@ -32,7 +32,7 @@ impl SpFreshLayerDbIndex {
         query: &[f32],
     ) -> anyhow::Result<DistanceLoadResult> {
         let mut out = Vec::with_capacity(ids.len());
-        let mut cache_misses = Vec::new();
+        let mut cache_misses = Vec::with_capacity(ids.len());
         {
             let cache = lock_mutex(vector_cache);
             for id in ids.iter().copied() {
@@ -54,8 +54,8 @@ impl SpFreshLayerDbIndex {
             missing
         };
 
-        let mut missing = Vec::new();
-        let mut fetched_for_cache = Vec::new();
+        let mut missing = Vec::with_capacity(unresolved.len());
+        let mut fetched_for_cache = Vec::with_capacity(unresolved.len());
         if !unresolved.is_empty() {
             let keys: Vec<Bytes> = unresolved
                 .iter()

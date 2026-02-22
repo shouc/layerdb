@@ -368,3 +368,29 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=0.8606`
 - `search_qps_ratio=3.4840`
+
+## Step 16 (`distance-load-buffer-prealloc`)
+
+Change:
+- Preallocated internal vectors in `load_distances_for_ids(...)`:
+  - `cache_misses` now starts at `ids.len()`,
+  - `missing` and `fetched_for_cache` now start at `unresolved.len()`.
+- Keeps behavior identical while reducing allocator churn in repeated diskmeta search fallback paths.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step17-spfresh.json`, `target/vectordb-step17-lancedb.json`.
+
+SPFresh:
+- `update_qps=120025.51`
+- `search_qps=1875.23`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=110939.57`
+- `search_qps=472.58`
+- `recall_at_k=0.4785`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.0819`
+- `search_qps_ratio=3.9680`

@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::linalg::squared_l2;
@@ -17,12 +16,12 @@ fn default_zero_u64() -> u64 {
     0
 }
 
-fn default_empty_posting_to_coarse() -> HashMap<usize, usize> {
-    HashMap::new()
+fn default_empty_posting_to_coarse() -> FxHashMap<usize, usize> {
+    FxHashMap::default()
 }
 
-fn default_empty_coarse_to_postings() -> HashMap<usize, Vec<usize>> {
-    HashMap::new()
+fn default_empty_coarse_to_postings() -> FxHashMap<usize, Vec<usize>> {
+    FxHashMap::default()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,15 +34,15 @@ pub(crate) struct DiskPosting {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SpFreshDiskMetaIndex {
     cfg: SpFreshConfig,
-    postings: HashMap<usize, DiskPosting>,
+    postings: FxHashMap<usize, DiskPosting>,
     next_posting_id: usize,
     total_rows: u64,
     #[serde(default)]
     coarse_centroids: Vec<Vec<f32>>,
     #[serde(default = "default_empty_posting_to_coarse")]
-    posting_to_coarse: HashMap<usize, usize>,
+    posting_to_coarse: FxHashMap<usize, usize>,
     #[serde(default = "default_empty_coarse_to_postings")]
-    coarse_to_postings: HashMap<usize, Vec<usize>>,
+    coarse_to_postings: FxHashMap<usize, Vec<usize>>,
     #[serde(default = "default_zero_u64")]
     mutations_since_coarse_refresh: u64,
     #[serde(default = "default_coarse_refresh_interval")]
@@ -54,34 +53,35 @@ impl SpFreshDiskMetaIndex {
     pub(crate) fn build_with_assignments(
         cfg: SpFreshConfig,
         rows: &[VectorRecord],
-    ) -> (Self, HashMap<u64, usize>) {
+    ) -> (Self, FxHashMap<u64, usize>) {
         Self::build_from_rows_with_assignments(cfg, rows, None)
     }
 
     pub(crate) fn build_from_rows_with_assignments(
         cfg: SpFreshConfig,
         rows: &[VectorRecord],
-        known_assignments: Option<&HashMap<u64, usize>>,
-    ) -> (Self, HashMap<u64, usize>) {
+        known_assignments: Option<&FxHashMap<u64, usize>>,
+    ) -> (Self, FxHashMap<u64, usize>) {
         let mut out = Self {
             cfg,
-            postings: HashMap::new(),
+            postings: FxHashMap::default(),
             next_posting_id: 0,
             total_rows: 0,
             coarse_centroids: Vec::new(),
-            posting_to_coarse: HashMap::new(),
-            coarse_to_postings: HashMap::new(),
+            posting_to_coarse: FxHashMap::default(),
+            coarse_to_postings: FxHashMap::default(),
             mutations_since_coarse_refresh: 0,
             coarse_refresh_interval: default_coarse_refresh_interval(),
         };
         if rows.is_empty() {
-            return (out, HashMap::new());
+            return (out, FxHashMap::default());
         }
 
         if known_assignments.is_none() {
             let built = SpFreshOffHeapIndex::build(out.cfg.clone(), rows);
             let snapshot = built.export_metadata();
-            let mut postings = HashMap::with_capacity(snapshot.postings.len());
+            let mut postings =
+                FxHashMap::with_capacity_and_hasher(snapshot.postings.len(), Default::default());
             for posting in snapshot.postings {
                 postings.insert(
                     posting.id,
@@ -96,7 +96,14 @@ impl SpFreshDiskMetaIndex {
             out.next_posting_id = snapshot.next_posting_id;
             out.total_rows = snapshot.vector_posting.len() as u64;
             out.rebuild_coarse_index();
-            return (out, snapshot.vector_posting);
+            let mut assignments = FxHashMap::with_capacity_and_hasher(
+                snapshot.vector_posting.len(),
+                Default::default(),
+            );
+            for (id, posting_id) in snapshot.vector_posting {
+                assignments.insert(id, posting_id);
+            }
+            return (out, assignments);
         }
 
         let vectors: Vec<Vec<f32>> = rows.iter().map(|r| r.values.clone()).collect();
@@ -106,9 +113,9 @@ impl SpFreshDiskMetaIndex {
             out.alloc_posting(centroid);
         }
 
-        let mut assigns = HashMap::with_capacity(rows.len());
-        let mut sums: HashMap<usize, Vec<f64>> = HashMap::new();
-        let mut counts: HashMap<usize, u64> = HashMap::new();
+        let mut assigns = FxHashMap::with_capacity_and_hasher(rows.len(), Default::default());
+        let mut sums: FxHashMap<usize, Vec<f64>> = FxHashMap::default();
+        let mut counts: FxHashMap<usize, u64> = FxHashMap::default();
         for row in rows {
             let posting_id = if let Some(assigns) = known_assignments {
                 if let Some(pid) = assigns.get(&row.id).copied() {

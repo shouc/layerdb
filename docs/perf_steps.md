@@ -674,3 +674,34 @@ LanceDB (run2):
 SPFresh/LanceDB ratio (median across run1/run2):
 - `update_qps_ratio=2.0804`
 - `search_qps_ratio=4.7138`
+
+## Step 27 (`diskmeta-index-fxhash-maps`)
+
+Change:
+- Switched `SpFreshDiskMetaIndex` internal maps to `FxHashMap`:
+  - `postings`
+  - `posting_to_coarse`
+  - `coarse_to_postings`
+  - row-to-posting assignment maps returned by build helpers
+- Switched LayerDB helpers using dense id->value maps to `FxHashMap`:
+  - `load_rows_with_posting_assignments(...)`
+  - `load_posting_members(...)` latest-event map
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step28-spfresh.json`,
+  `target/vectordb-step28-lancedb.json`.
+
+SPFresh:
+- `update_qps=183508.68`
+- `search_qps=2718.87`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=117679.66`
+- `search_qps=766.86`
+- `recall_at_k=0.4690`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.5594`
+- `search_qps_ratio=3.5455`

@@ -5,8 +5,8 @@ use std::path::Path;
 use anyhow::Context;
 use bytes::Bytes;
 use layerdb::{Db, Range, ReadOptions, WriteOptions};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::types::VectorRecord;
 
@@ -235,9 +235,9 @@ pub(crate) fn load_row(db: &Db, generation: u64, id: u64) -> anyhow::Result<Opti
 pub(crate) fn load_rows_with_posting_assignments(
     db: &Db,
     generation: u64,
-) -> anyhow::Result<(Vec<VectorRecord>, HashMap<u64, usize>)> {
+) -> anyhow::Result<(Vec<VectorRecord>, FxHashMap<u64, usize>)> {
     let mut rows = Vec::new();
-    let mut assignments = HashMap::new();
+    let mut assignments = FxHashMap::default();
     let prefix = vector_prefix(generation);
     let prefix_bytes = prefix.as_bytes().to_vec();
     let end = prefix_exclusive_end(&prefix_bytes)?;
@@ -802,7 +802,7 @@ pub(crate) fn load_posting_members(
     generation: u64,
     posting_id: usize,
 ) -> anyhow::Result<PostingMembersLoadResult> {
-    let mut latest = HashMap::<u64, PostingMember>::new();
+    let mut latest = FxHashMap::<u64, PostingMember>::default();
     let mut scanned_events = 0usize;
     let prefix = posting_members_prefix(generation, posting_id);
     let prefix_bytes = prefix.as_bytes().to_vec();

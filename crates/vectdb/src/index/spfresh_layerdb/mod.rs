@@ -58,6 +58,25 @@ use vector_blocks::VectorBlockStore;
 pub use config::{SpFreshLayerDbConfig, SpFreshMemoryMode};
 pub use stats::SpFreshLayerDbStats;
 
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    pub fn decode_wal_entry(raw: &[u8]) {
+        let _ = super::storage::decode_wal_entry(raw);
+    }
+
+    pub fn decode_vector_row_with_posting(raw: &[u8]) {
+        let _ = super::storage::decode_vector_row_with_posting(raw);
+    }
+
+    pub fn decode_posting_members_snapshot(raw: &[u8]) {
+        let _ = super::storage::decode_posting_members_snapshot_for_fuzz(raw);
+    }
+
+    pub fn decode_posting_member_event(raw: &[u8]) {
+        let _ = super::storage::decode_posting_member_event_for_fuzz(raw);
+    }
+}
+
 #[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
 pub enum VectorMutation {
     Upsert(VectorRecord),

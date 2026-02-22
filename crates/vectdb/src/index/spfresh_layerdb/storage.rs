@@ -1383,6 +1383,12 @@ fn decode_posting_members_snapshot(raw: &[u8]) -> anyhow::Result<PostingMembersS
     })
 }
 
+#[cfg(feature = "fuzzing")]
+pub(super) fn decode_posting_members_snapshot_for_fuzz(raw: &[u8]) -> anyhow::Result<()> {
+    let _ = decode_posting_members_snapshot(raw)?;
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn posting_member_event_upsert_value_with_residual(
     id: u64,
@@ -1516,6 +1522,12 @@ fn decode_posting_member_event(raw: &[u8]) -> anyhow::Result<DecodedPostingMembe
         residual_scale: Some(scale),
         residual_code: Some(code),
     })
+}
+
+#[cfg(feature = "fuzzing")]
+pub(super) fn decode_posting_member_event_for_fuzz(raw: &[u8]) -> anyhow::Result<()> {
+    let _ = decode_posting_member_event(raw)?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]

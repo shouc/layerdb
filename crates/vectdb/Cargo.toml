@@ -3,6 +3,11 @@ name = "vectdb"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+fuzzing = []
+lancedb-bench = ["dep:lancedb"]
+
 [dependencies]
 anyhow = "1"
 arc-swap = "1.7"
@@ -15,7 +20,7 @@ clap = { version = "4.5", features = ["derive"] }
 crc32fast = "1"
 etcd-client = "0.18"
 futures = "0.3"
-lancedb = "0.26.2"
+lancedb = { version = "0.26.2", optional = true }
 rand = "0.8"
 rayon = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -31,6 +36,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 [[bin]]
 name = "bench_lancedb"
 path = "../../bins/bench_lancedb.rs"
+required-features = ["lancedb-bench"]
 
 [[bin]]
 name = "bench_spfresh_sharded"

@@ -1,0 +1,59 @@
+[package]
+name = "layerdb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+layerdb = { path = "../crates/layerdb" }
+vectdb = { path = "../crates/vectdb", default-features = false, features = ["fuzzing"] }
+
+[[bin]]
+name = "layerdb_internal_key_decode"
+path = "fuzz_targets/layerdb_internal_key_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "layerdb_table_root_decode"
+path = "fuzz_targets/layerdb_table_root_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vectdb_spfresh_wal_decode"
+path = "fuzz_targets/vectdb_spfresh_wal_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vectdb_spfresh_vector_row_decode"
+path = "fuzz_targets/vectdb_spfresh_vector_row_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vectdb_spfresh_posting_members_snapshot_decode"
+path = "fuzz_targets/vectdb_spfresh_posting_members_snapshot_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vectdb_spfresh_posting_member_event_decode"
+path = "fuzz_targets/vectdb_spfresh_posting_member_event_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

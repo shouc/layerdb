@@ -506,3 +506,29 @@ LanceDB (run1):
 SPFresh/LanceDB ratio (median across run1/run2):
 - `update_qps_ratio=1.5776`
 - `search_qps_ratio=3.1615`
+
+## Step 21 (`dirty-id-batch-marking`)
+
+Change:
+- Added `mark_dirty_batch(&[u64])` to update dirty-id state under one mutex acquisition.
+- Switched non-diskmeta upsert path to batch dirty-id marking after mutation apply.
+- Switched non-diskmeta delete path to collect deleted ids and batch-mark once.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step22-spfresh.json`,
+  `target/vectordb-step22-lancedb.json`.
+
+SPFresh:
+- `update_qps=227745.04`
+- `search_qps=2748.98`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=127299.00`
+- `search_qps=851.50`
+- `recall_at_k=0.4550`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.7891`
+- `search_qps_ratio=3.2284`

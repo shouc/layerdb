@@ -603,9 +603,7 @@ impl SpFreshLayerDbIndex {
                 cache.put(id, vector);
             }
         }
-        for id in touched_ids {
-            self.mark_dirty(id);
-        }
+        self.mark_dirty_batch(touched_ids.as_slice());
         for _ in 0..mutation_count {
             self.stats.inc_upserts();
         }
@@ -783,6 +781,7 @@ impl SpFreshLayerDbIndex {
         }
 
         let mut deleted = 0usize;
+        let mut deleted_ids = Vec::new();
         {
             let mut index = lock_write(&self.index);
             for id in &mutations {
@@ -806,10 +805,11 @@ impl SpFreshLayerDbIndex {
                 };
                 if was_deleted {
                     deleted += 1;
-                    self.mark_dirty(*id);
+                    deleted_ids.push(*id);
                 }
             }
         }
+        self.mark_dirty_batch(deleted_ids.as_slice());
         {
             let mut cache = lock_mutex(&self.vector_cache);
             for id in &mutations {

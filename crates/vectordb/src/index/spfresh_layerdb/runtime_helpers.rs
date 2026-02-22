@@ -382,9 +382,14 @@ impl SpFreshLayerDbIndex {
         }
     }
 
-    pub(super) fn mark_dirty(&self, id: u64) {
+    pub(super) fn mark_dirty_batch(&self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
         let mut dirty = lock_mutex(&self.dirty_ids);
-        dirty.insert(id);
+        for id in ids {
+            dirty.insert(*id);
+        }
         self.pending_ops.store(dirty.len(), Ordering::Relaxed);
     }
 

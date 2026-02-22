@@ -439,8 +439,6 @@ impl SpFreshDiskMetaIndex {
         if out.is_empty() {
             self.postings.keys().copied().collect()
         } else {
-            out.sort_unstable();
-            out.dedup();
             out
         }
     }

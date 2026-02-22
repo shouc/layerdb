@@ -21,6 +21,7 @@ use super::config::{
 const VECTOR_ROW_BIN_TAG: &[u8] = b"vr3";
 const VECTOR_ROW_FLAG_DELETED: u8 = 1 << 0;
 const VECTOR_ROW_FLAG_HAS_POSTING: u8 = 1 << 1;
+const META_BIN_TAG: &[u8] = b"sm1";
 
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedVectorRow {
@@ -518,6 +519,61 @@ pub(crate) fn ensure_wal_exists(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn encode_spfresh_metadata(meta: &SpFreshPersistedMeta) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(META_BIN_TAG.len() + 4 + 8 * 8);
+    out.extend_from_slice(META_BIN_TAG);
+    out.extend_from_slice(&meta.schema_version.to_le_bytes());
+    for (field, value) in [
+        ("dim", meta.dim),
+        ("initial_postings", meta.initial_postings),
+        ("split_limit", meta.split_limit),
+        ("merge_limit", meta.merge_limit),
+        ("reassign_range", meta.reassign_range),
+        ("nprobe", meta.nprobe),
+        ("diskmeta_probe_multiplier", meta.diskmeta_probe_multiplier),
+        ("kmeans_iters", meta.kmeans_iters),
+    ] {
+        let encoded = u64::try_from(value)
+            .with_context(|| format!("spfresh metadata {field} does not fit u64"))?;
+        out.extend_from_slice(&encoded.to_le_bytes());
+    }
+    Ok(out)
+}
+
+fn decode_spfresh_metadata(raw: &[u8]) -> anyhow::Result<SpFreshPersistedMeta> {
+    if !raw.starts_with(META_BIN_TAG) {
+        anyhow::bail!("unsupported spfresh metadata tag");
+    }
+    let mut cursor = META_BIN_TAG.len();
+    let schema_version = read_u32(raw, &mut cursor)?;
+    let mut decode_usize = |field: &str| -> anyhow::Result<usize> {
+        let raw = read_u64(raw, &mut cursor)?;
+        usize::try_from(raw).with_context(|| format!("spfresh metadata {field} overflow"))
+    };
+    let dim = decode_usize("dim")?;
+    let initial_postings = decode_usize("initial_postings")?;
+    let split_limit = decode_usize("split_limit")?;
+    let merge_limit = decode_usize("merge_limit")?;
+    let reassign_range = decode_usize("reassign_range")?;
+    let nprobe = decode_usize("nprobe")?;
+    let diskmeta_probe_multiplier = decode_usize("diskmeta_probe_multiplier")?;
+    let kmeans_iters = decode_usize("kmeans_iters")?;
+    if cursor != raw.len() {
+        anyhow::bail!("spfresh metadata trailing bytes");
+    }
+    Ok(SpFreshPersistedMeta {
+        schema_version,
+        dim,
+        initial_postings,
+        split_limit,
+        merge_limit,
+        reassign_range,
+        nprobe,
+        diskmeta_probe_multiplier,
+        kmeans_iters,
+    })
+}
+
 pub(crate) fn load_metadata(db: &Db) -> anyhow::Result<Option<SpFreshPersistedMeta>> {
     let current = db
         .get(META_CONFIG_KEY, ReadOptions::default())
@@ -525,8 +581,7 @@ pub(crate) fn load_metadata(db: &Db) -> anyhow::Result<Option<SpFreshPersistedMe
     let Some(value) = current else {
         return Ok(None);
     };
-    let meta: SpFreshPersistedMeta =
-        bincode::deserialize(value.as_ref()).context("decode spfresh metadata")?;
+    let meta = decode_spfresh_metadata(value.as_ref()).context("decode spfresh metadata")?;
     Ok(Some(meta))
 }
 
@@ -574,7 +629,7 @@ pub(crate) fn ensure_metadata(db: &Db, cfg: &SpFreshLayerDbConfig) -> anyhow::Re
         return Ok(());
     }
 
-    let bytes = bincode::serialize(&expected).context("encode spfresh metadata")?;
+    let bytes = encode_spfresh_metadata(&expected).context("encode spfresh metadata")?;
     db.put(META_CONFIG_KEY, bytes, WriteOptions { sync: true })
         .context("persist spfresh metadata")?;
     set_active_generation(db, 0, true)?;
@@ -1298,6 +1353,56 @@ mod tests {
         let encoded = encode_u64_fixed(value);
         let decoded = decode_u64_fixed(encoded.as_slice(), "test_u64")?;
         assert_eq!(decoded, value);
+        Ok(())
+    }
+
+    #[test]
+    fn spfresh_metadata_binary_codec_roundtrip() -> anyhow::Result<()> {
+        let expected = SpFreshPersistedMeta {
+            schema_version: META_SCHEMA_VERSION,
+            dim: 64,
+            initial_postings: 128,
+            split_limit: 256,
+            merge_limit: 64,
+            reassign_range: 16,
+            nprobe: 8,
+            diskmeta_probe_multiplier: 4,
+            kmeans_iters: 20,
+        };
+        let encoded = encode_spfresh_metadata(&expected)?;
+        assert!(encoded.starts_with(META_BIN_TAG));
+        let decoded = decode_spfresh_metadata(encoded.as_slice())?;
+        assert_eq!(decoded, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn load_metadata_rejects_corrupt_payload() -> anyhow::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let db = Db::open(dir.path(), layerdb::DbOptions::default())?;
+        db.put(
+            META_CONFIG_KEY,
+            vec![0xaa, 0xbb, 0xcc],
+            WriteOptions { sync: true },
+        )?;
+        let err = load_metadata(&db).expect_err("invalid metadata payload should fail closed");
+        assert!(
+            format!("{err:#}").contains("decode spfresh metadata"),
+            "unexpected error: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_metadata_persists_binary_codec_tag() -> anyhow::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let db = Db::open(dir.path(), layerdb::DbOptions::default())?;
+        let cfg = SpFreshLayerDbConfig::default();
+        ensure_metadata(&db, &cfg)?;
+        let raw = db
+            .get(META_CONFIG_KEY, ReadOptions::default())?
+            .ok_or_else(|| anyhow::anyhow!("metadata missing"))?;
+        assert!(raw.as_ref().starts_with(META_BIN_TAG));
         Ok(())
     }
 

@@ -23,7 +23,7 @@ fn default_diskmeta_probe_multiplier() -> usize {
     1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SpFreshPersistedMeta {
     pub schema_version: u32,
     pub dim: usize,

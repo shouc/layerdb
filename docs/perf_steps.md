@@ -1066,3 +1066,38 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7136`
 - `search_qps_ratio=3.2294`
+
+## Step 43 (`metadata-fixed-binary-codec`)
+
+Change:
+- Replaced spfresh metadata (`META_CONFIG_KEY`) `bincode` payload with fixed binary codec.
+- Added strict decode behavior:
+  - tag check
+  - field overflow checks for `usize` conversions
+  - trailing-bytes rejection
+- Added targeted tests:
+  - `spfresh_metadata_binary_codec_roundtrip`
+  - `load_metadata_rejects_corrupt_payload`
+  - `ensure_metadata_persists_binary_codec_tag`
+
+Impact:
+- Reduces startup metadata decode overhead and allocation churn.
+- Enforces deterministic fail-closed behavior for corrupt metadata payloads.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=191595.34`
+- `search_qps=2801.51`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=124647.81`
+- `search_qps=906.12`
+- `recall_at_k=0.4530`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.5371`
+- `search_qps_ratio=3.0918`

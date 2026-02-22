@@ -135,6 +135,7 @@ impl VectorBlockStore {
         }
 
         let rec_size = record_size(self.dim);
+        let rec_size_u64 = u64::try_from(rec_size).context("vector block record size overflow")?;
         let mut buf = Vec::with_capacity(rec_size.saturating_mul(rows.len()));
         let mut offset = self
             .file
@@ -165,7 +166,7 @@ impl VectorBlockStore {
             }
             self.offsets.insert(*id, offset);
             offset = offset
-                .checked_add(u64::try_from(rec_size).context("vector block record size overflow")?)
+                .checked_add(rec_size_u64)
                 .ok_or_else(|| anyhow::anyhow!("vector block offset overflow"))?;
         }
 
@@ -222,6 +223,7 @@ impl VectorBlockStore {
             return Ok(());
         }
         let rec_size = record_size(self.dim);
+        let tombstone_tail = vec![0u8; rec_size.saturating_sub(17)];
         let mut buf = Vec::with_capacity(rec_size.saturating_mul(ids.len()));
         self.file
             .seek(SeekFrom::End(0))
@@ -230,7 +232,7 @@ impl VectorBlockStore {
             buf.extend_from_slice(&id.to_le_bytes());
             buf.push(VECTOR_BLOCK_TOMBSTONE);
             buf.extend_from_slice(&0u64.to_le_bytes());
-            buf.resize(buf.len().saturating_add(rec_size.saturating_sub(17)), 0);
+            buf.extend_from_slice(tombstone_tail.as_slice());
             self.offsets.remove(id);
         }
         self.file

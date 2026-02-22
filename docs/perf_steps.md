@@ -784,3 +784,30 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7373`
 - `search_qps_ratio=3.2810`
+
+## Step 31 (`vector-block-batch-buffer-trim`)
+
+Change:
+- In `append_upsert_batch_with_posting(...)`, precomputed record-size `u64` once per batch
+  instead of converting each iteration.
+- In `append_delete_batch(...)`, replaced per-record `Vec::resize(..., 0)` with one prebuilt
+  tombstone tail buffer reused across all ids.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step32-spfresh.json`,
+  `target/vectordb-step32-lancedb.json`.
+
+SPFresh:
+- `update_qps=194874.79`
+- `search_qps=2837.18`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=123445.99`
+- `search_qps=564.95`
+- `recall_at_k=0.4810`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.5786`
+- `search_qps_ratio=5.0220`

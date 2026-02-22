@@ -1004,3 +1004,17 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.4982`
 - `search_qps_ratio=2.9948`
+
+## Step 40 (`vector-sidecar-record-crc-v2`)
+
+Change:
+- Upgraded sidecar index format from `vbi1` to `vbi2`.
+- Added per-record CRC32 to sidecar entries (`id`, `flags`, `offset`, `crc`).
+- Replay now validates each record checksum; on mismatch it stops trusting further sidecar tail
+  and deterministically falls back to vector-file tail scan from last valid covered offset.
+- Added corruption-recovery test:
+  `reopen_recovers_when_index_sidecar_crc_is_corrupted`.
+
+Impact:
+- Prevents silent wrong-offset ingestion from sidecar bit-rot and keeps restart correctness
+  fail-safe.

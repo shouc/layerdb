@@ -10,12 +10,13 @@ const VECTOR_BLOCKS_DIR: &str = "vector_blocks";
 const VECTOR_BLOCK_FILE_EXT: &str = "vb";
 const VECTOR_BLOCK_INDEX_FILE_EXT: &str = "vbi";
 const VECTOR_BLOCK_HEADER_TAG: &[u8] = b"vb1";
-const VECTOR_BLOCK_INDEX_HEADER_TAG: &[u8] = b"vbi1";
+const VECTOR_BLOCK_INDEX_HEADER_TAG: &[u8] = b"vbi2";
 const VECTOR_BLOCK_TOMBSTONE: u8 = 1;
 const VECTOR_BLOCK_LIVE: u8 = 0;
 const VECTOR_BLOCK_HAS_POSTING: u8 = 1 << 1;
 const REMAP_INTERVAL_RECORDS: usize = 1_024;
-const INDEX_RECORD_SIZE: usize = 8 + 1 + 8;
+const INDEX_RECORD_PAYLOAD_SIZE: usize = 8 + 1 + 8;
+const INDEX_RECORD_SIZE: usize = INDEX_RECORD_PAYLOAD_SIZE + 4;
 const DISTANCE_SCAN_PREFETCH_DISTANCE: usize = 16;
 
 fn record_size(dim: usize) -> usize {
@@ -59,6 +60,11 @@ pub(crate) struct VectorBlockState {
 }
 
 impl VectorBlockStore {
+    #[inline]
+    fn index_record_crc(payload: &[u8]) -> u32 {
+        crc32fast::hash(payload)
+    }
+
     #[inline]
     fn prefetch_record(mmap: &Mmap, offset: u64, rec_size: usize) {
         let Some(start) = usize::try_from(offset).ok() else {
@@ -192,9 +198,13 @@ impl VectorBlockStore {
     }
 
     fn push_index_record(buf: &mut Vec<u8>, id: u64, flags: u8, offset: u64) {
+        let start = buf.len();
         buf.extend_from_slice(&id.to_le_bytes());
         buf.push(flags);
         buf.extend_from_slice(&offset.to_le_bytes());
+        let end = start.saturating_add(INDEX_RECORD_PAYLOAD_SIZE);
+        let crc = Self::index_record_crc(&buf[start..end]);
+        buf.extend_from_slice(&crc.to_le_bytes());
     }
 
     fn append_index_records(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
@@ -580,12 +590,19 @@ impl VectorBlockStore {
                 Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(err) => return Err(err).context("read vector index sidecar record"),
             }
+            let payload = &rec[..INDEX_RECORD_PAYLOAD_SIZE];
+            let mut crc_arr = [0u8; 4];
+            crc_arr.copy_from_slice(&rec[INDEX_RECORD_PAYLOAD_SIZE..INDEX_RECORD_SIZE]);
+            let stored_crc = u32::from_le_bytes(crc_arr);
+            if Self::index_record_crc(payload) != stored_crc {
+                break;
+            }
             let mut id_arr = [0u8; 8];
-            id_arr.copy_from_slice(&rec[..8]);
+            id_arr.copy_from_slice(&payload[..8]);
             let id = u64::from_le_bytes(id_arr);
-            let flags = rec[8];
+            let flags = payload[8];
             let mut off_arr = [0u8; 8];
-            off_arr.copy_from_slice(&rec[9..17]);
+            off_arr.copy_from_slice(&payload[9..17]);
             let offset = u64::from_le_bytes(off_arr);
             let Some(end) = offset.checked_add(rec_size_u64) else {
                 break;
@@ -853,6 +870,41 @@ mod tests {
             assert_eq!(store.live_len(), 2);
             assert_eq!(store.get(1), Some(vec![7.0, 8.0, 9.0]));
             assert_eq!(store.get(2), Some(vec![4.0, 5.0, 6.0]));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reopen_recovers_when_index_sidecar_crc_is_corrupted() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let epoch = 12u64;
+        {
+            let mut store = VectorBlockStore::open(dir.path(), 3, epoch)?;
+            store.append_upsert_with_posting(1, None, &[1.0, 2.0, 3.0])?;
+            store.append_upsert_with_posting(2, None, &[4.0, 5.0, 6.0])?;
+            store.append_upsert_with_posting(3, None, &[7.0, 8.0, 9.0])?;
+            store.remap()?;
+            assert_eq!(store.live_len(), 3);
+        }
+
+        let sidecar = index_file_path_for_epoch(dir.path(), epoch);
+        let mut bytes = std::fs::read(&sidecar)?;
+        let index_header = super::index_header_size();
+        assert!(
+            bytes.len() > index_header + INDEX_RECORD_SIZE,
+            "sidecar should contain at least one index record"
+        );
+        // Flip one payload byte in the second record so CRC mismatch is guaranteed.
+        let second_record_payload = index_header + INDEX_RECORD_SIZE + 2;
+        bytes[second_record_payload] ^= 0x6d;
+        std::fs::write(&sidecar, bytes)?;
+
+        {
+            let store = VectorBlockStore::open(dir.path(), 3, epoch)?;
+            assert_eq!(store.live_len(), 3);
+            assert_eq!(store.get(1), Some(vec![1.0, 2.0, 3.0]));
+            assert_eq!(store.get(2), Some(vec![4.0, 5.0, 6.0]));
+            assert_eq!(store.get(3), Some(vec![7.0, 8.0, 9.0]));
         }
         Ok(())
     }

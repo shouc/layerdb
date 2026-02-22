@@ -87,6 +87,40 @@ fn startup_replays_typed_wal_tail_without_vector_rows() -> anyhow::Result<()> {
 }
 
 #[test]
+fn startup_fails_closed_on_corrupted_wal_tail_entry() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig::default();
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(1, vec![0.1; cfg.spfresh.dim])?;
+        idx.close()?;
+    }
+
+    let db = Db::open(dir.path(), cfg.db_options.clone())?;
+    let next_seq = super::storage::ensure_wal_next_seq(&db)?;
+    let mut corrupted = super::storage::encode_wal_touch_batch_ids(&[999])?;
+    let payload_start = 3usize + 4 + 4;
+    corrupted[payload_start + 1] ^= 0x7f;
+    db.put(
+        super::storage::wal_key(next_seq),
+        corrupted,
+        WriteOptions { sync: true },
+    )?;
+    super::storage::set_wal_next_seq(&db, next_seq.saturating_add(1), true)?;
+
+    let err = match SpFreshLayerDbIndex::open_existing(dir.path(), cfg.db_options.clone()) {
+        Ok(_) => anyhow::bail!("corrupted wal tail should fail startup"),
+        Err(err) => err,
+    };
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("decode wal entry") && rendered.contains("checksum mismatch"),
+        "unexpected startup error: {rendered}"
+    );
+    Ok(())
+}
+
+#[test]
 fn offheap_diskmeta_wal_tail_rebuilds_from_rows() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let cfg = SpFreshLayerDbConfig {

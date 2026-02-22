@@ -1018,3 +1018,14 @@ Change:
 Impact:
 - Prevents silent wrong-offset ingestion from sidecar bit-rot and keeps restart correctness
   fail-safe.
+
+## Step 41 (`startup-fail-closed-corrupt-wal-tail`)
+
+Change:
+- Added startup regression test proving fail-closed behavior on corrupted WAL tail entries:
+  `startup_fails_closed_on_corrupted_wal_tail_entry`.
+- The test injects a checksum-corrupted WAL frame, advances `wal_next_seq`, and verifies
+  `open_existing(...)` rejects startup instead of silently booting.
+
+Impact:
+- Locks in retrieval correctness guarantees by preventing boot on ambiguous/corrupt replay state.

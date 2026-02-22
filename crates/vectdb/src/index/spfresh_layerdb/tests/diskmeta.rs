@@ -233,3 +233,56 @@ fn offheap_diskmeta_bulk_load_populates_metadata() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn offheap_diskmeta_same_posting_update_skips_redundant_membership_event() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig {
+        memory_mode: SpFreshMemoryMode::OffHeapDiskMeta,
+        spfresh: crate::index::SpFreshConfig {
+            dim: 8,
+            initial_postings: 1,
+            nprobe: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(7, vec![0.1; cfg.spfresh.dim])?;
+        idx.try_upsert(7, vec![0.11; cfg.spfresh.dim])?;
+        idx.close()?;
+    }
+
+    let db = Db::open(dir.path(), cfg.db_options.clone())?;
+    let generation = super::storage::ensure_active_generation(&db)?;
+    let posting_event_next_seq = super::storage::ensure_posting_event_next_seq(&db)?;
+    assert_eq!(
+        posting_event_next_seq, 1,
+        "same-posting update should not append a second membership event"
+    );
+
+    let row_raw = db
+        .get(
+            super::storage::vector_key(generation, 7),
+            layerdb::ReadOptions::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("vector row missing for id=7"))?;
+    let decoded = super::storage::decode_vector_row_with_posting(row_raw.as_ref())?;
+    let posting_id = decoded
+        .posting_id
+        .ok_or_else(|| anyhow::anyhow!("posting id missing for id=7"))?;
+    let loaded_members = super::storage::load_posting_members(&db, generation, posting_id)?;
+    let ids: Vec<u64> = loaded_members
+        .members
+        .into_iter()
+        .map(|member| member.id)
+        .collect();
+    assert_eq!(ids, vec![7]);
+    assert_eq!(
+        loaded_members.scanned_events, 1,
+        "expected exactly one posting event for repeated same-posting upserts"
+    );
+    Ok(())
+}

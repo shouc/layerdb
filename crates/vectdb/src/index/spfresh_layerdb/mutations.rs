@@ -422,6 +422,7 @@ impl SpFreshLayerDbIndex {
                 let old = old_state.as_ref();
                 let new_posting = shadow.choose_posting(vector).unwrap_or(0);
                 let old_posting = old.map(|(posting, _)| *posting);
+                let membership_changed = old_posting != Some(new_posting);
                 if !use_fast_path {
                     let value = encode_vector_row_fields(
                         *id,
@@ -432,12 +433,19 @@ impl SpFreshLayerDbIndex {
                     )
                     .context("serialize vector row")?;
                     batch_ops.push(layerdb::Op::put(vector_key(generation, *id), value));
-                    let upsert_event_seq = posting_event_next_seq;
-                    posting_event_next_seq = posting_event_next_seq.saturating_add(1);
-                    batch_ops.push(layerdb::Op::put(
-                        posting_member_event_key(generation, new_posting, upsert_event_seq, *id),
-                        posting_member_event_upsert_value_id_only(*id),
-                    ));
+                    if membership_changed {
+                        let upsert_event_seq = posting_event_next_seq;
+                        posting_event_next_seq = posting_event_next_seq.saturating_add(1);
+                        batch_ops.push(layerdb::Op::put(
+                            posting_member_event_key(
+                                generation,
+                                new_posting,
+                                upsert_event_seq,
+                                *id,
+                            ),
+                            posting_member_event_upsert_value_id_only(*id),
+                        ));
+                    }
                     if let Some(old_posting) = old_posting {
                         if old_posting != new_posting {
                             let tombstone_event_seq = posting_event_next_seq;
@@ -454,11 +462,13 @@ impl SpFreshLayerDbIndex {
                         }
                     }
                 }
-                posting_deltas.push((*id, old_posting, new_posting));
-                if let Some(old_posting) = old_posting {
-                    dirty_postings.insert(old_posting);
+                if membership_changed {
+                    posting_deltas.push((*id, old_posting, new_posting));
+                    if let Some(old_posting) = old_posting {
+                        dirty_postings.insert(old_posting);
+                    }
+                    dirty_postings.insert(new_posting);
                 }
-                dirty_postings.insert(new_posting);
                 shadow.apply_upsert_ref(
                     old.map(|(posting, values)| (*posting, values.as_slice())),
                     new_posting,

@@ -214,3 +214,54 @@ fn open_existing_uses_persisted_metadata() -> anyhow::Result<()> {
     assert_eq!(got[0].id, 9);
     Ok(())
 }
+
+#[test]
+fn push_neighbor_topk_matches_naive_selection() {
+    let candidates = vec![
+        crate::Neighbor {
+            id: 10,
+            distance: 0.5,
+        },
+        crate::Neighbor {
+            id: 7,
+            distance: 0.2,
+        },
+        crate::Neighbor {
+            id: 3,
+            distance: 0.2,
+        },
+        crate::Neighbor {
+            id: 8,
+            distance: 0.7,
+        },
+        crate::Neighbor {
+            id: 2,
+            distance: 0.1,
+        },
+        crate::Neighbor {
+            id: 11,
+            distance: 0.3,
+        },
+    ];
+
+    let k = 3usize;
+    let mut top = Vec::new();
+    let mut worst_idx = None;
+    for candidate in candidates.clone() {
+        SpFreshLayerDbIndex::push_neighbor_topk(&mut top, &mut worst_idx, candidate, k);
+    }
+    top.sort_by(SpFreshLayerDbIndex::neighbor_cmp);
+
+    let mut expected = candidates;
+    expected.sort_by(SpFreshLayerDbIndex::neighbor_cmp);
+    expected.truncate(k);
+
+    assert_eq!(top.len(), expected.len());
+    assert_eq!(
+        top.iter().map(|n| n.id).collect::<Vec<_>>(),
+        expected.iter().map(|n| n.id).collect::<Vec<_>>()
+    );
+    for (got, want) in top.iter().zip(expected.iter()) {
+        assert!((got.distance - want.distance).abs() <= f32::EPSILON);
+    }
+}

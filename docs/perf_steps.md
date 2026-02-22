@@ -315,3 +315,31 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=5.2524`
 - `search_qps_ratio=3.9167`
+
+## Step 14 (`topk-worst-index-tracking`)
+
+Change:
+- Reworked diskmeta `push_neighbor_topk` to track the current worst slot incrementally.
+- Removed full `O(k)` worst-element scan on every candidate; now it recomputes only when the top-k
+  set changes.
+- Added deterministic unit test `push_neighbor_topk_matches_naive_selection` validating exact
+  equivalence with naive sort+truncate selection.
+
+Benchmark note:
+- Gate runs were highly noisy on this host in this cycle, so numbers below use a same-dataset
+  release rerun pair (`target/vectordb-step15/spfresh-rerun2.json`,
+  `target/vectordb-step15/lancedb-rerun2.json`).
+
+SPFresh:
+- `update_qps=124248.36`
+- `search_qps=1808.32`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=116192.66`
+- `search_qps=507.35`
+- `recall_at_k=0.4695`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.0693`
+- `search_qps_ratio=3.5643`

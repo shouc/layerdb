@@ -116,6 +116,7 @@ impl VectorIndex for SpFreshLayerDbIndex {
         let diskmeta_snapshot = self.diskmeta_search_snapshot.load_full();
         let out = if let Some(index) = diskmeta_snapshot {
             let mut top = Vec::with_capacity(k);
+            let mut worst_idx = None;
             let postings = index.choose_probe_postings(query, k);
             for posting_id in postings {
                 if index.posting_centroid(posting_id).is_none() {
@@ -139,7 +140,12 @@ impl VectorIndex for SpFreshLayerDbIndex {
                     panic!("offheap-diskmeta load selected distances failed: {err:#}")
                 });
                 for (id, distance) in selected_exact {
-                    Self::push_neighbor_topk(&mut top, Neighbor { id, distance }, k);
+                    Self::push_neighbor_topk(
+                        &mut top,
+                        &mut worst_idx,
+                        Neighbor { id, distance },
+                        k,
+                    );
                 }
 
                 // If selected candidates miss exact payloads, retry exact evaluation only for the
@@ -157,7 +163,12 @@ impl VectorIndex for SpFreshLayerDbIndex {
                         panic!("offheap-diskmeta load fallback distances failed: {err:#}")
                     });
                     for (id, distance) in fallback_exact {
-                        Self::push_neighbor_topk(&mut top, Neighbor { id, distance }, k);
+                        Self::push_neighbor_topk(
+                            &mut top,
+                            &mut worst_idx,
+                            Neighbor { id, distance },
+                            k,
+                        );
                     }
                     if !fallback_missing.is_empty() {
                         panic!(

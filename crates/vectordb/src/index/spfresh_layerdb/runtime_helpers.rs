@@ -339,13 +339,9 @@ impl SpFreshLayerDbIndex {
             .then_with(|| a.id.cmp(&b.id))
     }
 
-    pub(super) fn push_neighbor_topk(top: &mut Vec<Neighbor>, candidate: Neighbor, k: usize) {
-        if k == 0 {
-            return;
-        }
-        if top.len() < k {
-            top.push(candidate);
-            return;
+    fn recompute_worst_neighbor_idx(top: &[Neighbor]) -> Option<usize> {
+        if top.is_empty() {
+            return None;
         }
         let mut worst_idx = 0usize;
         for idx in 1..top.len() {
@@ -353,8 +349,36 @@ impl SpFreshLayerDbIndex {
                 worst_idx = idx;
             }
         }
-        if Self::neighbor_cmp(&candidate, &top[worst_idx]).is_lt() {
-            top[worst_idx] = candidate;
+        Some(worst_idx)
+    }
+
+    pub(super) fn push_neighbor_topk(
+        top: &mut Vec<Neighbor>,
+        worst_idx: &mut Option<usize>,
+        candidate: Neighbor,
+        k: usize,
+    ) {
+        if k == 0 {
+            return;
+        }
+        if top.len() < k {
+            top.push(candidate);
+            if top.len() == k {
+                *worst_idx = Self::recompute_worst_neighbor_idx(top);
+            }
+            return;
+        }
+        let worst = match *worst_idx {
+            Some(idx) if idx < top.len() => idx,
+            _ => {
+                let idx = Self::recompute_worst_neighbor_idx(top).expect("non-empty top");
+                *worst_idx = Some(idx);
+                idx
+            }
+        };
+        if Self::neighbor_cmp(&candidate, &top[worst]).is_lt() {
+            top[worst] = candidate;
+            *worst_idx = Self::recompute_worst_neighbor_idx(top);
         }
     }
 

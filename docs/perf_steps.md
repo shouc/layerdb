@@ -1369,3 +1369,38 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.4514`
 - `search_qps_ratio=3.0251`
+
+## Step 52 (`offheap-loader-reuse-and-cache-prefill`)
+
+Change:
+- Optimized non-diskmeta offheap mutation execution:
+  - prefilled vector cache with incoming upsert payloads before `upsert_with` loop
+  - reused a single loader closure across the full offheap upsert batch
+  - reused a single loader closure across the full offheap delete batch
+- Optimized startup WAL replay for resident/offheap tails:
+  - replay now matches index variant once per WAL entry (fewer per-row dispatch branches)
+  - offheap vector upsert replay preloads cache and reuses one loader
+  - legacy touched-id fallback now reuses one loader for offheap replay
+
+Impact:
+- Removes redundant per-row loader construction in hot update/replay loops.
+- Reduces clone/load churn for offheap upserts by ensuring replay/update paths hit in-memory cache for newly written vectors.
+- Preserves existing recovery semantics and legacy fallback behavior.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=183394.39`
+- `search_qps=2730.56`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=129736.39`
+- `search_qps=818.04`
+- `recall_at_k=0.4715`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.4136`
+- `search_qps_ratio=3.3379`

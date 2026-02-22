@@ -573,36 +573,48 @@ impl SpFreshLayerDbIndex {
         }
 
         let mutation_count = mutations.len();
-        let mut cache_entries = Vec::with_capacity(mutation_count);
         let mut touched_ids = Vec::with_capacity(mutation_count);
+        let mut resident_cache_entries = Vec::new();
         {
             let mut index = lock_write(&self.index);
-            for (id, vector) in mutations {
-                match &mut *index {
-                    RuntimeSpFreshIndex::Resident(index) => index.upsert(id, vector.clone()),
-                    RuntimeSpFreshIndex::OffHeap(index) => {
-                        let mut loader = Self::loader_for(
-                            &self.db,
-                            &self.vector_cache,
-                            &self.vector_blocks,
-                            generation,
-                            Some((id, vector.clone())),
-                        );
-                        index
-                            .upsert_with(id, vector.clone(), &mut loader)
-                            .with_context(|| format!("offheap upsert id={id}"))?;
-                    }
-                    RuntimeSpFreshIndex::OffHeapDiskMeta(_) => {
-                        anyhow::bail!("non-diskmeta upsert batch called for diskmeta runtime");
+            match &mut *index {
+                RuntimeSpFreshIndex::Resident(index) => {
+                    resident_cache_entries.reserve(mutation_count);
+                    for (id, vector) in mutations {
+                        index.upsert(id, vector.clone());
+                        touched_ids.push(id);
+                        resident_cache_entries.push((id, vector));
                     }
                 }
-                touched_ids.push(id);
-                cache_entries.push((id, vector));
+                RuntimeSpFreshIndex::OffHeap(index) => {
+                    {
+                        let mut cache = lock_mutex(&self.vector_cache);
+                        for (id, vector) in &mutations {
+                            cache.put(*id, vector.clone());
+                        }
+                    }
+                    let mut loader = Self::loader_for(
+                        &self.db,
+                        &self.vector_cache,
+                        &self.vector_blocks,
+                        generation,
+                        None,
+                    );
+                    for (id, vector) in mutations {
+                        index
+                            .upsert_with(id, vector, &mut loader)
+                            .with_context(|| format!("offheap upsert id={id}"))?;
+                        touched_ids.push(id);
+                    }
+                }
+                RuntimeSpFreshIndex::OffHeapDiskMeta(_) => {
+                    anyhow::bail!("non-diskmeta upsert batch called for diskmeta runtime");
+                }
             }
         }
-        {
+        if !resident_cache_entries.is_empty() {
             let mut cache = lock_mutex(&self.vector_cache);
-            for (id, vector) in cache_entries {
+            for (id, vector) in resident_cache_entries {
                 cache.put(id, vector);
             }
         }
@@ -789,28 +801,35 @@ impl SpFreshLayerDbIndex {
         let mut deleted_ids = Vec::new();
         {
             let mut index = lock_write(&self.index);
-            for id in &mutations {
-                let was_deleted = match &mut *index {
-                    RuntimeSpFreshIndex::Resident(index) => index.delete(*id),
-                    RuntimeSpFreshIndex::OffHeap(index) => {
-                        let mut loader = Self::loader_for(
-                            &self.db,
-                            &self.vector_cache,
-                            &self.vector_blocks,
-                            generation,
-                            None,
-                        );
-                        index
+            match &mut *index {
+                RuntimeSpFreshIndex::Resident(index) => {
+                    for id in &mutations {
+                        if index.delete(*id) {
+                            deleted += 1;
+                            deleted_ids.push(*id);
+                        }
+                    }
+                }
+                RuntimeSpFreshIndex::OffHeap(index) => {
+                    let mut loader = Self::loader_for(
+                        &self.db,
+                        &self.vector_cache,
+                        &self.vector_blocks,
+                        generation,
+                        None,
+                    );
+                    for id in &mutations {
+                        if index
                             .delete_with(*id, &mut loader)
                             .with_context(|| format!("offheap delete id={id}"))?
+                        {
+                            deleted += 1;
+                            deleted_ids.push(*id);
+                        }
                     }
-                    RuntimeSpFreshIndex::OffHeapDiskMeta(_) => {
-                        anyhow::bail!("non-diskmeta delete batch called for diskmeta runtime");
-                    }
-                };
-                if was_deleted {
-                    deleted += 1;
-                    deleted_ids.push(*id);
+                }
+                RuntimeSpFreshIndex::OffHeapDiskMeta(_) => {
+                    anyhow::bail!("non-diskmeta delete batch called for diskmeta runtime");
                 }
             }
         }

@@ -536,51 +536,51 @@ impl SpFreshLayerDbIndex {
                 IndexWalEntry::TouchBatch { ids } => {
                     touched.extend(ids);
                 }
-                IndexWalEntry::VectorUpsertBatch { rows } => {
-                    for row in rows {
-                        let id = row.id;
-                        let values = row.values;
-                        match index {
-                            RuntimeSpFreshIndex::Resident(index) => index.upsert(id, values),
-                            RuntimeSpFreshIndex::OffHeap(index) => {
-                                let mut loader = Self::loader_for(
-                                    db,
-                                    vector_cache,
-                                    vector_blocks,
-                                    generation,
-                                    Some((id, values.clone())),
-                                );
-                                index.upsert_with(id, values, &mut loader)?;
-                            }
-                            RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
-                                let posting = index.choose_posting(&values).unwrap_or_default();
-                                index.apply_upsert(None, posting, values);
-                            }
+                IndexWalEntry::VectorUpsertBatch { rows } => match index {
+                    RuntimeSpFreshIndex::Resident(index) => {
+                        for row in rows {
+                            index.upsert(row.id, row.values);
                         }
                     }
-                }
-                IndexWalEntry::VectorDeleteBatch { ids } => {
-                    for id in ids {
-                        match index {
-                            RuntimeSpFreshIndex::Resident(index) => {
-                                let _ = index.delete(id);
-                            }
-                            RuntimeSpFreshIndex::OffHeap(index) => {
-                                let mut loader = Self::loader_for(
-                                    db,
-                                    vector_cache,
-                                    vector_blocks,
-                                    generation,
-                                    None,
-                                );
-                                let _ = index.delete_with(id, &mut loader)?;
-                            }
-                            RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
-                                let _ = index.apply_delete(None);
+                    RuntimeSpFreshIndex::OffHeap(index) => {
+                        {
+                            let mut cache = lock_mutex(vector_cache);
+                            for row in &rows {
+                                cache.put(row.id, row.values.clone());
                             }
                         }
+                        let mut loader =
+                            Self::loader_for(db, vector_cache, vector_blocks, generation, None);
+                        for row in rows {
+                            index.upsert_with(row.id, row.values, &mut loader)?;
+                        }
                     }
-                }
+                    RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
+                        for row in rows {
+                            let posting = index.choose_posting(&row.values).unwrap_or_default();
+                            index.apply_upsert(None, posting, row.values);
+                        }
+                    }
+                },
+                IndexWalEntry::VectorDeleteBatch { ids } => match index {
+                    RuntimeSpFreshIndex::Resident(index) => {
+                        for id in ids {
+                            let _ = index.delete(id);
+                        }
+                    }
+                    RuntimeSpFreshIndex::OffHeap(index) => {
+                        let mut loader =
+                            Self::loader_for(db, vector_cache, vector_blocks, generation, None);
+                        for id in ids {
+                            let _ = index.delete_with(id, &mut loader)?;
+                        }
+                    }
+                    RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
+                        for _ in ids {
+                            let _ = index.apply_delete(None);
+                        }
+                    }
+                },
                 IndexWalEntry::DiskMetaUpsertBatch { rows } => {
                     touched.extend(rows.into_iter().map(|row| row.id));
                 }
@@ -594,40 +594,49 @@ impl SpFreshLayerDbIndex {
             return Ok(());
         }
 
-        for id in touched {
-            let resolved =
-                Self::load_vector_for_id(db, vector_cache, vector_blocks, generation, id)?;
-            match resolved {
-                Some(values) => match index {
-                    RuntimeSpFreshIndex::Resident(index) => index.upsert(id, values),
-                    RuntimeSpFreshIndex::OffHeap(index) => {
-                        let mut loader = Self::loader_for(
-                            db,
-                            vector_cache,
-                            vector_blocks,
-                            generation,
-                            Some((id, values.clone())),
-                        );
-                        index.upsert_with(id, values, &mut loader)?;
+        match index {
+            RuntimeSpFreshIndex::Resident(index) => {
+                for id in touched {
+                    let resolved =
+                        Self::load_vector_for_id(db, vector_cache, vector_blocks, generation, id)?;
+                    match resolved {
+                        Some(values) => index.upsert(id, values),
+                        None => {
+                            let _ = index.delete(id);
+                        }
                     }
-                    RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
-                        let posting = index.choose_posting(&values).unwrap_or_default();
-                        index.apply_upsert(None, posting, values);
+                }
+            }
+            RuntimeSpFreshIndex::OffHeap(index) => {
+                let mut loader =
+                    Self::loader_for(db, vector_cache, vector_blocks, generation, None);
+                for id in touched {
+                    let resolved =
+                        Self::load_vector_for_id(db, vector_cache, vector_blocks, generation, id)?;
+                    match resolved {
+                        Some(values) => {
+                            index.upsert_with(id, values, &mut loader)?;
+                        }
+                        None => {
+                            let _ = index.delete_with(id, &mut loader)?;
+                        }
                     }
-                },
-                None => match index {
-                    RuntimeSpFreshIndex::Resident(index) => {
-                        let _ = index.delete(id);
+                }
+            }
+            RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
+                for id in touched {
+                    let resolved =
+                        Self::load_vector_for_id(db, vector_cache, vector_blocks, generation, id)?;
+                    match resolved {
+                        Some(values) => {
+                            let posting = index.choose_posting(&values).unwrap_or_default();
+                            index.apply_upsert(None, posting, values);
+                        }
+                        None => {
+                            let _ = index.apply_delete(None);
+                        }
                     }
-                    RuntimeSpFreshIndex::OffHeap(index) => {
-                        let mut loader =
-                            Self::loader_for(db, vector_cache, vector_blocks, generation, None);
-                        let _ = index.delete_with(id, &mut loader)?;
-                    }
-                    RuntimeSpFreshIndex::OffHeapDiskMeta(index) => {
-                        let _ = index.apply_delete(None);
-                    }
-                },
+                }
             }
         }
         Ok(())

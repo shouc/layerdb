@@ -1206,3 +1206,34 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.6142`
 - `search_qps_ratio=2.9759`
+
+## Step 47 (`startup-streaming-wal-replay`)
+
+Change:
+- Added `visit_wal_entries_since(...)` to stream decoded WAL entries directly from LayerDB iterators.
+- Switched startup replay paths to streaming mode:
+  - exact diskmeta tail replay (`replay_wal_tail_diskmeta_exact`)
+  - generic touched-id tail replay (`replay_wal_tail`)
+- Removed intermediate full in-memory WAL entry materialization during startup replay.
+
+Impact:
+- Reduces startup memory pressure for large WAL tails.
+- Keeps replay processing bounded and sequential with identical recovery semantics.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=230740.39`
+- `search_qps=2888.57`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=128256.51`
+- `search_qps=918.06`
+- `recall_at_k=0.4800`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.7991`
+- `search_qps_ratio=3.1464`

@@ -42,13 +42,13 @@ use storage::{
     encode_wal_diskmeta_upsert_batch, encode_wal_touch_batch_ids, ensure_active_generation,
     ensure_metadata, ensure_posting_event_next_seq, ensure_wal_exists, ensure_wal_next_seq,
     load_index_checkpoint_bytes, load_metadata, load_posting_members, load_row, load_rows,
-    load_rows_with_posting_assignments, load_startup_manifest_bytes, load_wal_entries_since,
+    load_rows_with_posting_assignments, load_startup_manifest_bytes,
     persist_index_checkpoint_bytes, persist_startup_manifest_bytes, posting_map_prefix,
     posting_member_event_key, posting_member_event_tombstone_value,
     posting_member_event_upsert_value_with_residual, posting_members_generation_prefix,
     posting_members_prefix, posting_members_snapshot_key, prefix_exclusive_end, prune_wal_before,
     refresh_read_snapshot, set_active_generation, set_posting_event_next_seq, validate_config,
-    vector_key, vector_prefix, wal_key, IndexWalEntry, PostingMember,
+    vector_key, vector_prefix, visit_wal_entries_since, wal_key, IndexWalEntry, PostingMember,
 };
 use sync_utils::{lock_mutex, lock_read, lock_write};
 use vector_blocks::VectorBlockStore;

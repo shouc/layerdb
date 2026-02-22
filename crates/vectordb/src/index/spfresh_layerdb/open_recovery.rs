@@ -427,11 +427,11 @@ impl SpFreshLayerDbIndex {
         index: &mut SpFreshDiskMetaIndex,
         from_seq: u64,
     ) -> anyhow::Result<bool> {
-        let entries = load_wal_entries_since(db, from_seq)?;
-        if entries.is_empty() {
-            return Ok(true);
-        }
-        for entry in entries {
+        let mut replay_supported = true;
+        visit_wal_entries_since(db, from_seq, |entry| {
+            if !replay_supported {
+                return Ok(());
+            }
             match entry {
                 IndexWalEntry::DiskMetaUpsertBatch { rows } => {
                     for row in rows {
@@ -444,11 +444,12 @@ impl SpFreshLayerDbIndex {
                     }
                 }
                 IndexWalEntry::Touch { .. } | IndexWalEntry::TouchBatch { .. } => {
-                    return Ok(false);
+                    replay_supported = false;
                 }
             }
-        }
-        Ok(true)
+            Ok(())
+        })?;
+        Ok(replay_supported)
     }
 
     pub(super) fn extract_diskmeta_snapshot(
@@ -468,26 +469,8 @@ impl SpFreshLayerDbIndex {
         index: &mut RuntimeSpFreshIndex,
         from_seq: u64,
     ) -> anyhow::Result<()> {
-        let entries = load_wal_entries_since(db, from_seq)?;
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        let mut touched_capacity = 0usize;
-        for entry in &entries {
-            let add = match entry {
-                IndexWalEntry::Touch { .. } => 1usize,
-                IndexWalEntry::TouchBatch { ids } => ids.len(),
-                IndexWalEntry::DiskMetaUpsertBatch { rows } => rows.len(),
-                IndexWalEntry::DiskMetaDeleteBatch { rows } => rows.len(),
-            };
-            touched_capacity = touched_capacity.saturating_add(add);
-        }
-        let mut touched = FxHashSet::with_capacity_and_hasher(
-            touched_capacity.max(entries.len()),
-            Default::default(),
-        );
-        for entry in entries {
+        let mut touched = FxHashSet::default();
+        visit_wal_entries_since(db, from_seq, |entry| {
             match entry {
                 IndexWalEntry::Touch { id } => {
                     touched.insert(id);
@@ -502,6 +485,10 @@ impl SpFreshLayerDbIndex {
                     touched.extend(rows.into_iter().map(|row| row.id));
                 }
             }
+            Ok(())
+        })?;
+        if touched.is_empty() {
+            return Ok(());
         }
 
         for id in touched {

@@ -957,11 +957,14 @@ pub(crate) fn decode_wal_entry(raw: &[u8]) -> anyhow::Result<IndexWalEntry> {
     Ok(entry)
 }
 
-pub(crate) fn load_wal_entries_since(
+pub(crate) fn visit_wal_entries_since<F>(
     db: &Db,
     start_seq: u64,
-) -> anyhow::Result<Vec<IndexWalEntry>> {
-    let mut out = Vec::new();
+    mut on_entry: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(IndexWalEntry) -> anyhow::Result<()>,
+{
     let prefix_bytes = INDEX_WAL_PREFIX.as_bytes().to_vec();
     let start = wal_key(start_seq).into_bytes();
     let end = prefix_exclusive_end(&prefix_bytes)?;
@@ -983,9 +986,9 @@ pub(crate) fn load_wal_entries_since(
         };
         let entry = decode_wal_entry(value.as_ref())
             .with_context(|| format!("decode wal entry key={}", String::from_utf8_lossy(&key)))?;
-        out.push(entry);
+        on_entry(entry)?;
     }
-    Ok(out)
+    Ok(())
 }
 
 pub(crate) fn prune_wal_before(db: &Db, seq_exclusive: u64, sync: bool) -> anyhow::Result<()> {

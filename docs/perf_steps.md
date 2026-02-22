@@ -1135,3 +1135,37 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.5638`
 - `search_qps_ratio=2.7467`
+
+## Step 45 (`checkpoint-crc-frame`)
+
+Change:
+- Added framed index-checkpoint format (`icp1`) with:
+  - payload length
+  - CRC32 checksum
+  - serialized checkpoint payload
+- Startup checkpoint load now verifies frame integrity before payload decode.
+- On corruption, startup deterministically rebuilds from authoritative rows (existing behavior) with explicit checksum error reporting.
+- Added startup regression:
+  - `startup_recovers_from_corrupted_index_checkpoint_frame`
+
+Impact:
+- Prevents silent acceptance of corrupted checkpoint bytes.
+- Tightens restart correctness while retaining deterministic recovery path.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=214825.66`
+- `search_qps=2783.10`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=116479.13`
+- `search_qps=819.65`
+- `recall_at_k=0.4765`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.8443`
+- `search_qps_ratio=3.3955`

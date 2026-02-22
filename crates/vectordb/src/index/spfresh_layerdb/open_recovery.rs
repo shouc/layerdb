@@ -5,6 +5,8 @@ const STARTUP_MANIFEST_FLAG_HAS_APPLIED_WAL_SEQ: u8 = 1 << 0;
 const STARTUP_MANIFEST_CRC_SIZE: usize = 4;
 const STARTUP_MANIFEST_BIN_ENCODED_LEN: usize =
     STARTUP_MANIFEST_BIN_TAG.len() + 4 + 8 + 1 + 8 + 8 + 8 + 4;
+const INDEX_CHECKPOINT_FRAME_TAG: &[u8] = b"icp1";
+const INDEX_CHECKPOINT_FRAME_HEADER_SIZE: usize = INDEX_CHECKPOINT_FRAME_TAG.len() + 4 + 4;
 
 fn read_manifest_u8(raw: &[u8], cursor: &mut usize) -> anyhow::Result<u8> {
     let Some(byte) = raw.get(*cursor).copied() else {
@@ -105,6 +107,59 @@ pub(super) fn decode_startup_manifest(raw: &[u8]) -> anyhow::Result<PersistedSta
         posting_event_next_seq,
         epoch,
     })
+}
+
+fn encode_checkpoint_frame(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let payload_len = u32::try_from(payload.len()).context("index checkpoint payload too large")?;
+    let checksum = crc32fast::hash(payload);
+    let mut out = Vec::with_capacity(INDEX_CHECKPOINT_FRAME_HEADER_SIZE + payload.len());
+    out.extend_from_slice(INDEX_CHECKPOINT_FRAME_TAG);
+    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+fn decode_checkpoint_frame(raw: &[u8]) -> anyhow::Result<&[u8]> {
+    if !raw.starts_with(INDEX_CHECKPOINT_FRAME_TAG) {
+        anyhow::bail!("unsupported index checkpoint frame tag");
+    }
+    if raw.len() < INDEX_CHECKPOINT_FRAME_HEADER_SIZE {
+        anyhow::bail!("index checkpoint frame underflow");
+    }
+    let mut len_arr = [0u8; 4];
+    len_arr.copy_from_slice(
+        raw.get(INDEX_CHECKPOINT_FRAME_TAG.len()..INDEX_CHECKPOINT_FRAME_TAG.len() + 4)
+            .ok_or_else(|| anyhow::anyhow!("index checkpoint frame missing length"))?,
+    );
+    let payload_len =
+        usize::try_from(u32::from_le_bytes(len_arr)).context("index checkpoint length overflow")?;
+    let mut checksum_arr = [0u8; 4];
+    checksum_arr.copy_from_slice(
+        raw.get(INDEX_CHECKPOINT_FRAME_TAG.len() + 4..INDEX_CHECKPOINT_FRAME_HEADER_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("index checkpoint frame missing checksum"))?,
+    );
+    let expected_checksum = u32::from_le_bytes(checksum_arr);
+    let payload_end = INDEX_CHECKPOINT_FRAME_HEADER_SIZE
+        .checked_add(payload_len)
+        .ok_or_else(|| anyhow::anyhow!("index checkpoint frame payload length overflow"))?;
+    if payload_end != raw.len() {
+        anyhow::bail!(
+            "index checkpoint frame length mismatch: payload_len={} total_len={}",
+            payload_len,
+            raw.len()
+        );
+    }
+    let payload = raw
+        .get(INDEX_CHECKPOINT_FRAME_HEADER_SIZE..payload_end)
+        .ok_or_else(|| anyhow::anyhow!("index checkpoint payload underflow"))?;
+    let actual_checksum = crc32fast::hash(payload);
+    if actual_checksum != expected_checksum {
+        anyhow::bail!(
+            "index checkpoint checksum mismatch: expected={expected_checksum:#010x} actual={actual_checksum:#010x}"
+        );
+    }
+    Ok(payload)
 }
 
 impl SpFreshLayerDbIndex {
@@ -316,7 +371,10 @@ impl SpFreshLayerDbIndex {
         wal_next_seq: u64,
     ) -> anyhow::Result<(RuntimeSpFreshIndex, Option<u64>)> {
         if let Some(raw) = load_index_checkpoint_bytes(db)? {
-            match bincode::deserialize::<PersistedIndexCheckpoint>(raw.as_ref()) {
+            match decode_checkpoint_frame(raw.as_ref()).and_then(|payload| {
+                bincode::deserialize::<PersistedIndexCheckpoint>(payload)
+                    .context("decode framed index checkpoint payload")
+            }) {
                 Ok(checkpoint)
                     if checkpoint.schema_version
                         == config::META_INDEX_CHECKPOINT_SCHEMA_VERSION
@@ -453,7 +511,10 @@ impl SpFreshLayerDbIndex {
             applied_wal_seq: next_wal_seq.checked_sub(1),
             index: snapshot,
         };
-        let bytes = bincode::serialize(&checkpoint).context("encode spfresh index checkpoint")?;
+        let payload =
+            bincode::serialize(&checkpoint).context("encode spfresh index checkpoint payload")?;
+        let bytes = encode_checkpoint_frame(payload.as_slice())
+            .context("frame spfresh index checkpoint")?;
         persist_index_checkpoint_bytes(&self.db, bytes, true)?;
         let manifest = PersistedStartupManifest {
             schema_version: STARTUP_MANIFEST_SCHEMA_VERSION,

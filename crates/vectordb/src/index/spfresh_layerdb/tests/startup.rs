@@ -159,6 +159,38 @@ fn startup_fails_closed_on_corrupted_startup_manifest() -> anyhow::Result<()> {
 }
 
 #[test]
+fn startup_recovers_from_corrupted_index_checkpoint_frame() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig::default();
+    {
+        let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+        idx.try_upsert(42, vec![0.42; cfg.spfresh.dim])?;
+        idx.close()?;
+    }
+
+    let db = Db::open(dir.path(), cfg.db_options.clone())?;
+    let mut raw = db
+        .get(
+            super::config::META_INDEX_CHECKPOINT_KEY,
+            layerdb::ReadOptions::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("index checkpoint missing"))?
+        .to_vec();
+    raw[15] ^= 0x33;
+    db.put(
+        super::config::META_INDEX_CHECKPOINT_KEY,
+        raw,
+        WriteOptions { sync: true },
+    )?;
+
+    let idx = SpFreshLayerDbIndex::open_existing(dir.path(), cfg.db_options.clone())?;
+    assert_eq!(idx.len(), 1);
+    let got = idx.search(&vec![0.42; cfg.spfresh.dim], 1);
+    assert_eq!(got[0].id, 42);
+    Ok(())
+}
+
+#[test]
 fn offheap_diskmeta_wal_tail_rebuilds_from_rows() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let cfg = SpFreshLayerDbConfig {

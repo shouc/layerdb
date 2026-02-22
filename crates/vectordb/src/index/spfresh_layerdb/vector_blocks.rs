@@ -451,19 +451,11 @@ impl VectorBlockStore {
         let records_len = bytes.len() / rec_size * rec_size;
         let mut cursor = 0usize;
         while cursor < records_len {
-            let record = bytes
-                .get(cursor..cursor + rec_size)
-                .ok_or_else(|| anyhow::anyhow!("vector block scan record slice out of bounds"))?;
-            let mut id_arr = [0u8; 8];
-            id_arr.copy_from_slice(
-                record
-                    .get(..8)
-                    .ok_or_else(|| anyhow::anyhow!("vector block scan missing id bytes"))?,
-            );
-            let id = u64::from_le_bytes(id_arr);
-            let flags = *record
-                .get(8)
-                .ok_or_else(|| anyhow::anyhow!("vector block scan missing flags byte"))?;
+            // SAFETY: `cursor < records_len <= bytes.len()`, and each record is `rec_size`
+            // bytes where `rec_size >= 17`, so id/flags reads are in-bounds.
+            let id =
+                unsafe { u64::from_le(bytes.as_ptr().add(cursor).cast::<u64>().read_unaligned()) };
+            let flags = unsafe { *bytes.as_ptr().add(cursor + 8) };
             let record_offset = base_offset
                 .checked_add(u64::try_from(cursor).context("vector block offset overflow")?)
                 .ok_or_else(|| anyhow::anyhow!("vector block offset overflow"))?;

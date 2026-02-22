@@ -732,3 +732,29 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.5216`
 - `search_qps_ratio=3.2502`
+
+## Step 29 (`offset-scan-unaligned-read-fastpath`)
+
+Change:
+- Reworked `scan_records_into_offsets(...)` to decode id/flags with direct unaligned loads
+  instead of per-record slice/get/copy.
+- This reduces per-record CPU overhead during vector-block offset rebuild scans.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step30-spfresh.json`,
+  `target/vectordb-step30-lancedb.json`.
+
+SPFresh:
+- `update_qps=203482.96`
+- `search_qps=2490.37`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=126052.40`
+- `search_qps=854.94`
+- `recall_at_k=0.4710`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.6143`
+- `search_qps_ratio=2.9129`

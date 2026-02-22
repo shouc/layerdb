@@ -9,6 +9,7 @@ This directory stores CI-facing benchmark regression thresholds.
   - `fairness.search_runs`
   - `fairness.warmup_queries`
   - `fairness.maintenance_before_search` (SPFresh force-rebuild / LanceDB optimize-index parity)
+  - `lancedb.optimize_per_update_batch` (counts index-maintenance cost in update-qps)
 - Use `scripts/bench_regression.sh` to refresh a Criterion baseline and validate
   results against `baseline.json`.
 - Use `scripts/vectdb_bench_gate.sh` to run reproducible SPFresh/LanceDB gate checks.

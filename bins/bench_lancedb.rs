@@ -40,6 +40,8 @@ struct Args {
     search_runs: usize,
     #[arg(long, default_value_t = false)]
     optimize_before_search: bool,
+    #[arg(long, default_value_t = false)]
+    optimize_per_update_batch: bool,
     #[arg(long)]
     db: Option<PathBuf>,
     #[arg(long, default_value = "vectors")]
@@ -165,6 +167,12 @@ async fn main() -> Result<()> {
             .execute(make_reader(&batch_rows, dim)?)
             .await
             .context("merge insert update batch")?;
+        if args.optimize_per_update_batch {
+            table
+                .optimize(OptimizeAction::Index(OptimizeOptions::default()))
+                .await
+                .context("optimize lancedb index after update batch")?;
+        }
     }
     let update_s = update_start.elapsed().as_secs_f64().max(1e-9);
     let update_qps = dataset.updates.len() as f64 / update_s;
@@ -243,6 +251,7 @@ async fn main() -> Result<()> {
         "search_qps_runs": search_qps_runs,
         "recall_at_k_runs": recall_runs,
         "optimize_before_search": args.optimize_before_search,
+        "optimize_per_update_batch": args.optimize_per_update_batch,
         "maintenance_ms": maintenance_ms,
         "build_ms": build_ms,
         "update_qps": update_qps,

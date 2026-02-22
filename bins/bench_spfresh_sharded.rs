@@ -186,9 +186,14 @@ fn main() -> Result<()> {
 
     let update_start = Instant::now();
     for chunk in dataset.updates.chunks(args.update_batch) {
-        let rows: Vec<VectorRecord> = chunk
-            .iter()
-            .map(|(id, v)| VectorRecord::new(*id, v.clone()))
+        // Match LanceDB benchmark semantics: keep only the last update per id in each batch.
+        let mut dedup: HashMap<u64, Vec<f32>> = HashMap::with_capacity(chunk.len());
+        for (id, values) in chunk {
+            dedup.insert(*id, values.clone());
+        }
+        let rows: Vec<VectorRecord> = dedup
+            .into_iter()
+            .map(|(id, values)| VectorRecord::new(id, values))
             .collect();
         let _ = index.try_upsert_batch_owned_with_commit_mode(rows, commit_mode)?;
     }

@@ -21,7 +21,8 @@
   "lancedb": {
     "nlist": 64,
     "nprobe": 64,
-    "update_batch": 1024
+    "update_batch": 1024,
+    "optimize_per_update_batch": true
   },
   "fairness": {
     "search_runs": 3,
@@ -33,6 +34,6 @@
     "min_lancedb_recall_at_k": 0.95,
     "max_recall_gap_at_k": 0.05,
     "min_spfresh_search_qps_vs_lancedb_ratio": 1.0,
-    "min_spfresh_update_qps_vs_lancedb_ratio": 0.35
+    "min_spfresh_update_qps_vs_lancedb_ratio": 2.0
   }
 }

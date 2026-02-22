@@ -34,6 +34,7 @@ SP_DISKMETA_PROBE_MULTIPLIER="$(python3 -c 'import json,sys;print(json.load(open
 LC_NLIST="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["lancedb"]["nlist"])' "$CONFIG")"
 LC_NPROBE="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["lancedb"]["nprobe"])' "$CONFIG")"
 LC_UPDATE_BATCH="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["lancedb"]["update_batch"])' "$CONFIG")"
+LC_OPTIMIZE_PER_UPDATE_BATCH="$(python3 -c 'import json,sys;print("true" if json.load(open(sys.argv[1]))["lancedb"].get("optimize_per_update_batch", False) else "false")' "$CONFIG")"
 SP_EXACT_SHARD_PRUNE="$(python3 -c 'import json,sys;print("true" if json.load(open(sys.argv[1]))["spfresh"].get("exact_shard_prune", False) else "false")' "$CONFIG")"
 
 FAIR_SEARCH_RUNS="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("fairness", {}).get("search_runs", 1))' "$CONFIG")"
@@ -67,6 +68,11 @@ else
   SP_SKIP_FORCE_REBUILD_FLAG="--skip-force-rebuild"
   LC_OPTIMIZE_BEFORE_SEARCH_FLAG=""
 fi
+if [[ "$LC_OPTIMIZE_PER_UPDATE_BATCH" == "true" ]]; then
+  LC_OPTIMIZE_PER_UPDATE_BATCH_FLAG="--optimize-per-update-batch"
+else
+  LC_OPTIMIZE_PER_UPDATE_BATCH_FLAG=""
+fi
 cargo run --release -p vectdb --bin bench_spfresh_sharded -- \
   --dataset "$DATASET" \
   --k "$K" \
@@ -95,6 +101,7 @@ cargo run --release -p vectdb --bin bench_lancedb -- \
   --search-runs "$FAIR_SEARCH_RUNS" \
   --warmup-queries "$FAIR_WARMUP_QUERIES" \
   $LC_OPTIMIZE_BEFORE_SEARCH_FLAG \
+  $LC_OPTIMIZE_PER_UPDATE_BATCH_FLAG \
   > "$LANCEDB_JSON"
 
 python3 "$ROOT_DIR/scripts/check_vectdb_gate.py" \

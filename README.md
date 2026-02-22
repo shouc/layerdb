@@ -49,6 +49,9 @@ cargo run -p vectdb --bin vectdb-deploy -- \
   --node-id node1 \
   --listen 0.0.0.0:8080 \
   --self-url http://127.0.0.1:8080 \
+  --replica-urls http://127.0.0.1:8080,http://127.0.0.1:8081,http://127.0.0.1:8082 \
+  --logical-partitions 16 \
+  --replication-factor 3 \
   --dim 4 \
   --initial-postings 4 \
   --etcd-endpoints http://127.0.0.1:2379 \
@@ -75,6 +78,8 @@ curl -sS -X POST http://127.0.0.1:8080/v1/mutations \
     "commit_mode":"durable"
   }' | jq
 ```
+
+Writes can be sent to any node endpoint; the server routes each mutation batch to the current partition leader.
 
 Search:
 

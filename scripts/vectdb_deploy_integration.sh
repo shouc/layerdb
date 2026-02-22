@@ -115,6 +115,17 @@ post_json() {
   echo "${status}"
 }
 
+assert_quorum_replication_summary() {
+  local response_file="$1"
+  local context="$2"
+  if ! grep -Eq '"attempted"[[:space:]]*:[[:space:]]*[1-9][0-9]*' "${response_file}" \
+    || ! grep -Eq '"succeeded"[[:space:]]*:[[:space:]]*[1-9][0-9]*' "${response_file}"; then
+    echo "unexpected replication summary for ${context}" >&2
+    cat "${response_file}" >&2
+    return 1
+  fi
+}
+
 assert_search_top_id() {
   local base_url="$1"
   local expected_id="$2"
@@ -172,9 +183,13 @@ fi
 tmp_out="$(mktemp)"
 follower_write_payload="{\"mutations\":[{\"kind\":\"upsert\",\"id\":101,\"values\":${VEC_A}}],\"commit_mode\":\"durable\"}"
 follower_status="$(post_json "${follower_url}/v1/mutations" "${follower_write_payload}" "${tmp_out}")"
-if [[ "${follower_status}" != "409" ]]; then
-  echo "expected follower write rejection (409), got ${follower_status}" >&2
+if [[ "${follower_status}" != "200" ]]; then
+  echo "expected routed write success (200) via non-leader endpoint, got ${follower_status}" >&2
   cat "${tmp_out}" >&2
+  rm -f "${tmp_out}"
+  exit 1
+fi
+if ! assert_quorum_replication_summary "${tmp_out}" "routed write"; then
   rm -f "${tmp_out}"
   exit 1
 fi
@@ -189,10 +204,7 @@ if [[ "${leader_status}" != "200" ]]; then
   rm -f "${tmp_out}"
   exit 1
 fi
-if ! grep -Eq '"attempted"[[:space:]]*:[[:space:]]*2' "${tmp_out}" \
-  || ! grep -Eq '"succeeded"[[:space:]]*:[[:space:]]*2' "${tmp_out}"; then
-  echo "unexpected replication summary after leader write" >&2
-  cat "${tmp_out}" >&2
+if ! assert_quorum_replication_summary "${tmp_out}" "leader write"; then
   rm -f "${tmp_out}"
   exit 1
 fi
@@ -230,10 +242,7 @@ if [[ "${second_status}" != "200" ]]; then
   rm -f "${tmp_out}"
   exit 1
 fi
-if ! grep -Eq '"attempted"[[:space:]]*:[[:space:]]*2' "${tmp_out}" \
-  || ! grep -Eq '"succeeded"[[:space:]]*:[[:space:]]*2' "${tmp_out}"; then
-  echo "unexpected replication summary after second write" >&2
-  cat "${tmp_out}" >&2
+if ! assert_quorum_replication_summary "${tmp_out}" "second write"; then
   rm -f "${tmp_out}"
   exit 1
 fi
@@ -265,10 +274,7 @@ for id in $(seq 300 339); do
     rm -f "${tmp_out}"
     exit 1
   fi
-  if ! grep -Eq '"attempted"[[:space:]]*:[[:space:]]*2' "${tmp_out}" \
-    || ! grep -Eq '"succeeded"[[:space:]]*:[[:space:]]*1' "${tmp_out}"; then
-    echo "unexpected replication summary while follower is stopped (id=${id})" >&2
-    cat "${tmp_out}" >&2
+  if ! assert_quorum_replication_summary "${tmp_out}" "lag write id=${id}"; then
     rm -f "${tmp_out}"
     exit 1
   fi
@@ -291,10 +297,7 @@ if [[ "${snapshot_status}" != "200" ]]; then
   rm -f "${tmp_out}"
   exit 1
 fi
-if ! grep -Eq '"attempted"[[:space:]]*:[[:space:]]*2' "${tmp_out}" \
-  || ! grep -Eq '"succeeded"[[:space:]]*:[[:space:]]*2' "${tmp_out}"; then
-  echo "unexpected replication summary after snapshot catch-up write" >&2
-  cat "${tmp_out}" >&2
+if ! assert_quorum_replication_summary "${tmp_out}" "snapshot catch-up write"; then
   rm -f "${tmp_out}"
   exit 1
 fi

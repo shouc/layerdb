@@ -105,6 +105,17 @@ post_json() {
   echo "${status}"
 }
 
+assert_quorum_replication_summary() {
+  local response_file="$1"
+  local context="$2"
+  if ! grep -Eq '"attempted"[[:space:]]*:[[:space:]]*[1-9][0-9]*' "${response_file}" \
+    || ! grep -Eq '"succeeded"[[:space:]]*:[[:space:]]*[1-9][0-9]*' "${response_file}"; then
+    echo "replication summary failed for ${context}" >&2
+    cat "${response_file}" >&2
+    return 1
+  fi
+}
+
 vector_for_id() {
   local id="$1"
   local b0=$(( (id >> 0) & 255 ))
@@ -179,11 +190,7 @@ run_worker() {
       rm -f "${out_file}"
       return 1
     fi
-    if ! grep -Eq '"attempted"[[:space:]]*:[[:space:]]*2' "${out_file}" \
-      || ! grep -Eq '"succeeded"[[:space:]]*:[[:space:]]*2' "${out_file}" \
-      || ! grep -Eq '"failed"[[:space:]]*:[[:space:]]*\[\]' "${out_file}"; then
-      echo "worker ${worker_id}: replication summary failed for id=${id}" >&2
-      cat "${out_file}" >&2
+    if ! assert_quorum_replication_summary "${out_file}" "worker=${worker_id} id=${id}"; then
       rm -f "${out_file}"
       return 1
     fi

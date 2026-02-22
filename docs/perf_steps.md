@@ -558,3 +558,31 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.6012`
 - `search_qps_ratio=2.9612`
+
+## Step 23 (`dirty-id-fxhash-set`)
+
+Change:
+- Switched rebuild dirty-id tracking set from std `HashSet<u64>` to `FxHashSet<u64>` across:
+  - index runtime state,
+  - startup/open initialization,
+  - rebuilder runtime.
+- Updated WAL-tail replay touched-id accumulation to `FxHashSet` for consistency.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step24-spfresh.json`,
+  `target/vectordb-step24-lancedb.json`.
+
+SPFresh:
+- `update_qps=213528.82`
+- `search_qps=2876.99`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=124773.19`
+- `search_qps=852.29`
+- `recall_at_k=0.4825`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.7113`
+- `search_qps_ratio=3.3756`

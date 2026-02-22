@@ -13,7 +13,7 @@ mod vector_blocks;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -237,7 +237,7 @@ pub struct SpFreshLayerDbIndex {
     active_generation: Arc<AtomicU64>,
     index: Arc<RwLock<RuntimeSpFreshIndex>>,
     update_gate: Arc<RwLock<()>>,
-    dirty_ids: Arc<Mutex<HashSet<u64>>>,
+    dirty_ids: Arc<Mutex<FxHashSet<u64>>>,
     pending_ops: Arc<AtomicUsize>,
     vector_cache: Arc<Mutex<VectorCache>>,
     vector_blocks: Arc<Mutex<VectorBlockStore>>,

@@ -4,6 +4,7 @@ use std::thread::JoinHandle;
 
 use anyhow::Context;
 use layerdb::Db;
+use rustc_hash::FxHashSet;
 
 use crate::types::VectorIndex;
 
@@ -21,7 +22,7 @@ pub(crate) struct RebuilderRuntime {
     pub active_generation: Arc<AtomicU64>,
     pub index: Arc<RwLock<RuntimeSpFreshIndex>>,
     pub update_gate: Arc<RwLock<()>>,
-    pub dirty_ids: Arc<Mutex<std::collections::HashSet<u64>>>,
+    pub dirty_ids: Arc<Mutex<FxHashSet<u64>>>,
     pub pending_ops: Arc<AtomicUsize>,
     pub vector_cache: Arc<Mutex<VectorCache>>,
     pub vector_blocks: Arc<Mutex<VectorBlockStore>>,

@@ -114,7 +114,7 @@ impl SpFreshLayerDbIndex {
         }
         let active_generation = Arc::new(AtomicU64::new(generation));
         let update_gate = Arc::new(RwLock::new(()));
-        let dirty_ids = Arc::new(Mutex::new(HashSet::new()));
+        let dirty_ids = Arc::new(Mutex::new(FxHashSet::default()));
         let pending_ops = Arc::new(AtomicUsize::new(0));
         let wal_next_seq = Arc::new(AtomicU64::new(wal_next_seq));
         let posting_event_next_seq = Arc::new(AtomicU64::new(posting_event_next_seq));
@@ -263,7 +263,7 @@ impl SpFreshLayerDbIndex {
             return Ok(());
         }
 
-        let mut touched = HashSet::with_capacity(entries.len());
+        let mut touched = FxHashSet::with_capacity_and_hasher(entries.len(), Default::default());
         for entry in entries {
             match entry {
                 IndexWalEntry::Touch { id } => {

@@ -908,20 +908,57 @@ pub(crate) fn encode_wal_vector_delete_batch(ids: &[u64]) -> anyhow::Result<Vec<
     encode_wal_frame(payload.as_slice())
 }
 
+#[cfg(test)]
 pub(crate) fn encode_wal_diskmeta_upsert_batch(
     rows: &[(u64, Vec<f32>)],
     old_states: &FxHashMap<u64, Option<(usize, Vec<f32>)>>,
     new_postings: &FxHashMap<u64, usize>,
 ) -> anyhow::Result<Vec<u8>> {
+    let mut old_states_ordered = Vec::with_capacity(rows.len());
+    let mut new_postings_ordered = Vec::with_capacity(rows.len());
+    for (id, _new_values) in rows {
+        old_states_ordered.push(old_states.get(id).cloned().unwrap_or(None));
+        let posting = new_postings
+            .get(id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("missing new posting for diskmeta wal id={id}"))?;
+        new_postings_ordered.push(posting);
+    }
+    encode_wal_diskmeta_upsert_batch_ordered(
+        rows,
+        old_states_ordered.as_slice(),
+        new_postings_ordered.as_slice(),
+    )
+}
+
+pub(crate) fn encode_wal_diskmeta_upsert_batch_ordered(
+    rows: &[(u64, Vec<f32>)],
+    old_states: &[Option<(usize, Vec<f32>)>],
+    new_postings: &[usize],
+) -> anyhow::Result<Vec<u8>> {
+    if rows.len() != old_states.len() {
+        anyhow::bail!(
+            "diskmeta wal upsert ordered old state len mismatch: rows={} old_states={}",
+            rows.len(),
+            old_states.len()
+        );
+    }
+    if rows.len() != new_postings.len() {
+        anyhow::bail!(
+            "diskmeta wal upsert ordered posting len mismatch: rows={} new_postings={}",
+            rows.len(),
+            new_postings.len()
+        );
+    }
     let mut payload_len = 1usize + 4usize;
-    for (id, new_values) in rows {
+    for (old, (_id, new_values)) in old_states.iter().zip(rows.iter()) {
         payload_len = payload_len
             .saturating_add(8) // id
             .saturating_add(1) // old-state flags
             .saturating_add(8) // new posting
             .saturating_add(4) // new vector len
             .saturating_add(new_values.len().saturating_mul(std::mem::size_of::<f32>()));
-        if let Some(Some((_old_posting, old_values))) = old_states.get(id) {
+        if let Some((_old_posting, old_values)) = old.as_ref() {
             payload_len = payload_len
                 .saturating_add(8) // old posting
                 .saturating_add(4) // old vector len
@@ -933,33 +970,49 @@ pub(crate) fn encode_wal_diskmeta_upsert_batch(
     let len =
         u32::try_from(rows.len()).context("wal diskmeta upsert-batch len does not fit u32")?;
     payload.extend_from_slice(&len.to_le_bytes());
-    for (id, new_values) in rows {
+    for (((id, new_values), old), new_posting) in
+        rows.iter().zip(old_states.iter()).zip(new_postings.iter())
+    {
         payload.extend_from_slice(&id.to_le_bytes());
-        let old = old_states
-            .get(id)
-            .and_then(|state| state.as_ref())
+        let old = old
+            .as_ref()
             .map(|(posting, values)| (*posting, values.as_slice()));
         encode_wal_diskmeta_old_state(&mut payload, old)?;
-        let new_posting = new_postings
-            .get(id)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("missing new posting for diskmeta wal id={id}"))?;
         let posting_u64 =
-            u64::try_from(new_posting).context("wal diskmeta new posting does not fit u64")?;
+            u64::try_from(*new_posting).context("wal diskmeta new posting does not fit u64")?;
         payload.extend_from_slice(&posting_u64.to_le_bytes());
         encode_wal_f32_vec(&mut payload, new_values.as_slice())?;
     }
     encode_wal_frame(payload.as_slice())
 }
 
+#[cfg(test)]
 pub(crate) fn encode_wal_diskmeta_delete_batch(
     ids: &[u64],
     old_states: &FxHashMap<u64, Option<(usize, Vec<f32>)>>,
 ) -> anyhow::Result<Vec<u8>> {
+    let old_states_ordered = ids
+        .iter()
+        .map(|id| old_states.get(id).cloned().unwrap_or(None))
+        .collect::<Vec<_>>();
+    encode_wal_diskmeta_delete_batch_ordered(ids, old_states_ordered.as_slice())
+}
+
+pub(crate) fn encode_wal_diskmeta_delete_batch_ordered(
+    ids: &[u64],
+    old_states: &[Option<(usize, Vec<f32>)>],
+) -> anyhow::Result<Vec<u8>> {
+    if ids.len() != old_states.len() {
+        anyhow::bail!(
+            "diskmeta wal delete ordered old state len mismatch: ids={} old_states={}",
+            ids.len(),
+            old_states.len()
+        );
+    }
     let mut payload_len = 1usize + 4usize;
-    for id in ids {
+    for old in old_states {
         payload_len = payload_len.saturating_add(8).saturating_add(1); // id + old-state flags
-        if let Some(Some((_old_posting, old_values))) = old_states.get(id) {
+        if let Some((_old_posting, old_values)) = old.as_ref() {
             payload_len = payload_len
                 .saturating_add(8) // old posting
                 .saturating_add(4) // old vector len
@@ -970,11 +1023,10 @@ pub(crate) fn encode_wal_diskmeta_delete_batch(
     payload.push(WAL_KIND_DISKMETA_DELETE_BATCH);
     let len = u32::try_from(ids.len()).context("wal diskmeta delete-batch len does not fit u32")?;
     payload.extend_from_slice(&len.to_le_bytes());
-    for id in ids {
+    for (id, old) in ids.iter().zip(old_states.iter()) {
         payload.extend_from_slice(&id.to_le_bytes());
-        let old = old_states
-            .get(id)
-            .and_then(|state| state.as_ref())
+        let old = old
+            .as_ref()
             .map(|(posting, values)| (*posting, values.as_slice()));
         encode_wal_diskmeta_old_state(&mut payload, old)?;
     }

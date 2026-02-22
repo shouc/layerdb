@@ -226,35 +226,34 @@ impl SpFreshLayerDbIndex {
         Ok(())
     }
 
-    pub(super) fn load_ephemeral_row_states_for_ids(&self, ids: &[u64]) -> DiskMetaStateMap {
+    pub(super) fn load_ephemeral_row_states_for_ids_ordered(
+        &self,
+        ids: &[u64],
+    ) -> Vec<DiskMetaRowState> {
         let guard = lock_mutex(&self.ephemeral_row_states);
-        let mut out = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         if let Some(states) = guard.as_ref() {
-            for id in ids {
-                out.insert(*id, states.get(id).cloned());
-            }
+            ids.iter()
+                .map(|id| states.get(id).cloned())
+                .collect::<Vec<_>>()
         } else {
-            for id in ids {
-                out.insert(*id, None);
-            }
+            vec![None; ids.len()]
         }
-        out
     }
 
-    pub(super) fn apply_ephemeral_row_upserts(
+    pub(super) fn apply_ephemeral_row_upserts_ordered(
         &self,
         mutations: &[(u64, Vec<f32>)],
-        new_postings: &FxHashMap<u64, usize>,
+        new_postings: &[usize],
     ) {
+        if mutations.len() != new_postings.len() {
+            return;
+        }
         let mut guard = lock_mutex(&self.ephemeral_row_states);
         let Some(states) = guard.as_mut() else {
             return;
         };
-        for (id, vector) in mutations {
-            let Some(new_posting) = new_postings.get(id).copied() else {
-                continue;
-            };
-            states.insert(*id, (new_posting, vector.clone()));
+        for ((id, vector), posting) in mutations.iter().zip(new_postings.iter()) {
+            states.insert(*id, (*posting, vector.clone()));
         }
     }
 

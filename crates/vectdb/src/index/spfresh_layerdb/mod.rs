@@ -39,8 +39,8 @@ use stats::SpFreshLayerDbStatsInner;
 use storage::{
     decode_vector_row_value, decode_vector_row_with_posting, encode_posting_members_snapshot,
     encode_u64_fixed, encode_vector_row_fields, encode_vector_row_value,
-    encode_vector_row_value_with_posting, encode_wal_diskmeta_delete_batch,
-    encode_wal_diskmeta_upsert_batch, encode_wal_vector_delete_batch,
+    encode_vector_row_value_with_posting, encode_wal_diskmeta_delete_batch_ordered,
+    encode_wal_diskmeta_upsert_batch_ordered, encode_wal_vector_delete_batch,
     encode_wal_vector_upsert_batch, ensure_active_generation, ensure_metadata,
     ensure_posting_event_next_seq, ensure_wal_exists, ensure_wal_next_seq,
     load_index_checkpoint_bytes, load_metadata, load_posting_members, load_row, load_rows,
@@ -86,7 +86,6 @@ pub enum MutationCommitMode {
 }
 
 type DiskMetaRowState = Option<(usize, Vec<f32>)>;
-type DiskMetaStateMap = FxHashMap<u64, DiskMetaRowState>;
 type EphemeralPostingMembers = FxHashMap<usize, FxHashSet<u64>>;
 type EphemeralRowStates = FxHashMap<u64, (usize, Vec<f32>)>;
 type DistanceRow = (u64, f32);

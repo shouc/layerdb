@@ -235,12 +235,12 @@ impl SpFreshLayerDbIndex {
         Ok(())
     }
 
-    fn load_diskmeta_states_for_ids(
+    fn load_diskmeta_states_for_ids_ordered(
         &self,
         generation: u64,
         ids: &[u64],
-    ) -> anyhow::Result<DiskMetaStateMap> {
-        let mut out = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
+    ) -> anyhow::Result<Vec<DiskMetaRowState>> {
+        let mut out = vec![None; ids.len()];
         if ids.is_empty() {
             return Ok(out);
         }
@@ -248,15 +248,15 @@ impl SpFreshLayerDbIndex {
         let mut unresolved = Vec::new();
         {
             let blocks = lock_mutex(&self.vector_blocks);
-            for id in ids.iter().copied() {
+            for (idx, id) in ids.iter().copied().enumerate() {
                 if let Some(state) = blocks.get_state(id) {
                     if let Some(posting_id) = state.posting_id {
-                        out.insert(id, Some((posting_id, state.values)));
+                        out[idx] = Some((posting_id, state.values));
                     } else {
-                        unresolved.push(id);
+                        unresolved.push((idx, id));
                     }
                 } else {
-                    unresolved.push(id);
+                    unresolved.push((idx, id));
                 }
             }
         }
@@ -267,29 +267,27 @@ impl SpFreshLayerDbIndex {
 
         let row_keys: Vec<Bytes> = unresolved
             .iter()
-            .map(|id| Bytes::from(vector_key(generation, *id)))
+            .map(|(_, id)| Bytes::from(vector_key(generation, *id)))
             .collect();
         let row_values = self
             .db
             .multi_get(&row_keys, ReadOptions::default())
             .context("diskmeta multi_get fallback vector rows")?;
 
-        for (id, row_raw) in unresolved.into_iter().zip(row_values.into_iter()) {
+        for ((idx, id), row_raw) in unresolved.into_iter().zip(row_values.into_iter()) {
             let Some(raw) = row_raw else {
-                out.insert(id, None);
+                out[idx] = None;
                 continue;
             };
             let decoded = decode_vector_row_with_posting(raw.as_ref())
                 .with_context(|| format!("decode vector row id={id} generation={generation}"))?;
             if decoded.row.deleted {
-                out.insert(id, None);
+                out[idx] = None;
                 continue;
             }
-            if let Some(posting_id) = decoded.posting_id {
-                out.insert(id, Some((posting_id, decoded.row.values)));
-            } else {
-                out.insert(id, None);
-            }
+            out[idx] = decoded
+                .posting_id
+                .map(|posting_id| (posting_id, decoded.row.values));
         }
         Ok(out)
     }
@@ -389,9 +387,9 @@ impl SpFreshLayerDbIndex {
             let use_fast_path = self.use_nondurable_fast_path();
             let ids: Vec<u64> = mutations.iter().map(|(id, _)| *id).collect();
             let states = if use_fast_path {
-                self.load_ephemeral_row_states_for_ids(&ids)
+                self.load_ephemeral_row_states_for_ids_ordered(&ids)
             } else {
-                self.load_diskmeta_states_for_ids(generation, &ids)?
+                self.load_diskmeta_states_for_ids_ordered(generation, &ids)?
             };
             let mut shadow = match &*lock_read(&self.index) {
                 RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.clone(),
@@ -399,15 +397,14 @@ impl SpFreshLayerDbIndex {
             };
             let mut posting_event_next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(3));
-            let mut new_postings =
-                FxHashMap::with_capacity_and_hasher(mutations.len(), Default::default());
+            let mut new_postings = Vec::with_capacity(mutations.len());
             let mut dirty_postings = FxHashSet::with_capacity_and_hasher(
                 mutations.len().saturating_mul(2),
                 Default::default(),
             );
             let mut posting_deltas = Vec::with_capacity(mutations.len());
-            for (id, vector) in &mutations {
-                let old = states.get(id).and_then(|state| state.as_ref());
+            for ((id, vector), old_state) in mutations.iter().zip(states.iter()) {
+                let old = old_state.as_ref();
                 let new_posting = shadow.choose_posting(vector).unwrap_or(0);
                 let old_posting = old.map(|(posting, _)| *posting);
                 if !use_fast_path {
@@ -452,14 +449,17 @@ impl SpFreshLayerDbIndex {
                     new_posting,
                     vector.as_slice(),
                 );
-                new_postings.insert(*id, new_posting);
+                new_postings.push(new_posting);
             }
             if use_fast_path {
                 self.stats
                     .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
             } else {
-                let wal_payload =
-                    encode_wal_diskmeta_upsert_batch(mutations.as_slice(), &states, &new_postings)?;
+                let wal_payload = encode_wal_diskmeta_upsert_batch_ordered(
+                    mutations.as_slice(),
+                    states.as_slice(),
+                    new_postings.as_slice(),
+                )?;
                 let posting_event_next = encode_u64_fixed(posting_event_next_seq);
                 let trailer_ops = vec![layerdb::Op::put(
                     config::META_POSTING_EVENT_NEXT_SEQ_KEY,
@@ -484,9 +484,9 @@ impl SpFreshLayerDbIndex {
             }
             {
                 let mut blocks = lock_mutex(&self.vector_blocks);
-                if let Err(err) = blocks.append_upsert_batch_with_posting(&mutations, |id| {
-                    new_postings.get(&id).copied()
-                }) {
+                if let Err(err) =
+                    blocks.append_upsert_batch_with_postings(&mutations, new_postings.as_slice())
+                {
                     eprintln!("spfresh-layerdb vector blocks upsert append failed: {err:#}");
                 }
             }
@@ -512,7 +512,7 @@ impl SpFreshLayerDbIndex {
                 for (id, vector) in &mutations {
                     cache.put(*id, vector.clone());
                 }
-                self.apply_ephemeral_row_upserts(&mutations, &new_postings);
+                self.apply_ephemeral_row_upserts_ordered(&mutations, new_postings.as_slice());
                 self.apply_ephemeral_posting_upsert_deltas(posting_deltas);
             } else {
                 let mut cache = lock_mutex(&self.vector_cache);
@@ -646,9 +646,9 @@ impl SpFreshLayerDbIndex {
         if self.cfg.memory_mode == SpFreshMemoryMode::OffHeapDiskMeta {
             let use_fast_path = self.use_nondurable_fast_path();
             let states = if use_fast_path {
-                self.load_ephemeral_row_states_for_ids(&mutations)
+                self.load_ephemeral_row_states_for_ids_ordered(&mutations)
             } else {
-                self.load_diskmeta_states_for_ids(generation, &mutations)?
+                self.load_diskmeta_states_for_ids_ordered(generation, &mutations)?
             };
             let mut shadow = match &*lock_read(&self.index) {
                 RuntimeSpFreshIndex::OffHeapDiskMeta(index) => index.clone(),
@@ -660,8 +660,8 @@ impl SpFreshLayerDbIndex {
                 FxHashSet::with_capacity_and_hasher(mutations.len(), Default::default());
             let mut posting_delete_deltas = Vec::with_capacity(mutations.len());
             let mut posting_event_next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
-            for id in &mutations {
-                let old = states.get(id).and_then(|state| state.as_ref());
+            for (id, old_state) in mutations.iter().zip(states.iter()) {
+                let old = old_state.as_ref();
                 if !use_fast_path {
                     batch_ops.push(layerdb::Op::delete(vector_key(generation, *id)));
                 }
@@ -692,7 +692,10 @@ impl SpFreshLayerDbIndex {
                 self.stats
                     .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
             } else {
-                let wal_payload = encode_wal_diskmeta_delete_batch(mutations.as_slice(), &states)?;
+                let wal_payload = encode_wal_diskmeta_delete_batch_ordered(
+                    mutations.as_slice(),
+                    states.as_slice(),
+                )?;
                 let posting_event_next = encode_u64_fixed(posting_event_next_seq);
                 let trailer_ops = vec![layerdb::Op::put(
                     config::META_POSTING_EVENT_NEXT_SEQ_KEY,

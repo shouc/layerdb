@@ -1,5 +1,5 @@
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -373,36 +373,108 @@ impl VectorBlockStore {
 
     fn rebuild_offsets(&mut self) -> anyhow::Result<()> {
         self.offsets.clear();
-        self.file
-            .seek(SeekFrom::Start(0))
-            .context("seek vector blocks before scan")?;
-        let mut bytes = Vec::new();
-        self.file
-            .read_to_end(&mut bytes)
-            .context("read vector blocks for offset scan")?;
-        if bytes.len() < header_size() {
+        let file_len = self
+            .file
+            .metadata()
+            .context("stat vector blocks before scan")?
+            .len();
+        if file_len < u64::try_from(header_size()).context("vector blocks header size overflow")? {
+            self.file
+                .seek(SeekFrom::End(0))
+                .context("seek vector blocks end after empty scan")?;
             return Ok(());
         }
         let rec_size = record_size(self.dim);
-        let mut cursor = header_size();
-        while cursor + rec_size <= bytes.len() {
-            let record = &bytes[cursor..cursor + rec_size];
-            let mut id_arr = [0u8; 8];
-            id_arr.copy_from_slice(&record[..8]);
-            let id = u64::from_le_bytes(id_arr);
-            let tombstone = record[8];
-            let offset = u64::try_from(cursor).context("vector block offset overflow")?;
-            if tombstone == VECTOR_BLOCK_TOMBSTONE {
-                self.offsets.remove(&id);
-            } else {
-                self.offsets.insert(id, offset);
+        let chunk_size = rec_size.saturating_mul(1024).max(rec_size);
+        let mut reader = BufReader::with_capacity(
+            chunk_size.max(64 * 1024),
+            self.file.try_clone().context("clone vector blocks file")?,
+        );
+        let mut offset = u64::try_from(header_size()).context("vector block offset overflow")?;
+        reader
+            .seek(SeekFrom::Start(offset))
+            .context("seek vector blocks scan start")?;
+
+        let mut chunk = vec![0u8; chunk_size];
+        let mut carry = Vec::<u8>::new();
+        loop {
+            let read = reader
+                .read(chunk.as_mut_slice())
+                .context("read vector blocks scan chunk")?;
+            if read == 0 {
+                break;
             }
-            cursor += rec_size;
+            if carry.is_empty() {
+                let consumed = Self::scan_records_into_offsets(
+                    chunk.get(..read).expect("read length checked"),
+                    rec_size,
+                    offset,
+                    &mut self.offsets,
+                )?;
+                if consumed < read {
+                    carry.extend_from_slice(&chunk[consumed..read]);
+                }
+                offset = offset
+                    .checked_add(u64::try_from(consumed).context("vector block offset overflow")?)
+                    .ok_or_else(|| anyhow::anyhow!("vector block offset overflow"))?;
+            } else {
+                let mut merged = Vec::with_capacity(carry.len().saturating_add(read));
+                merged.extend_from_slice(carry.as_slice());
+                merged.extend_from_slice(chunk.get(..read).expect("read length checked"));
+                let consumed = Self::scan_records_into_offsets(
+                    merged.as_slice(),
+                    rec_size,
+                    offset,
+                    &mut self.offsets,
+                )?;
+                carry.clear();
+                if consumed < merged.len() {
+                    carry.extend_from_slice(&merged[consumed..]);
+                }
+                offset = offset
+                    .checked_add(u64::try_from(consumed).context("vector block offset overflow")?)
+                    .ok_or_else(|| anyhow::anyhow!("vector block offset overflow"))?;
+            }
         }
         self.file
             .seek(SeekFrom::End(0))
             .context("seek vector blocks end after scan")?;
         Ok(())
+    }
+
+    fn scan_records_into_offsets(
+        bytes: &[u8],
+        rec_size: usize,
+        base_offset: u64,
+        offsets: &mut FxHashMap<u64, u64>,
+    ) -> anyhow::Result<usize> {
+        let records_len = bytes.len() / rec_size * rec_size;
+        let mut cursor = 0usize;
+        while cursor < records_len {
+            let record = bytes
+                .get(cursor..cursor + rec_size)
+                .ok_or_else(|| anyhow::anyhow!("vector block scan record slice out of bounds"))?;
+            let mut id_arr = [0u8; 8];
+            id_arr.copy_from_slice(
+                record
+                    .get(..8)
+                    .ok_or_else(|| anyhow::anyhow!("vector block scan missing id bytes"))?,
+            );
+            let id = u64::from_le_bytes(id_arr);
+            let flags = *record
+                .get(8)
+                .ok_or_else(|| anyhow::anyhow!("vector block scan missing flags byte"))?;
+            let record_offset = base_offset
+                .checked_add(u64::try_from(cursor).context("vector block offset overflow")?)
+                .ok_or_else(|| anyhow::anyhow!("vector block offset overflow"))?;
+            if (flags & VECTOR_BLOCK_TOMBSTONE) != 0 {
+                offsets.remove(&id);
+            } else {
+                offsets.insert(id, record_offset);
+            }
+            cursor += rec_size;
+        }
+        Ok(records_len)
     }
 
     fn maybe_remap(&mut self) -> anyhow::Result<()> {
@@ -444,6 +516,29 @@ mod tests {
         assert_eq!(found[0].0, 1);
         assert!((found[0].1 - 0.0).abs() <= f32::EPSILON);
         assert_eq!(missing, vec![2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn reopen_rebuild_offsets_preserves_latest_live_records() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        {
+            let mut store = VectorBlockStore::open(dir.path(), 3, 7)?;
+            store.append_upsert_with_posting(1, Some(3), &[1.0, 2.0, 3.0])?;
+            store.append_upsert_with_posting(2, None, &[4.0, 5.0, 6.0])?;
+            store.append_upsert_with_posting(1, None, &[7.0, 8.0, 9.0])?;
+            store.append_delete_batch(&[2])?;
+            store.remap()?;
+            assert_eq!(store.live_len(), 1);
+            assert_eq!(store.get(1), Some(vec![7.0, 8.0, 9.0]));
+            assert_eq!(store.get(2), None);
+        }
+        {
+            let store = VectorBlockStore::open(dir.path(), 3, 7)?;
+            assert_eq!(store.live_len(), 1);
+            assert_eq!(store.get(1), Some(vec![7.0, 8.0, 9.0]));
+            assert_eq!(store.get(2), None);
+        }
         Ok(())
     }
 }

@@ -642,3 +642,35 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.4902`
 - `search_qps_ratio=3.5302`
+
+## Step 26 (`vector-block-offset-stream-scan`)
+
+Change:
+- Reworked `VectorBlockStore::rebuild_offsets()` to scan block files in fixed-size chunks instead of
+  `read_to_end(...)`.
+- This removes full-file heap materialization during startup/reopen and keeps offset rebuild memory
+  bounded.
+- Added test `reopen_rebuild_offsets_preserves_latest_live_records` to lock correct rebuild behavior.
+
+Benchmark note:
+- This step primarily targets startup memory behavior; throughput measurements were highly noisy in
+  this cycle.
+- Two same-dataset rerun pairs:
+  - run1: `target/vectordb-step27-spfresh.json`, `target/vectordb-step27-lancedb.json`
+  - run2: `target/vectordb-step27-spfresh-rerun2.json`,
+    `target/vectordb-step27-lancedb-rerun2.json`
+- Median ratios are reported below.
+
+SPFresh (run2):
+- `update_qps=212126.58`
+- `search_qps=2941.52`
+- `recall_at_k=0.6030`
+
+LanceDB (run2):
+- `update_qps=56825.65`
+- `search_qps=357.64`
+- `recall_at_k=0.4855`
+
+SPFresh/LanceDB ratio (median across run1/run2):
+- `update_qps_ratio=2.0804`
+- `search_qps_ratio=4.7138`

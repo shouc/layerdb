@@ -483,11 +483,12 @@ impl SpFreshLayerDbIndex {
                     config::META_POSTING_EVENT_NEXT_SEQ_KEY,
                     posting_event_next,
                 )];
-                let persist_entries =
-                    vec![(IndexWalEntry::TouchBatch { ids: touched_ids }, batch_ops)];
-                if let Err(err) =
-                    self.persist_with_wal_batch_ops(persist_entries, trailer_ops, commit_mode)
-                {
+                if let Err(err) = self.persist_with_wal_ops(
+                    IndexWalEntry::TouchBatch { ids: touched_ids },
+                    batch_ops,
+                    trailer_ops,
+                    commit_mode,
+                ) {
                     self.stats
                         .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
                     self.stats.inc_persist_errors();
@@ -551,10 +552,12 @@ impl SpFreshLayerDbIndex {
                 batch_ops.push(layerdb::Op::put(vector_key(generation, *id), value));
                 touched_ids.push(*id);
             }
-            let persist_entries = vec![(IndexWalEntry::TouchBatch { ids: touched_ids }, batch_ops)];
-            if let Err(err) =
-                self.persist_with_wal_batch_ops(persist_entries, Vec::new(), commit_mode)
-            {
+            if let Err(err) = self.persist_with_wal_ops(
+                IndexWalEntry::TouchBatch { ids: touched_ids },
+                batch_ops,
+                Vec::new(),
+                commit_mode,
+            ) {
                 self.stats
                     .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
                 self.stats.inc_persist_errors();
@@ -706,11 +709,12 @@ impl SpFreshLayerDbIndex {
                     config::META_POSTING_EVENT_NEXT_SEQ_KEY,
                     posting_event_next,
                 )];
-                let persist_entries =
-                    vec![(IndexWalEntry::TouchBatch { ids: touched_ids }, batch_ops)];
-                if let Err(err) =
-                    self.persist_with_wal_batch_ops(persist_entries, trailer_ops, commit_mode)
-                {
+                if let Err(err) = self.persist_with_wal_ops(
+                    IndexWalEntry::TouchBatch { ids: touched_ids },
+                    batch_ops,
+                    trailer_ops,
+                    commit_mode,
+                ) {
                     self.stats
                         .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
                     self.stats.inc_persist_errors();
@@ -766,10 +770,12 @@ impl SpFreshLayerDbIndex {
                 batch_ops.push(layerdb::Op::delete(vector_key(generation, *id)));
                 touched_ids.push(*id);
             }
-            let persist_entries = vec![(IndexWalEntry::TouchBatch { ids: touched_ids }, batch_ops)];
-            if let Err(err) =
-                self.persist_with_wal_batch_ops(persist_entries, Vec::new(), commit_mode)
-            {
+            if let Err(err) = self.persist_with_wal_ops(
+                IndexWalEntry::TouchBatch { ids: touched_ids },
+                batch_ops,
+                Vec::new(),
+                commit_mode,
+            ) {
                 self.stats
                     .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
                 self.stats.inc_persist_errors();

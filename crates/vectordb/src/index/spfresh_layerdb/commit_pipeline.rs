@@ -103,54 +103,31 @@ impl SpFreshLayerDbIndex {
             self.poll_pending_commits()
         }
     }
-    pub(super) fn persist_with_wal_batch_ops(
+    pub(super) fn persist_with_wal_ops(
         &self,
-        entries: Vec<(IndexWalEntry, Vec<layerdb::Op>)>,
+        entry: IndexWalEntry,
+        mut row_ops: Vec<layerdb::Op>,
         mut trailer_ops: Vec<layerdb::Op>,
         commit_mode: MutationCommitMode,
     ) -> anyhow::Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
         let start_seq = self.wal_next_seq.load(Ordering::Relaxed);
-        let entry_count = entries.len();
-        let mut next_seq = start_seq;
-        let mut ops = if entry_count == 1 {
-            let mut iter = entries.into_iter();
-            let (entry, mut row_ops) = iter.next().expect("entry_count checked non-zero");
-            let mut out = Vec::with_capacity(row_ops.len() + 1 + trailer_ops.len() + 1);
-            let wal_value = encode_wal_entry(&entry)?;
-            row_ops.push(layerdb::Op::put(wal_key(next_seq), wal_value));
-            out.append(&mut row_ops);
-            next_seq = next_seq
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("spfresh wal sequence overflow"))?;
-            out
-        } else {
-            let mut out = Vec::new();
-            for (entry, mut row_ops) in entries {
-                let wal_value = encode_wal_entry(&entry)?;
-                row_ops.push(layerdb::Op::put(wal_key(next_seq), wal_value));
-                out.append(&mut row_ops);
-                next_seq = next_seq
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("spfresh wal sequence overflow"))?;
-            }
-            out
-        };
+        let next_seq = start_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("spfresh wal sequence overflow"))?;
+        row_ops.reserve(trailer_ops.len().saturating_add(2));
+        let wal_value = encode_wal_entry(&entry)?;
+        row_ops.push(layerdb::Op::put(wal_key(start_seq), wal_value));
         let wal_next = bincode::serialize(&next_seq).context("encode spfresh wal next seq")?;
-        ops.push(layerdb::Op::put(
+        row_ops.push(layerdb::Op::put(
             config::META_INDEX_WAL_NEXT_SEQ_KEY,
             wal_next,
         ));
-        ops.append(&mut trailer_ops);
+        row_ops.append(&mut trailer_ops);
         let sync = matches!(commit_mode, MutationCommitMode::Durable);
-        self.submit_commit(ops, sync, true).with_context(|| {
+        self.submit_commit(row_ops, sync, true).with_context(|| {
             format!(
-                "persist vector+wal batch count={} seq_start={} seq_end={}",
-                next_seq.saturating_sub(start_seq),
-                start_seq,
-                next_seq.saturating_sub(1)
+                "persist vector+wal single seq={} next={next_seq}",
+                start_seq
             )
         })?;
         self.wal_next_seq.store(next_seq, Ordering::Relaxed);

@@ -420,3 +420,32 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=0.9974`
 - `search_qps_ratio=3.5513`
+
+## Step 18 (`wal-single-entry-api-and-capacity-reserve`)
+
+Change:
+- Removed the now-unused multi-entry WAL persist helper from the hot mutation path and
+  standardized callers on `persist_with_wal_ops(...)`.
+- Added a single `row_ops.reserve(trailer_ops.len() + 2)` in `persist_with_wal_ops(...)` so
+  WAL/meta/trailer append does not trigger extra vector growth on common update/delete commits.
+
+Benchmark note:
+- The first full gate run at `target/vectordb-step19/summary.json` was noisy and underperformed
+  during long release compile pressure.
+- Reported numbers below use a clean same-dataset rerun pair:
+  `target/vectordb-step19-spfresh-rerun.json`,
+  `target/vectordb-step19-lancedb-rerun.json`.
+
+SPFresh:
+- `update_qps=147255.97`
+- `search_qps=1761.06`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=65178.69`
+- `search_qps=439.07`
+- `recall_at_k=0.4880`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=2.2593`
+- `search_qps_ratio=4.0109`

@@ -59,12 +59,15 @@ impl ClusterTopology {
         for partition_id in 0..partition_count {
             let mut scored: Vec<(u64, &str)> = unique
                 .iter()
-                .map(|endpoint| (rendezvous_score(partition_id, endpoint.as_str()), endpoint.as_str()))
+                .map(|endpoint| {
+                    (
+                        rendezvous_score(partition_id, endpoint.as_str()),
+                        endpoint.as_str(),
+                    )
+                })
                 .collect();
             scored.sort_unstable_by(|(lhs_score, lhs_ep), (rhs_score, rhs_ep)| {
-                rhs_score
-                    .cmp(lhs_score)
-                    .then_with(|| lhs_ep.cmp(rhs_ep))
+                rhs_score.cmp(lhs_score).then_with(|| lhs_ep.cmp(rhs_ep))
             });
             let replicas: Vec<String> = scored
                 .iter()
@@ -117,7 +120,10 @@ impl ClusterTopology {
                 );
             }
             if seen_partition_ids[id] {
-                anyhow::bail!("duplicate placement for partition {}", placement.partition_id);
+                anyhow::bail!(
+                    "duplicate placement for partition {}",
+                    placement.partition_id
+                );
             }
             seen_partition_ids[id] = true;
             if placement.replicas.len() != self.replication_factor as usize {
@@ -129,7 +135,10 @@ impl ClusterTopology {
                 );
             }
             if placement.leader.is_empty() {
-                anyhow::bail!("partition {} leader must not be empty", placement.partition_id);
+                anyhow::bail!(
+                    "partition {} leader must not be empty",
+                    placement.partition_id
+                );
             }
             if !placement
                 .replicas
@@ -145,7 +154,10 @@ impl ClusterTopology {
             let mut seen_replicas = HashSet::with_capacity(placement.replicas.len());
             for endpoint in &placement.replicas {
                 if endpoint.is_empty() {
-                    anyhow::bail!("partition {} has empty replica endpoint", placement.partition_id);
+                    anyhow::bail!(
+                        "partition {} has empty replica endpoint",
+                        placement.partition_id
+                    );
                 }
                 if !seen_replicas.insert(endpoint) {
                     anyhow::bail!(

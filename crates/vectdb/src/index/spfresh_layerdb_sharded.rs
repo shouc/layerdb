@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 
@@ -56,22 +57,27 @@ pub struct SpFreshLayerDbShardedIndex {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct HeapNeighbor(Neighbor);
 
+#[cfg(test)]
 impl PartialEq for HeapNeighbor {
     fn eq(&self, other: &Self) -> bool {
         self.0.id == other.0.id && self.0.distance.to_bits() == other.0.distance.to_bits()
     }
 }
 
+#[cfg(test)]
 impl Eq for HeapNeighbor {}
 
+#[cfg(test)]
 impl PartialOrd for HeapNeighbor {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
+#[cfg(test)]
 impl Ord for HeapNeighbor {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0
@@ -513,68 +519,43 @@ impl SpFreshLayerDbShardedIndex {
     }
 
     fn search_with_exact_shard_prune(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
-        if k == 1 {
-            let best = self
-                .shards
-                .par_iter()
-                .filter_map(|shard| shard.search(query, 1).into_iter().next())
-                .reduce_with(|left, right| {
-                    if Self::neighbor_cmp(&left, &right).is_le() {
-                        left
-                    } else {
-                        right
-                    }
-                });
-            return best.into_iter().collect();
-        }
-
         let mut lower_bounds: Vec<(usize, f32)> = self
             .shards
             .par_iter()
             .enumerate()
             .map(|(shard_id, shard)| {
-                let distance = shard
+                let best = shard
                     .search(query, 1)
                     .into_iter()
                     .next()
-                    .map(|neighbor| neighbor.distance)
+                    .map(|n| n.distance)
                     .unwrap_or(f32::INFINITY);
-                (shard_id, distance)
+                (shard_id, best)
             })
             .collect();
-        lower_bounds.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        lower_bounds.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
-        let mut top: BinaryHeap<HeapNeighbor> = BinaryHeap::with_capacity(k);
+        let mut top: Vec<Neighbor> = Vec::with_capacity(k);
         let window_size = rayon::current_num_threads()
             .max(1)
             .min(self.shards.len().max(1));
         let mut cursor = 0usize;
         while cursor < lower_bounds.len() {
-            let worst = top
-                .peek()
-                .map(|neighbor| neighbor.0.distance)
-                .unwrap_or(f32::INFINITY);
-            if top.len() >= k && lower_bounds[cursor].1 > worst {
+            let worst = top.last().map(|n| n.distance).unwrap_or(f32::INFINITY);
+            if top.len() >= k && lower_bounds[cursor].1 >= worst {
                 break;
             }
 
             let mut window = Vec::with_capacity(window_size);
             while cursor < lower_bounds.len() && window.len() < window_size {
-                let (shard_id, lower_bound) = &lower_bounds[cursor];
-                if !lower_bound.is_finite() {
-                    cursor = cursor.saturating_add(1);
-                    continue;
-                }
+                let (shard_id, lower_bound) = lower_bounds[cursor];
                 if top.len() >= k {
-                    let worst_now = top
-                        .peek()
-                        .map(|neighbor| neighbor.0.distance)
-                        .unwrap_or(f32::INFINITY);
-                    if *lower_bound > worst_now {
+                    let worst_now = top.last().map(|n| n.distance).unwrap_or(f32::INFINITY);
+                    if lower_bound >= worst_now {
                         break;
                     }
                 }
-                window.push(*shard_id);
+                window.push(shard_id);
                 cursor = cursor.saturating_add(1);
             }
             if window.is_empty() {
@@ -587,30 +568,34 @@ impl SpFreshLayerDbShardedIndex {
                 .collect();
             for shard_neighbors in results {
                 for neighbor in shard_neighbors {
-                    Self::push_heap_topk(&mut top, neighbor, k);
+                    Self::push_neighbor_topk(&mut top, neighbor, k);
                 }
             }
+            top.sort_by(Self::neighbor_cmp);
         }
-        let mut out: Vec<Neighbor> = top.into_iter().map(|entry| entry.0).collect();
-        out.sort_unstable_by(Self::neighbor_cmp);
-        out
+        top.sort_by(Self::neighbor_cmp);
+        if top.len() > k {
+            top.truncate(k);
+        }
+        top
     }
 
-    fn push_heap_topk(top: &mut BinaryHeap<HeapNeighbor>, candidate: Neighbor, k: usize) {
+    fn push_neighbor_topk(top: &mut Vec<Neighbor>, candidate: Neighbor, k: usize) {
         if k == 0 {
             return;
         }
         if top.len() < k {
-            top.push(HeapNeighbor(candidate));
+            top.push(candidate);
             return;
         }
-        let replace = top
-            .peek()
-            .map(|worst| Self::neighbor_cmp(&candidate, &worst.0).is_lt())
-            .unwrap_or(true);
-        if replace {
-            let _ = top.pop();
-            top.push(HeapNeighbor(candidate));
+        let mut worst_idx = 0usize;
+        for idx in 1..top.len() {
+            if Self::neighbor_cmp(&top[idx], &top[worst_idx]).is_gt() {
+                worst_idx = idx;
+            }
+        }
+        if Self::neighbor_cmp(&candidate, &top[worst_idx]).is_lt() {
+            top[worst_idx] = candidate;
         }
     }
 
@@ -625,28 +610,10 @@ impl SpFreshLayerDbShardedIndex {
     }
 
     pub fn try_bulk_load_owned(&mut self, rows: Vec<VectorRecord>) -> anyhow::Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
         self.validate_rows_dims(rows.as_slice())?;
         let mut shard_counts = vec![0usize; self.cfg.shard_count];
-        let mut single_shard = None;
-        let mut all_same_shard = true;
         for row in &rows {
-            let shard = self.shard_for_id(row.id);
-            shard_counts[shard] += 1;
-            match single_shard {
-                None => single_shard = Some(shard),
-                Some(existing) if existing != shard => all_same_shard = false,
-                Some(_) => {}
-            }
-        }
-        if all_same_shard {
-            if let Some(shard_id) = single_shard {
-                return self.shards[shard_id]
-                    .try_bulk_load(rows.as_slice())
-                    .with_context(|| format!("bulk load shard {}", shard_id));
-            }
+            shard_counts[self.shard_for_id(row.id)] += 1;
         }
         let mut partitioned: Vec<Vec<VectorRecord>> = shard_counts
             .iter()
@@ -654,11 +621,6 @@ impl SpFreshLayerDbShardedIndex {
             .collect();
         for row in rows {
             partitioned[self.shard_for_id(row.id)].push(row);
-        }
-        if let Some(shard_id) = Self::single_non_empty_partition(&partitioned) {
-            return self.shards[shard_id]
-                .try_bulk_load(&partitioned[shard_id])
-                .with_context(|| format!("bulk load shard {}", shard_id));
         }
         let results: Vec<anyhow::Result<()>> = self
             .shards
@@ -706,11 +668,6 @@ impl SpFreshLayerDbShardedIndex {
             return Ok(0);
         }
         self.validate_rows_dims(rows)?;
-        if self.shards.len() == 1 {
-            return self.shards[0]
-                .try_upsert_batch_with_commit_mode(rows, commit_mode)
-                .with_context(|| "upsert batch shard 0".to_string());
-        }
         if rows.len() == 1 {
             let shard_id = self.shard_for_id(rows[0].id);
             return self.shards[shard_id]
@@ -759,11 +716,6 @@ impl SpFreshLayerDbShardedIndex {
             return Ok(0);
         }
         self.validate_rows_dims(rows.as_slice())?;
-        if self.shards.len() == 1 {
-            return self.shards[0]
-                .try_upsert_batch_owned_with_commit_mode(rows, commit_mode)
-                .with_context(|| "upsert batch shard 0".to_string());
-        }
         if rows.len() == 1 {
             let row = rows.into_iter().next().expect("rows.len() == 1");
             let shard_id = self.shard_for_id(row.id);
@@ -828,11 +780,6 @@ impl SpFreshLayerDbShardedIndex {
         if ids.is_empty() {
             return Ok(0);
         }
-        if self.shards.len() == 1 {
-            return self.shards[0]
-                .try_delete_batch_with_commit_mode(ids, commit_mode)
-                .with_context(|| "delete batch shard 0".to_string());
-        }
         if ids.len() == 1 {
             return self
                 .try_delete_with_commit_mode(ids[0], commit_mode)
@@ -883,11 +830,6 @@ impl SpFreshLayerDbShardedIndex {
             return Ok(VectorMutationBatchResult::default());
         }
         self.validate_mutations_dims(mutations)?;
-        if self.shards.len() == 1 {
-            return self.shards[0]
-                .try_apply_batch_with_commit_mode(mutations, commit_mode)
-                .with_context(|| "apply batch shard 0".to_string());
-        }
         if mutations.len() == 1 {
             let shard_id = self.shard_for_id(mutations[0].id());
             return self.shards[shard_id]
@@ -914,11 +856,6 @@ impl SpFreshLayerDbShardedIndex {
             return Ok(VectorMutationBatchResult::default());
         }
         self.validate_mutations_dims(mutations.as_slice())?;
-        if self.shards.len() == 1 {
-            return self.shards[0]
-                .try_apply_batch_owned_with_commit_mode(mutations, commit_mode)
-                .with_context(|| "apply batch shard 0".to_string());
-        }
         if mutations.len() == 1 {
             let shard_id = self.shard_for_id(mutations[0].id());
             return self.shards[shard_id]
@@ -966,44 +903,21 @@ impl SpFreshLayerDbShardedIndex {
     }
 
     pub fn force_rebuild(&self) -> anyhow::Result<()> {
-        let results: Vec<anyhow::Result<()>> = self
-            .shards
-            .par_iter()
-            .enumerate()
-            .map(|(shard_id, shard)| {
-                shard
-                    .force_rebuild()
-                    .with_context(|| format!("force rebuild shard {}", shard_id))
-            })
-            .collect();
-        for result in results {
-            result?;
+        for (shard_id, shard) in self.shards.iter().enumerate() {
+            shard
+                .force_rebuild()
+                .with_context(|| format!("force rebuild shard {}", shard_id))?;
         }
         Ok(())
     }
 
     pub fn snapshot_rows(&self) -> anyhow::Result<Vec<VectorRecord>> {
-        let mut collected: Vec<anyhow::Result<(usize, Vec<VectorRecord>)>> = self
-            .shards
-            .par_iter()
-            .enumerate()
-            .map(|(shard_id, shard)| {
-                let rows = shard
-                    .snapshot_rows()
-                    .with_context(|| format!("snapshot rows shard {}", shard_id))?;
-                Ok((shard_id, rows))
-            })
-            .collect();
-        let mut ordered = Vec::with_capacity(collected.len());
-        for result in collected.drain(..) {
-            ordered.push(result?);
-        }
-        ordered.sort_by_key(|(shard_id, _)| *shard_id);
-
-        let total = ordered.iter().map(|(_, rows)| rows.len()).sum();
-        let mut out = Vec::with_capacity(total);
-        for (_shard_id, mut rows) in ordered {
-            out.append(&mut rows);
+        let mut out = Vec::new();
+        for (shard_id, shard) in self.shards.iter().enumerate() {
+            let mut shard_rows = shard
+                .snapshot_rows()
+                .with_context(|| format!("snapshot rows shard {}", shard_id))?;
+            out.append(&mut shard_rows);
         }
         Ok(out)
     }
@@ -1055,55 +969,31 @@ impl SpFreshLayerDbShardedIndex {
     }
 
     pub fn sync_to_s3(&self, max_files_per_shard: Option<usize>) -> anyhow::Result<usize> {
-        let results: Vec<anyhow::Result<usize>> = self
-            .shards
-            .par_iter()
-            .enumerate()
-            .map(|(shard_id, shard)| {
-                shard
-                    .sync_to_s3(max_files_per_shard)
-                    .with_context(|| format!("sync shard {} to s3", shard_id))
-            })
-            .collect();
         let mut moved = 0usize;
-        for result in results {
-            moved += result?;
+        for (shard_id, shard) in self.shards.iter().enumerate() {
+            moved += shard
+                .sync_to_s3(max_files_per_shard)
+                .with_context(|| format!("sync shard {} to s3", shard_id))?;
         }
         Ok(moved)
     }
 
     pub fn thaw_from_s3(&self, max_files_per_shard: Option<usize>) -> anyhow::Result<usize> {
-        let results: Vec<anyhow::Result<usize>> = self
-            .shards
-            .par_iter()
-            .enumerate()
-            .map(|(shard_id, shard)| {
-                shard
-                    .thaw_from_s3(max_files_per_shard)
-                    .with_context(|| format!("thaw shard {} from s3", shard_id))
-            })
-            .collect();
         let mut thawed = 0usize;
-        for result in results {
-            thawed += result?;
+        for (shard_id, shard) in self.shards.iter().enumerate() {
+            thawed += shard
+                .thaw_from_s3(max_files_per_shard)
+                .with_context(|| format!("thaw shard {} from s3", shard_id))?;
         }
         Ok(thawed)
     }
 
     pub fn gc_orphaned_s3(&self) -> anyhow::Result<usize> {
-        let results: Vec<anyhow::Result<usize>> = self
-            .shards
-            .par_iter()
-            .enumerate()
-            .map(|(shard_id, shard)| {
-                shard
-                    .gc_orphaned_s3()
-                    .with_context(|| format!("gc orphaned s3 for shard {}", shard_id))
-            })
-            .collect();
         let mut removed = 0usize;
-        for result in results {
-            removed += result?;
+        for (shard_id, shard) in self.shards.iter().enumerate() {
+            removed += shard
+                .gc_orphaned_s3()
+                .with_context(|| format!("gc orphaned s3 for shard {}", shard_id))?;
         }
         Ok(removed)
     }
@@ -1320,43 +1210,6 @@ mod tests {
                     b.distance
                 );
             }
-
-            let top1_full = full.search(query.as_slice(), 1);
-            let top1_pruned = pruned.search(query.as_slice(), 1);
-            assert_eq!(top1_full.len(), top1_pruned.len());
-            for (a, b) in top1_full.iter().zip(top1_pruned.iter()) {
-                assert_eq!(a.id, b.id);
-                assert!(
-                    (a.distance - b.distance).abs() <= 1e-6,
-                    "top1 distance mismatch id={} {} vs {}",
-                    a.id,
-                    a.distance,
-                    b.distance
-                );
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn sharded_bulk_load_single_shard_fast_path_round_trip() -> anyhow::Result<()> {
-        let dir = TempDir::new()?;
-        let cfg = SpFreshLayerDbShardedConfig {
-            shard_count: 4,
-            ..Default::default()
-        };
-        let mut idx = SpFreshLayerDbShardedIndex::open(dir.path(), cfg.clone())?;
-        let rows: Vec<crate::types::VectorRecord> = (0..64u64)
-            .map(|offset| {
-                let id = offset * cfg.shard_count as u64;
-                crate::types::VectorRecord::new(id, vec![id as f32; cfg.shard.spfresh.dim])
-            })
-            .collect();
-        idx.try_bulk_load_owned(rows.clone())?;
-        let snapshot = idx.snapshot_rows()?;
-        assert_eq!(snapshot.len(), rows.len());
-        for row in rows {
-            assert!(snapshot.iter().any(|candidate| candidate.id == row.id));
         }
         Ok(())
     }

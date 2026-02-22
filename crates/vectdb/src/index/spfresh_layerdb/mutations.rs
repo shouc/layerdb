@@ -34,24 +34,11 @@ impl SpFreshLayerDbIndex {
                     let value = encode_vector_row_value_with_posting(row, Some(posting))
                         .with_context(|| format!("serialize vector row id={}", row.id))?;
                     ops.push(layerdb::Op::put(vector_key(new_generation, row.id), value));
-                    let centroid = disk_index
-                        .as_ref()
-                        .and_then(|idx| idx.posting_centroid(posting))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "missing centroid for posting {} during diskmeta bulk-load",
-                                posting
-                            )
-                        })?;
                     let event_seq = posting_event_next_seq;
                     posting_event_next_seq = posting_event_next_seq.saturating_add(1);
                     ops.push(layerdb::Op::put(
                         posting_member_event_key(new_generation, posting, event_seq, row.id),
-                        posting_member_event_upsert_value_with_residual(
-                            row.id,
-                            &row.values,
-                            centroid,
-                        )?,
+                        posting_member_event_upsert_value_id_only(row.id),
                     ));
                 } else {
                     let value = encode_vector_row_value(row)
@@ -433,14 +420,11 @@ impl SpFreshLayerDbIndex {
                     )
                     .context("serialize vector row")?;
                     batch_ops.push(layerdb::Op::put(vector_key(generation, *id), value));
-                    let centroid = shadow
-                        .posting_centroid(new_posting)
-                        .unwrap_or(vector.as_slice());
                     let upsert_event_seq = posting_event_next_seq;
                     posting_event_next_seq = posting_event_next_seq.saturating_add(1);
                     batch_ops.push(layerdb::Op::put(
                         posting_member_event_key(generation, new_posting, upsert_event_seq, *id),
-                        posting_member_event_upsert_value_with_residual(*id, vector, centroid)?,
+                        posting_member_event_upsert_value_id_only(*id),
                     ));
                     if let Some(old_posting) = old_posting {
                         if old_posting != new_posting {

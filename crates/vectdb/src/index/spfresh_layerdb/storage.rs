@@ -1168,6 +1168,7 @@ pub(crate) fn posting_member_event_key(
 
 const POSTING_MEMBER_EVENT_RKYV_V3_TAG: &[u8] = b"pk3";
 const POSTING_MEMBER_EVENT_FLAG_TOMBSTONE: u8 = 1 << 0;
+const POSTING_MEMBER_EVENT_FLAG_ID_ONLY: u8 = 1 << 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PostingMember {
@@ -1284,6 +1285,7 @@ fn decode_posting_members_snapshot(raw: &[u8]) -> anyhow::Result<PostingMembersS
     })
 }
 
+#[cfg(test)]
 pub(crate) fn posting_member_event_upsert_value_with_residual(
     id: u64,
     values: &[f32],
@@ -1318,6 +1320,14 @@ pub(crate) fn posting_member_event_upsert_value_with_residual(
         out.push(q as u8);
     }
     Ok(out)
+}
+
+pub(crate) fn posting_member_event_upsert_value_id_only(id: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(POSTING_MEMBER_EVENT_RKYV_V3_TAG.len() + 1 + 8);
+    out.extend_from_slice(POSTING_MEMBER_EVENT_RKYV_V3_TAG);
+    out.push(POSTING_MEMBER_EVENT_FLAG_ID_ONLY);
+    out.extend_from_slice(&id.to_le_bytes());
+    out
 }
 
 #[cfg(test)]
@@ -1372,6 +1382,17 @@ fn decode_posting_member_event(raw: &[u8]) -> anyhow::Result<DecodedPostingMembe
         return Ok(DecodedPostingMemberEvent {
             id,
             tombstone: true,
+            residual_scale: None,
+            residual_code: None,
+        });
+    }
+    if (flags & POSTING_MEMBER_EVENT_FLAG_ID_ONLY) != 0 {
+        if cursor != raw.len() {
+            anyhow::bail!("posting-member id-only trailing bytes");
+        }
+        return Ok(DecodedPostingMemberEvent {
+            id,
+            tombstone: false,
             residual_scale: None,
             residual_code: None,
         });
@@ -1487,18 +1508,12 @@ pub(crate) fn load_posting_members(
             latest.remove(&decoded.id);
             continue;
         }
-        let Some(scale) = decoded.residual_scale else {
-            anyhow::bail!("missing posting-member residual scale");
-        };
-        let Some(code) = decoded.residual_code else {
-            anyhow::bail!("missing posting-member residual code");
-        };
         latest.insert(
             decoded.id,
             PostingMember {
                 id: decoded.id,
-                residual_scale: Some(scale),
-                residual_code: Some(code),
+                residual_scale: decoded.residual_scale,
+                residual_code: decoded.residual_code,
             },
         );
     }
@@ -1926,6 +1941,27 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, vec![11, 13]);
         assert_eq!(loaded.max_event_seq, Some(12));
+        Ok(())
+    }
+
+    #[test]
+    fn load_posting_members_accepts_id_only_events() -> anyhow::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let db = Db::open(dir.path(), layerdb::DbOptions::default())?;
+        let generation = 11u64;
+        let posting_id = 5usize;
+        db.put(
+            posting_member_event_key(generation, posting_id, 1, 42),
+            posting_member_event_upsert_value_id_only(42),
+            WriteOptions { sync: true },
+        )?;
+
+        let loaded = load_posting_members(&db, generation, posting_id)?;
+        assert_eq!(loaded.members.len(), 1);
+        assert_eq!(loaded.members[0].id, 42);
+        assert!(loaded.members[0].residual_scale.is_none());
+        assert!(loaded.members[0].residual_code.is_none());
+        assert_eq!(loaded.max_event_seq, Some(1));
         Ok(())
     }
 }

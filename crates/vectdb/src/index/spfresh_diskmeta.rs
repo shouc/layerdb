@@ -516,12 +516,6 @@ impl SpFreshDiskMetaIndex {
         best.map(|(posting_id, _)| posting_id)
     }
 
-    pub(crate) fn posting_centroid(&self, posting_id: usize) -> Option<&[f32]> {
-        self.postings
-            .get(&posting_id)
-            .map(|p| p.centroid.as_slice())
-    }
-
     pub(crate) fn posting_ids(&self) -> Vec<usize> {
         let mut out: Vec<usize> = self.postings.keys().copied().collect();
         out.sort_unstable();

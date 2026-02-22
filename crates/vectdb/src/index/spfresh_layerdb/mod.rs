@@ -47,7 +47,7 @@ use storage::{
     load_rows_with_posting_assignments, load_startup_manifest_bytes,
     persist_index_checkpoint_bytes, persist_startup_manifest_bytes, posting_map_prefix,
     posting_member_event_key, posting_member_event_tombstone_value,
-    posting_member_event_upsert_value_with_residual, posting_members_generation_prefix,
+    posting_member_event_upsert_value_id_only, posting_members_generation_prefix,
     posting_members_prefix, posting_members_snapshot_key, prefix_exclusive_end, prune_wal_before,
     refresh_read_snapshot, set_active_generation, set_posting_event_next_seq, validate_config,
     vector_key, vector_prefix, visit_wal_entries_since, wal_key, IndexWalEntry, PostingMember,

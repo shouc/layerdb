@@ -944,3 +944,21 @@ Change:
 
 Impact:
 - Cuts intermediate allocation pressure and keeps per-thread top-k state local in the search path.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=198083.54`
+- `search_qps=2410.35`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=129440.41`
+- `search_qps=932.33`
+- `recall_at_k=0.4720`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.5303`
+- `search_qps_ratio=2.5853`

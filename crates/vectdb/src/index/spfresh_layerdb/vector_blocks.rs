@@ -2,6 +2,7 @@ use std::fs::OpenOptions;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::linalg::squared_l2_bytes_le;
 use anyhow::Context;
 use memmap2::Mmap;
 use rustc_hash::FxHashMap;
@@ -390,19 +391,10 @@ impl VectorBlockStore {
                     return;
                 }
 
-                let mut distance = 0.0f32;
-                let mut cursor = 17usize;
-                for query_value in query {
-                    // SAFETY: `record` length is exactly one full record (rec_size), and
-                    // `query.len() == self.dim`, so each 4-byte load is in-bounds.
-                    let bits = unsafe {
-                        u32::from_le(record.as_ptr().add(cursor).cast::<u32>().read_unaligned())
-                    };
-                    let value = f32::from_bits(bits);
-                    let delta = *query_value - value;
-                    distance += delta * delta;
-                    cursor += 4;
-                }
+                let Some(distance) = squared_l2_bytes_le(query, &record[17..]) else {
+                    missing.push(id);
+                    return;
+                };
                 if distance.is_finite() {
                     found.push((id, distance));
                 } else {

@@ -2,7 +2,7 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::linalg::squared_l2;
+use crate::linalg::{norm2, squared_l2};
 use crate::types::VectorRecord;
 
 use super::kmeans::l2_kmeans;
@@ -34,7 +34,7 @@ fn default_empty_sum_values() -> Vec<f64> {
 }
 
 fn l2_norm(values: &[f32]) -> f32 {
-    values.iter().map(|v| v * v).sum::<f32>().sqrt()
+    norm2(values).sqrt()
 }
 
 #[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize, Serialize, Deserialize)]
@@ -999,7 +999,7 @@ mod tests {
                         let values = values_by_id
                             .get(row_id)
                             .expect("member row should have values");
-                        let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        let norm = crate::linalg::norm2(values).sqrt();
                         if norm > true_max_norm {
                             true_max_norm = norm;
                         }

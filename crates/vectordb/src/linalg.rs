@@ -178,6 +178,62 @@ unsafe fn squared_l2_avx2(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn squared_l2_avx512(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        __m512, _mm512_add_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_setzero_ps, _mm512_storeu_ps,
+        _mm512_sub_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        __m512, _mm512_add_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_setzero_ps, _mm512_storeu_ps,
+        _mm512_sub_ps,
+    };
+
+    let mut i = 0usize;
+    let mut sum0: __m512 = _mm512_setzero_ps();
+    let mut sum1: __m512 = _mm512_setzero_ps();
+    while i + 32 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va0 = unsafe { _mm512_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb0 = unsafe { _mm512_loadu_ps(b.as_ptr().add(i)) };
+        let d0 = _mm512_sub_ps(va0, vb0);
+        sum0 = _mm512_add_ps(sum0, _mm512_mul_ps(d0, d0));
+
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va1 = unsafe { _mm512_loadu_ps(a.as_ptr().add(i + 16)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb1 = unsafe { _mm512_loadu_ps(b.as_ptr().add(i + 16)) };
+        let d1 = _mm512_sub_ps(va1, vb1);
+        sum1 = _mm512_add_ps(sum1, _mm512_mul_ps(d1, d1));
+        i += 32;
+    }
+    let mut sum = _mm512_add_ps(sum0, sum1);
+    while i + 16 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va = unsafe { _mm512_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb = unsafe { _mm512_loadu_ps(b.as_ptr().add(i)) };
+        let d = _mm512_sub_ps(va, vb);
+        sum = _mm512_add_ps(sum, _mm512_mul_ps(d, d));
+        i += 16;
+    }
+
+    let mut lanes = [0f32; 16];
+    // SAFETY: writing exactly 16 f32 lanes to a properly sized stack array.
+    unsafe { _mm512_storeu_ps(lanes.as_mut_ptr(), sum) };
+    let mut out = lanes.iter().sum::<f32>();
+    while i < a.len() {
+        let d = a[i] - b[i];
+        out += d * d;
+        i += 1;
+    }
+    out
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86")]
@@ -271,6 +327,56 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
     let mut lanes = [0f32; 8];
     // SAFETY: writing exactly 8 f32 lanes to a properly sized stack array.
     unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), sum) };
+    let mut out = lanes.iter().sum::<f32>();
+    while i < a.len() {
+        out += a[i] * b[i];
+        i += 1;
+    }
+    out
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        __m512, _mm512_add_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_setzero_ps, _mm512_storeu_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        __m512, _mm512_add_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_setzero_ps, _mm512_storeu_ps,
+    };
+
+    let mut i = 0usize;
+    let mut sum0: __m512 = _mm512_setzero_ps();
+    let mut sum1: __m512 = _mm512_setzero_ps();
+    while i + 32 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va0 = unsafe { _mm512_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb0 = unsafe { _mm512_loadu_ps(b.as_ptr().add(i)) };
+        sum0 = _mm512_add_ps(sum0, _mm512_mul_ps(va0, vb0));
+
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va1 = unsafe { _mm512_loadu_ps(a.as_ptr().add(i + 16)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb1 = unsafe { _mm512_loadu_ps(b.as_ptr().add(i + 16)) };
+        sum1 = _mm512_add_ps(sum1, _mm512_mul_ps(va1, vb1));
+        i += 32;
+    }
+    let mut sum = _mm512_add_ps(sum0, sum1);
+    while i + 16 <= a.len() {
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let va = unsafe { _mm512_loadu_ps(a.as_ptr().add(i)) };
+        // SAFETY: bounds checked by loop guard and unaligned loads are permitted.
+        let vb = unsafe { _mm512_loadu_ps(b.as_ptr().add(i)) };
+        sum = _mm512_add_ps(sum, _mm512_mul_ps(va, vb));
+        i += 16;
+    }
+
+    let mut lanes = [0f32; 16];
+    // SAFETY: writing exactly 16 f32 lanes to a properly sized stack array.
+    unsafe { _mm512_storeu_ps(lanes.as_mut_ptr(), sum) };
     let mut out = lanes.iter().sum::<f32>();
     while i < a.len() {
         out += a[i] * b[i];
@@ -483,6 +589,9 @@ fn dot_dispatch() -> BinaryKernel {
 fn resolve_squared_l2_dispatch() -> BinaryKernel {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        if std::is_x86_feature_detected!("avx512f") {
+            return squared_l2_avx512_entry;
+        }
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
             return squared_l2_avx2_fma_entry;
         }
@@ -506,6 +615,9 @@ fn resolve_squared_l2_dispatch() -> BinaryKernel {
 fn resolve_dot_dispatch() -> BinaryKernel {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        if std::is_x86_feature_detected!("avx512f") {
+            return dot_avx512_entry;
+        }
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
             return dot_avx2_fma_entry;
         }
@@ -551,6 +663,20 @@ fn dot_avx2_fma_entry(a: &[f32], b: &[f32]) -> f32 {
 fn dot_avx2_entry(a: &[f32], b: &[f32]) -> f32 {
     // SAFETY: dispatch resolver only selects this entrypoint when CPU supports avx2.
     unsafe { dot_avx2(a, b) }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn squared_l2_avx512_entry(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: dispatch resolver only selects this entrypoint when CPU supports avx512f.
+    unsafe { squared_l2_avx512(a, b) }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn dot_avx512_entry(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: dispatch resolver only selects this entrypoint when CPU supports avx512f.
+    unsafe { dot_avx512(a, b) }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

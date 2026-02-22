@@ -614,3 +614,31 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.5318`
 - `search_qps_ratio=3.5615`
+
+## Step 25 (`touch-batch-helper-unification`)
+
+Change:
+- Routed remaining non-diskmeta upsert/delete WAL commits through
+  `persist_with_wal_touch_batch_ids(...)` for consistent slice-based touch-batch encoding.
+- Removed now-unused generic single-entry WAL helper.
+- Moved `encode_wal_entry(...)` under `#[cfg(test)]` since production code now uses
+  `encode_wal_touch_batch_ids(...)` directly.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step26-spfresh.json`,
+  `target/vectordb-step26-lancedb.json`.
+
+SPFresh:
+- `update_qps=188696.32`
+- `search_qps=2834.48`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=126623.69`
+- `search_qps=802.93`
+- `recall_at_k=0.4600`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.4902`
+- `search_qps_ratio=3.5302`

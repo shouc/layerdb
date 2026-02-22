@@ -480,6 +480,7 @@ const WAL_BIN_TAG: &[u8] = b"wl2";
 const WAL_KIND_TOUCH: u8 = 1;
 const WAL_KIND_TOUCH_BATCH: u8 = 2;
 
+#[cfg(test)]
 pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(WAL_BIN_TAG.len() + 1 + 8);
     out.extend_from_slice(WAL_BIN_TAG);

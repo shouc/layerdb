@@ -549,8 +549,8 @@ impl SpFreshLayerDbIndex {
                 batch_ops.push(layerdb::Op::put(vector_key(generation, *id), value));
                 touched_ids.push(*id);
             }
-            if let Err(err) = self.persist_with_wal_ops(
-                IndexWalEntry::TouchBatch { ids: touched_ids },
+            if let Err(err) = self.persist_with_wal_touch_batch_ids(
+                touched_ids.as_slice(),
                 batch_ops,
                 Vec::new(),
                 commit_mode,
@@ -760,8 +760,8 @@ impl SpFreshLayerDbIndex {
                 batch_ops.push(layerdb::Op::delete(vector_key(generation, *id)));
                 touched_ids.push(*id);
             }
-            if let Err(err) = self.persist_with_wal_ops(
-                IndexWalEntry::TouchBatch { ids: touched_ids },
+            if let Err(err) = self.persist_with_wal_touch_batch_ids(
+                touched_ids.as_slice(),
                 batch_ops,
                 Vec::new(),
                 commit_mode,

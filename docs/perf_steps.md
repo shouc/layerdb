@@ -872,3 +872,62 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7687`
 - `search_qps_ratio=3.1433`
+
+## Step 34 (`wal-crc-frame-and-fixed-u64-hot-metadata`)
+
+Change:
+- Reworked SPFresh WAL records to a framed binary format with:
+  - payload length (`u32`),
+  - CRC32 checksum (`u32`),
+  - strict trailing-byte validation.
+- Switched hot metadata counters (`active generation`, `wal_next_seq`, `posting_event_next_seq`)
+  from `bincode` to fixed-width little-endian `u64` encoding.
+- Added failure-path tests:
+  - `wal_decoder_rejects_checksum_corruption`
+  - `fixed_u64_codec_roundtrip`
+
+Impact:
+- Improves corruption detection on startup/replay.
+- Removes serializer overhead from hot mutation commit metadata writes.
+
+## Step 35 (`vector-block-sidecar-offset-index`)
+
+Change:
+- Added persistent vector-block offset sidecar (`.vbi`) with compact record format
+  (`id`, `flags`, `offset`).
+- Startup now:
+  - replays sidecar offset records first,
+  - tail-scans only vector-block bytes not yet covered by sidecar.
+- Sidecar is appended in lockstep with vector-block upsert/delete appends.
+- Added crash-lag recovery test:
+  - `reopen_recovers_when_index_sidecar_lags_vector_file`
+
+Impact:
+- Startup I/O is reduced from full vector-block payload scans to compact sidecar replay plus
+  bounded tail scan when sidecar lags.
+
+## Step 36 (`avx512f-runtime-dispatch`)
+
+Change:
+- Added AVX-512F kernels for `squared_l2` and `dot`.
+- Updated x86 runtime dispatch priority:
+  `avx512f -> avx2+fma -> avx2 -> sse2 -> scalar`.
+- Kept existing ARM NEON and scalar fallback paths.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=213498.44`
+- `search_qps=2728.87`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=130840.11`
+- `search_qps=930.50`
+- `recall_at_k=0.4820`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.6318`
+- `search_qps_ratio=2.9327`

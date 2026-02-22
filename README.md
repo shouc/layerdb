@@ -48,6 +48,7 @@ cargo run -p vectdb --bin vectdb-deploy -- \
   --db-root /tmp/vectdb/node1 \
   --node-id node1 \
   --listen 0.0.0.0:8080 \
+  --self-url http://127.0.0.1:8080 \
   --dim 4 \
   --initial-postings 4 \
   --etcd-endpoints http://127.0.0.1:2379 \
@@ -108,6 +109,32 @@ fn main() -> anyhow::Result<()> {
     println!("top id={} dist={}", hits[0].id, hits[0].distance);
 
     index.close()?;
+    Ok(())
+}
+```
+
+Cluster client example:
+
+```rust
+use vectdb::cluster::{CommitMode, Mutation, VectDbClusterClient};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // etcd-only bootstrap (requires deploy nodes started with --self-url)
+    let client = VectDbClusterClient::from_etcd_endpoint("http://127.0.0.1:2379").await?;
+
+    let _ = client
+        .apply_mutations(&vectdb::cluster::ApplyMutationsRequest {
+            mutations: vec![Mutation::Upsert {
+                id: 1,
+                values: vec![0.1, 0.2, 0.3, 0.4],
+            }],
+            commit_mode: Some(CommitMode::Durable),
+        })
+        .await?;
+
+    let neighbors = client.search(vec![0.1, 0.2, 0.3, 0.4], 5).await?;
+    println!("neighbors={}", neighbors.len());
     Ok(())
 }
 ```

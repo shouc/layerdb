@@ -1,5 +1,6 @@
 //! VectDB core library.
 
+pub mod cluster;
 pub mod columnar;
 pub mod dataset;
 pub mod ground_truth;

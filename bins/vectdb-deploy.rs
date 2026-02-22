@@ -16,12 +16,13 @@ use clap::{Parser, ValueEnum};
 use etcd_client::{
     Client as EtcdClient, Compare, CompareOp, ConnectOptions, PutOptions, Txn, TxnOp,
 };
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Infallible, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
+use vectdb::cluster::etcd_leader_endpoint_key;
 use vectdb::index::{
     MutationCommitMode, SpFreshConfig, SpFreshLayerDbConfig, SpFreshLayerDbShardedConfig,
     SpFreshLayerDbShardedIndex, SpFreshLayerDbShardedStats, SpFreshMemoryMode, VectorMutation,
@@ -43,7 +44,7 @@ struct Args {
     node_id: String,
 
     #[arg(long)]
-    self_url: Option<String>,
+    self_url: String,
 
     #[arg(long, value_delimiter = ',', num_args = 0..)]
     replica_urls: Vec<String>,
@@ -328,9 +329,9 @@ impl ReplicationJournal {
             let mut raw = vec![0u8; len as usize];
             file.read_exact(&mut raw)
                 .with_context(|| format!("read {} payload len={}", log_path.display(), len))?;
-            let payload = decode_replication_payload(&raw)?;
+            let seq = decode_replication_payload_seq(&raw)?;
             index.insert(
-                payload.seq,
+                seq,
                 JournalIndexEntry {
                     offset: offset + 4,
                     len,
@@ -659,9 +660,9 @@ fn encode_replication_payload(payload: &ReplicationPayload) -> anyhow::Result<By
     Ok(Bytes::from(out))
 }
 
-fn decode_replication_payload(raw: &[u8]) -> anyhow::Result<ReplicationPayload> {
+fn decode_framed_payload<'a>(raw: &'a [u8], label: &str) -> anyhow::Result<&'a [u8]> {
     if raw.len() < 12 {
-        anyhow::bail!("replication payload too short: {}", raw.len());
+        anyhow::bail!("{label} payload too short: {}", raw.len());
     }
     let checksum = u64::from_le_bytes(
         raw[0..8]
@@ -675,7 +676,7 @@ fn decode_replication_payload(raw: &[u8]) -> anyhow::Result<ReplicationPayload> 
     ) as usize;
     if raw.len() != 12 + len {
         anyhow::bail!(
-            "replication payload length mismatch: raw={}, header_len={}",
+            "{label} payload length mismatch: raw={}, header_len={}",
             raw.len(),
             len
         );
@@ -684,11 +685,32 @@ fn decode_replication_payload(raw: &[u8]) -> anyhow::Result<ReplicationPayload> 
     let actual_checksum = checksum_fnv1a64(payload_bytes);
     if checksum != actual_checksum {
         anyhow::bail!(
-            "replication checksum mismatch: got {}, expected {}",
+            "{label} checksum mismatch: got {}, expected {}",
             checksum,
             actual_checksum
         );
     }
+    Ok(payload_bytes)
+}
+
+fn decode_replication_payload_seq(raw: &[u8]) -> anyhow::Result<u64> {
+    let payload_bytes = decode_framed_payload(raw, "replication")?;
+    let mut aligned = rkyv::AlignedVec::with_capacity(payload_bytes.len());
+    aligned.extend_from_slice(payload_bytes);
+    let archived = rkyv::check_archived_root::<ReplicationPayload>(aligned.as_ref())
+        .map_err(|err| anyhow::anyhow!("validate archived replication payload: {err}"))?;
+    if archived.schema_version != REPLICATION_PAYLOAD_SCHEMA_VERSION {
+        anyhow::bail!(
+            "replication payload schema mismatch: got {}, expected {}",
+            archived.schema_version,
+            REPLICATION_PAYLOAD_SCHEMA_VERSION
+        );
+    }
+    Ok(archived.seq)
+}
+
+fn decode_replication_payload(raw: &[u8]) -> anyhow::Result<ReplicationPayload> {
+    let payload_bytes = decode_framed_payload(raw, "replication")?;
     let mut aligned = rkyv::AlignedVec::with_capacity(payload_bytes.len());
     aligned.extend_from_slice(payload_bytes);
     let archived = rkyv::check_archived_root::<ReplicationPayload>(aligned.as_ref())
@@ -718,35 +740,7 @@ fn encode_snapshot_payload(payload: &SnapshotPayload) -> anyhow::Result<Bytes> {
 }
 
 fn decode_snapshot_payload(raw: &[u8]) -> anyhow::Result<SnapshotPayload> {
-    if raw.len() < 12 {
-        anyhow::bail!("snapshot payload too short: {}", raw.len());
-    }
-    let checksum = u64::from_le_bytes(
-        raw[0..8]
-            .try_into()
-            .expect("checked exact checksum header length"),
-    );
-    let len = u32::from_le_bytes(
-        raw[8..12]
-            .try_into()
-            .expect("checked exact payload length header"),
-    ) as usize;
-    if raw.len() != 12 + len {
-        anyhow::bail!(
-            "snapshot payload length mismatch: raw={}, header_len={}",
-            raw.len(),
-            len
-        );
-    }
-    let payload_bytes = &raw[12..];
-    let actual_checksum = checksum_fnv1a64(payload_bytes);
-    if checksum != actual_checksum {
-        anyhow::bail!(
-            "snapshot checksum mismatch: got {}, expected {}",
-            checksum,
-            actual_checksum
-        );
-    }
+    let payload_bytes = decode_framed_payload(raw, "snapshot")?;
     let mut aligned = rkyv::AlignedVec::with_capacity(payload_bytes.len());
     aligned.extend_from_slice(payload_bytes);
     let archived = rkyv::check_archived_root::<SnapshotPayload>(aligned.as_ref())
@@ -825,6 +819,8 @@ struct EtcdLeaderElector {
 struct EtcdElectionConfig {
     endpoints: Vec<String>,
     election_key: String,
+    leader_endpoint_key: String,
+    leader_endpoint_value: String,
     lease_ttl_secs: i64,
     retry_backoff: Duration,
     connect_timeout: Duration,
@@ -845,6 +841,9 @@ impl EtcdLeaderElector {
         }
         if cfg.election_key.is_empty() {
             anyhow::bail!("--etcd-election-key must not be empty");
+        }
+        if cfg.leader_endpoint_value.is_empty() {
+            anyhow::bail!("leader endpoint value must not be empty");
         }
         if cfg.lease_ttl_secs < 2 {
             anyhow::bail!("--etcd-lease-ttl-secs must be >= 2");
@@ -943,17 +942,25 @@ impl EtcdLeaderElector {
             .context("grant etcd lease")?;
         let lease_id = lease.id();
 
+        let then_ops = vec![
+            TxnOp::put(
+                self.cfg.election_key.as_bytes(),
+                self.node_id.as_bytes(),
+                Some(PutOptions::new().with_lease(lease_id)),
+            ),
+            TxnOp::put(
+                self.cfg.leader_endpoint_key.as_bytes(),
+                self.cfg.leader_endpoint_value.as_bytes(),
+                Some(PutOptions::new().with_lease(lease_id)),
+            ),
+        ];
         let tx = Txn::new()
             .when(vec![Compare::version(
                 self.cfg.election_key.as_bytes(),
                 CompareOp::Equal,
                 0,
             )])
-            .and_then(vec![TxnOp::put(
-                self.cfg.election_key.as_bytes(),
-                self.node_id.as_bytes(),
-                Some(PutOptions::new().with_lease(lease_id)),
-            )]);
+            .and_then(then_ops);
 
         let txn = client.txn(tx).await.context("acquire etcd leader key")?;
         if !txn.succeeded() {
@@ -1010,6 +1017,19 @@ impl EtcdLeaderElector {
             }
             if kv.value() != self.node_id.as_bytes() {
                 anyhow::bail!("leader key value mismatch");
+            }
+            let endpoint_response = client
+                .get(self.cfg.leader_endpoint_key.as_bytes(), None)
+                .await
+                .context("verify leader endpoint key ownership")?;
+            let Some(endpoint_kv) = endpoint_response.kvs().first() else {
+                anyhow::bail!("leader endpoint key deleted");
+            };
+            if endpoint_kv.lease() != lease_id {
+                anyhow::bail!("leader endpoint key lease mismatch");
+            }
+            if endpoint_kv.value() != self.cfg.leader_endpoint_value.as_bytes() {
+                anyhow::bail!("leader endpoint key value mismatch");
             }
         }
 
@@ -1343,7 +1363,28 @@ async fn apply_mutations(
     }
 
     let peers = state.replica_peers.clone();
-    let replicated = replicate_to_followers(state.clone(), peers, seq, term, encoded.clone()).await;
+    let replicated = if matches!(mode, MutationCommitMode::Durable) {
+        let follower_quorum = state.quorum_size.saturating_sub(1);
+        let replicated = replicate_to_followers_until_quorum(
+            state.clone(),
+            peers.clone(),
+            seq,
+            term,
+            encoded.clone(),
+            follower_quorum,
+        )
+        .await;
+        if replicated.succeeded < replicated.attempted {
+            let tail_state = state.clone();
+            let tail_payload = encoded.clone();
+            tokio::spawn(async move {
+                let _ = replicate_to_followers(tail_state, peers, seq, term, tail_payload).await;
+            });
+        }
+        replicated
+    } else {
+        replicate_to_followers(state.clone(), peers, seq, term, encoded.clone()).await
+    };
 
     if matches!(mode, MutationCommitMode::Durable) {
         let quorum_acks = 1usize.saturating_add(replicated.succeeded);
@@ -1635,6 +1676,34 @@ fn normalize_base_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
 }
 
+fn build_http_client() -> anyhow::Result<Client> {
+    Client::builder()
+        .pool_max_idle_per_host(256)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_nodelay(true)
+        .build()
+        .context("build HTTP client")
+}
+
+fn canonicalize_http_base_url(url: &str, flag_name: &str) -> anyhow::Result<String> {
+    let parsed = reqwest::Url::parse(url.trim())
+        .with_context(|| format!("{flag_name} must be an absolute URL: {url}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => anyhow::bail!("{flag_name} must use http or https scheme, got {other}: {url}"),
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{flag_name} must include host: {url}");
+    }
+    if parsed.query().is_some() {
+        anyhow::bail!("{flag_name} must not include query string: {url}");
+    }
+    if parsed.fragment().is_some() {
+        anyhow::bail!("{flag_name} must not include fragment: {url}");
+    }
+    Ok(normalize_base_url(parsed.to_string().as_str()))
+}
+
 fn join_base_url(base: &str, path: &str) -> String {
     format!(
         "{}/{}",
@@ -1643,18 +1712,13 @@ fn join_base_url(base: &str, path: &str) -> String {
     )
 }
 
-fn collect_replication_peers(self_url: Option<&str>, replica_urls: &[String]) -> Vec<String> {
-    let self_base = self_url.map(normalize_base_url);
+fn collect_replication_peers(self_url: &str, replica_urls: &[String]) -> Vec<String> {
+    let self_base = normalize_base_url(self_url);
     let mut seen = HashSet::new();
     replica_urls
         .iter()
         .map(|url| normalize_base_url(url))
-        .filter(|url| {
-            self_base
-                .as_ref()
-                .map(|self_url| self_url != url)
-                .unwrap_or(true)
-        })
+        .filter(|url| self_base != *url)
         .filter(|url| seen.insert(url.clone()))
         .collect()
 }
@@ -1842,13 +1906,13 @@ async fn catch_up_peer(
 
         let mut restart_from = None;
         for raw in entries {
-            let entry = decode_replication_payload(raw.as_ref()).map_err(|err| {
-                format!("{peer}: decode local replication payload during catch-up: {err:#}")
+            let entry_seq = decode_replication_payload_seq(raw.as_ref()).map_err(|err| {
+                format!("{peer}: decode local replication seq during catch-up: {err:#}")
             })?;
-            if entry.seq < next_seq {
+            if entry_seq < next_seq {
                 continue;
             }
-            if entry.seq > target_seq {
+            if entry_seq > target_seq {
                 return Ok(());
             }
 
@@ -1861,7 +1925,7 @@ async fn catch_up_peer(
             .await
             {
                 Ok(()) => {
-                    next_seq = entry.seq.saturating_add(1);
+                    next_seq = entry_seq.saturating_add(1);
                 }
                 Err(ReplicationSendError::Reject(reject)) => {
                     if reject.max_term_seen > leader_term {
@@ -1870,7 +1934,7 @@ async fn catch_up_peer(
                             reject.max_term_seen, leader_term
                         ));
                     }
-                    if reject.expected_seq == entry.seq.saturating_add(1) {
+                    if reject.expected_seq == entry_seq.saturating_add(1) {
                         next_seq = reject.expected_seq;
                         continue;
                     }
@@ -1881,7 +1945,7 @@ async fn catch_up_peer(
                     break;
                 }
                 Err(ReplicationSendError::Other(err)) => {
-                    return Err(format!("{peer}: catch-up seq={} failed: {err}", entry.seq));
+                    return Err(format!("{peer}: catch-up seq={} failed: {err}", entry_seq));
                 }
             }
         }
@@ -1945,6 +2009,55 @@ async fn replicate_to_peer(
     }
 }
 
+async fn collect_replication_results_until_quorum<Fut>(
+    futures: impl IntoIterator<Item = Fut>,
+    attempted: usize,
+    required_successes: usize,
+) -> ReplicationSummary
+where
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if attempted == 0 {
+        return ReplicationSummary {
+            attempted: 0,
+            succeeded: 0,
+            failed: Vec::new(),
+        };
+    }
+    if required_successes == 0 {
+        return ReplicationSummary {
+            attempted,
+            succeeded: 0,
+            failed: Vec::new(),
+        };
+    }
+
+    let mut pending = FuturesUnordered::new();
+    for fut in futures {
+        pending.push(fut);
+    }
+
+    let mut succeeded = 0usize;
+    let mut failed = Vec::new();
+    while let Some(result) = pending.next().await {
+        match result {
+            Ok(()) => {
+                succeeded = succeeded.saturating_add(1);
+                if succeeded >= required_successes {
+                    break;
+                }
+            }
+            Err(err) => failed.push(err),
+        }
+    }
+
+    ReplicationSummary {
+        attempted,
+        succeeded,
+        failed,
+    }
+}
+
 async fn replicate_to_followers(
     state: Arc<AppState>,
     peers: Vec<String>,
@@ -1960,6 +2073,7 @@ async fn replicate_to_followers(
         };
     }
 
+    let attempted = peers.len();
     let futures = peers.iter().map(|peer| {
         replicate_to_peer(
             state.clone(),
@@ -1969,21 +2083,37 @@ async fn replicate_to_followers(
             payload.clone(),
         )
     });
+    collect_replication_results_until_quorum(futures, attempted, attempted).await
+}
 
-    let mut succeeded = 0usize;
-    let mut failed = Vec::new();
-    for result in join_all(futures).await {
-        match result {
-            Ok(_) => succeeded += 1,
-            Err(err) => failed.push(err),
-        }
+async fn replicate_to_followers_until_quorum(
+    state: Arc<AppState>,
+    peers: Vec<String>,
+    seq: u64,
+    leader_term: u64,
+    payload: Bytes,
+    required_successes: usize,
+) -> ReplicationSummary {
+    if peers.is_empty() {
+        return ReplicationSummary {
+            attempted: 0,
+            succeeded: 0,
+            failed: Vec::new(),
+        };
     }
 
-    ReplicationSummary {
-        attempted: peers.len(),
-        succeeded,
-        failed,
-    }
+    let attempted = peers.len();
+    let required = required_successes.min(attempted);
+    let futures = peers.iter().map(|peer| {
+        replicate_to_peer(
+            state.clone(),
+            peer.clone(),
+            seq,
+            leader_term,
+            payload.clone(),
+        )
+    });
+    collect_replication_results_until_quorum(futures, attempted, required).await
 }
 
 fn build_index(args: &Args) -> anyhow::Result<SpFreshLayerDbShardedIndex> {
@@ -2029,6 +2159,11 @@ async fn main() -> anyhow::Result<()> {
     if args.diskmeta_probe_multiplier == 0 {
         anyhow::bail!("--diskmeta-probe-multiplier must be > 0");
     }
+    let self_url = canonicalize_http_base_url(args.self_url.as_str(), "--self-url")?;
+    let mut replica_urls = Vec::with_capacity(args.replica_urls.len());
+    for replica in &args.replica_urls {
+        replica_urls.push(canonicalize_http_base_url(replica, "--replica-urls")?);
+    }
 
     let index = build_index(&args).context("open sharded index")?;
     let journal = ReplicationJournal::open(&args.db_root, args.replication_log_max_entries)
@@ -2037,6 +2172,8 @@ async fn main() -> anyhow::Result<()> {
     let election_cfg = EtcdElectionConfig {
         endpoints: args.etcd_endpoints.clone(),
         election_key: args.etcd_election_key.clone(),
+        leader_endpoint_key: etcd_leader_endpoint_key(&args.etcd_election_key),
+        leader_endpoint_value: self_url.clone(),
         lease_ttl_secs: args.etcd_lease_ttl_secs.max(2),
         retry_backoff: Duration::from_millis(args.etcd_retry_ms.max(100)),
         connect_timeout: Duration::from_millis(args.etcd_connect_timeout_ms.max(100)),
@@ -2048,9 +2185,10 @@ async fn main() -> anyhow::Result<()> {
         EtcdLeaderElector::new(args.node_id.clone(), election_cfg).context("init etcd election")?,
     );
     let leader_task = tokio::spawn(leader.clone().run());
-    let replica_peers = collect_replication_peers(args.self_url.as_deref(), &args.replica_urls);
+    let replica_peers = collect_replication_peers(self_url.as_str(), &replica_urls);
     let cluster_size = 1usize.saturating_add(replica_peers.len());
     let quorum_size = cluster_size / 2 + 1;
+    let http = build_http_client()?;
 
     let state = Arc::new(AppState {
         node_id: args.node_id.clone(),
@@ -2065,7 +2203,7 @@ async fn main() -> anyhow::Result<()> {
         leader,
         journal: Arc::new(Mutex::new(journal)),
         mutation_gate: Arc::new(AsyncMutex::new(())),
-        http: Client::new(),
+        http,
     });
 
     let app = Router::new()
@@ -2117,14 +2255,17 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_replication_peers, decode_payload_frame, decode_replication_payload,
-        decode_snapshot_payload, encode_commit_mode, encode_payload_frame,
-        encode_replication_payload, encode_snapshot_payload, parse_replication_reject,
-        ErrorResponse, ReplicationJournal, ReplicationPayload, ReplicationRejectResponse,
-        SnapshotPayload, WireMutation, WireSnapshotRow, REPLICATION_PAYLOAD_SCHEMA_VERSION,
+        canonicalize_http_base_url, collect_replication_peers,
+        collect_replication_results_until_quorum, decode_payload_frame, decode_replication_payload,
+        decode_replication_payload_seq, decode_snapshot_payload, encode_commit_mode,
+        encode_payload_frame, encode_replication_payload, encode_snapshot_payload,
+        parse_replication_reject, ErrorResponse, EtcdElectionConfig, EtcdLeaderElector,
+        ReplicationJournal, ReplicationPayload, ReplicationRejectResponse, SnapshotPayload,
+        WireMutation, WireSnapshotRow, REPLICATION_PAYLOAD_SCHEMA_VERSION,
         SNAPSHOT_PAYLOAD_SCHEMA_VERSION,
     };
     use bytes::Bytes;
+    use std::time::Duration;
     use vectdb::index::MutationCommitMode;
 
     #[test]
@@ -2135,7 +2276,7 @@ mod tests {
             "http://127.0.0.1:8080".to_string(),
             "http://127.0.0.1:8082/".to_string(),
         ];
-        let out = collect_replication_peers(Some("http://127.0.0.1:8080/"), &peers);
+        let out = collect_replication_peers("http://127.0.0.1:8080/", &peers);
         assert_eq!(
             out,
             vec![
@@ -2143,6 +2284,95 @@ mod tests {
                 "http://127.0.0.1:8082".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn canonicalize_http_base_url_accepts_http_and_https() {
+        let root = canonicalize_http_base_url("http://127.0.0.1:8080/", "--self-url")
+            .expect("http endpoint must pass");
+        assert_eq!(root, "http://127.0.0.1:8080");
+        let prefixed = canonicalize_http_base_url("https://vectdb.example:443/base/", "--self-url")
+            .expect("https endpoint must pass");
+        assert_eq!(prefixed, "https://vectdb.example/base");
+    }
+
+    #[test]
+    fn canonicalize_http_base_url_rejects_invalid_scheme() {
+        let err = canonicalize_http_base_url("ftp://127.0.0.1:8080", "--self-url")
+            .expect_err("non-http scheme must fail");
+        assert!(err.to_string().contains("http or https"));
+    }
+
+    #[test]
+    fn canonicalize_http_base_url_rejects_query_and_fragment() {
+        let query_err = canonicalize_http_base_url("http://127.0.0.1:8080?a=1", "--self-url")
+            .expect_err("query string must fail");
+        assert!(query_err.to_string().contains("query string"));
+
+        let fragment_err = canonicalize_http_base_url("http://127.0.0.1:8080#frag", "--self-url")
+            .expect_err("fragment must fail");
+        assert!(fragment_err.to_string().contains("fragment"));
+    }
+
+    #[test]
+    fn etcd_elector_rejects_empty_leader_endpoint_value() {
+        let cfg = EtcdElectionConfig {
+            endpoints: vec!["http://127.0.0.1:2379".to_string()],
+            election_key: "/vectdb/prod/leader".to_string(),
+            leader_endpoint_key: "/vectdb/prod/leader_endpoint".to_string(),
+            leader_endpoint_value: String::new(),
+            lease_ttl_secs: 5,
+            retry_backoff: Duration::from_millis(500),
+            connect_timeout: Duration::from_millis(1_000),
+            request_timeout: Duration::from_millis(1_000),
+            username: None,
+            password: None,
+        };
+        let err = EtcdLeaderElector::new("node-a".to_string(), cfg)
+            .expect_err("empty leader endpoint must fail");
+        assert!(err
+            .to_string()
+            .contains("leader endpoint value must not be empty"));
+    }
+
+    async fn delayed_result(ms: u64, ok: bool) -> Result<(), String> {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        if ok {
+            Ok(())
+        } else {
+            Err("replication failed".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_replication_results_stops_after_quorum() {
+        let started = std::time::Instant::now();
+        let futures = vec![
+            delayed_result(10, true),
+            delayed_result(20, true),
+            delayed_result(300, true),
+        ];
+        let summary = collect_replication_results_until_quorum(futures, 3, 2).await;
+        assert_eq!(summary.attempted, 3);
+        assert_eq!(summary.succeeded, 2);
+        assert!(summary.failed.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "quorum collection should stop before slow tail completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_replication_results_records_failures_when_quorum_missed() {
+        let futures = vec![
+            delayed_result(1, false),
+            delayed_result(2, true),
+            delayed_result(3, false),
+        ];
+        let summary = collect_replication_results_until_quorum(futures, 3, 2).await;
+        assert_eq!(summary.attempted, 3);
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(summary.failed.len(), 2);
     }
 
     fn build_payload(seq: u64, term: u64) -> Bytes {
@@ -2182,6 +2412,13 @@ mod tests {
         corrupted[12] ^= 0x55;
         let err = decode_replication_payload(&corrupted).expect_err("decode must fail");
         assert!(err.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn replication_payload_seq_decoder_roundtrip() {
+        let encoded = build_payload(17, 10);
+        let seq = decode_replication_payload_seq(encoded.as_ref()).expect("decode seq");
+        assert_eq!(seq, 17);
     }
 
     #[test]

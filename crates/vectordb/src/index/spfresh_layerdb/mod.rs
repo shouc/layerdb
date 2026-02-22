@@ -24,7 +24,7 @@ use anyhow::Context;
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use layerdb::{Db, DbOptions, ReadOptions, WriteOptions};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::linalg::squared_l2;
@@ -120,7 +120,7 @@ struct PersistedStartupManifest {
 #[derive(Debug)]
 struct VectorCache {
     capacity: usize,
-    map: HashMap<u64, Vec<f32>>,
+    map: FxHashMap<u64, Vec<f32>>,
     order: VecDeque<u64>,
 }
 
@@ -128,7 +128,7 @@ impl VectorCache {
     fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
-            map: HashMap::new(),
+            map: FxHashMap::default(),
             order: VecDeque::new(),
         }
     }
@@ -147,8 +147,8 @@ impl VectorCache {
         if self.capacity == 0 {
             return;
         }
-        if let std::collections::hash_map::Entry::Occupied(mut existing) = self.map.entry(id) {
-            existing.insert(values);
+        if let Some(existing) = self.map.get_mut(&id) {
+            *existing = values;
             return;
         }
         if self.map.len() >= self.capacity {
@@ -170,7 +170,7 @@ impl VectorCache {
 #[derive(Debug)]
 struct PostingMembersCache {
     capacity: usize,
-    map: HashMap<(u64, usize), Arc<Vec<u64>>>,
+    map: FxHashMap<(u64, usize), Arc<Vec<u64>>>,
     order: VecDeque<(u64, usize)>,
 }
 
@@ -178,7 +178,7 @@ impl PostingMembersCache {
     fn new(capacity: usize, _compact_interval_ops: usize, _compact_budget_entries: usize) -> Self {
         Self {
             capacity: capacity.max(1),
-            map: HashMap::new(),
+            map: FxHashMap::default(),
             order: VecDeque::new(),
         }
     }
@@ -195,10 +195,8 @@ impl PostingMembersCache {
         if self.capacity == 0 {
             return;
         }
-        if let std::collections::hash_map::Entry::Occupied(mut existing) =
-            self.map.entry((generation, posting_id))
-        {
-            existing.insert(members);
+        if let Some(existing) = self.map.get_mut(&(generation, posting_id)) {
+            *existing = members;
             return;
         }
         if self.map.len() >= self.capacity {

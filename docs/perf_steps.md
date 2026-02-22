@@ -394,3 +394,29 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.0819`
 - `search_qps_ratio=3.9680`
+
+## Step 17 (`fxhash-cache-maps`)
+
+Change:
+- Switched hot in-memory cache maps to `FxHashMap`:
+  - `VectorCache.map`
+  - `PostingMembersCache.map`
+- Kept behavior identical, only changing hash function/cost in frequent lookup paths.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step18-spfresh.json`, `target/vectordb-step18-lancedb.json`.
+
+SPFresh:
+- `update_qps=216303.91`
+- `search_qps=2901.02`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=216869.76`
+- `search_qps=816.87`
+- `recall_at_k=0.4765`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=0.9974`
+- `search_qps_ratio=3.5513`

@@ -857,7 +857,7 @@ pub(crate) fn posting_member_event_key(
 const POSTING_MEMBER_EVENT_RKYV_V3_TAG: &[u8] = b"pk3";
 const POSTING_MEMBER_EVENT_FLAG_TOMBSTONE: u8 = 1 << 0;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PostingMember {
     pub id: u64,
     pub residual_scale: Option<f32>,
@@ -865,8 +865,11 @@ pub(crate) struct PostingMember {
 }
 
 const POSTING_MEMBERS_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const POSTING_MEMBERS_SNAPSHOT_BIN_TAG: &[u8] = b"pms1";
+const POSTING_MEMBERS_SNAPSHOT_FLAG_HAS_SCALE: u8 = 1 << 0;
+const POSTING_MEMBERS_SNAPSHOT_FLAG_HAS_CODE: u8 = 1 << 1;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PostingMembersSnapshot {
     pub schema_version: u32,
     pub last_event_seq: u64,
@@ -877,12 +880,96 @@ pub(crate) fn encode_posting_members_snapshot(
     last_event_seq: u64,
     members: &[PostingMember],
 ) -> anyhow::Result<Vec<u8>> {
-    let snapshot = PostingMembersSnapshot {
-        schema_version: POSTING_MEMBERS_SNAPSHOT_SCHEMA_VERSION,
+    let mut out = Vec::with_capacity(
+        POSTING_MEMBERS_SNAPSHOT_BIN_TAG.len()
+            + 4
+            + 8
+            + 4
+            + members.len().saturating_mul(8 + 1 + 4 + 16),
+    );
+    out.extend_from_slice(POSTING_MEMBERS_SNAPSHOT_BIN_TAG);
+    out.extend_from_slice(&POSTING_MEMBERS_SNAPSHOT_SCHEMA_VERSION.to_le_bytes());
+    out.extend_from_slice(&last_event_seq.to_le_bytes());
+    let count =
+        u32::try_from(members.len()).context("posting members snapshot len does not fit u32")?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for member in members {
+        out.extend_from_slice(&member.id.to_le_bytes());
+        let mut flags = 0u8;
+        if member.residual_scale.is_some() {
+            flags |= POSTING_MEMBERS_SNAPSHOT_FLAG_HAS_SCALE;
+        }
+        if member.residual_code.is_some() {
+            flags |= POSTING_MEMBERS_SNAPSHOT_FLAG_HAS_CODE;
+        }
+        out.push(flags);
+        if let Some(scale) = member.residual_scale {
+            out.extend_from_slice(&scale.to_bits().to_le_bytes());
+        }
+        if let Some(code) = member.residual_code.as_ref() {
+            let len = u32::try_from(code.len())
+                .context("posting member residual len does not fit u32")?;
+            out.extend_from_slice(&len.to_le_bytes());
+            for value in code {
+                out.push(*value as u8);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decode_posting_members_snapshot(raw: &[u8]) -> anyhow::Result<PostingMembersSnapshot> {
+    if !raw.starts_with(POSTING_MEMBERS_SNAPSHOT_BIN_TAG) {
+        anyhow::bail!("unsupported posting members snapshot tag");
+    }
+    let mut cursor = POSTING_MEMBERS_SNAPSHOT_BIN_TAG.len();
+    let schema_version = read_u32(raw, &mut cursor)?;
+    let last_event_seq = read_u64(raw, &mut cursor)?;
+    let count = usize::try_from(read_u32(raw, &mut cursor)?)
+        .context("posting members snapshot count overflow")?;
+    let mut members = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = read_u64(raw, &mut cursor)?;
+        let flags = read_u8(raw, &mut cursor)?;
+        let unknown_flags = flags
+            & !(POSTING_MEMBERS_SNAPSHOT_FLAG_HAS_SCALE | POSTING_MEMBERS_SNAPSHOT_FLAG_HAS_CODE);
+        if unknown_flags != 0 {
+            anyhow::bail!("posting member snapshot unknown flags: {unknown_flags:#x}");
+        }
+        let residual_scale = if (flags & POSTING_MEMBERS_SNAPSHOT_FLAG_HAS_SCALE) != 0 {
+            Some(read_f32(raw, &mut cursor)?)
+        } else {
+            None
+        };
+        let residual_code = if (flags & POSTING_MEMBERS_SNAPSHOT_FLAG_HAS_CODE) != 0 {
+            let len = usize::try_from(read_u32(raw, &mut cursor)?)
+                .context("posting member residual code len overflow")?;
+            let end = cursor
+                .checked_add(len)
+                .ok_or_else(|| anyhow::anyhow!("posting member residual code length overflow"))?;
+            let Some(code_raw) = raw.get(cursor..end) else {
+                anyhow::bail!("posting member residual code underflow");
+            };
+            let code = code_raw.iter().map(|byte| *byte as i8).collect::<Vec<_>>();
+            cursor = end;
+            Some(code)
+        } else {
+            None
+        };
+        members.push(PostingMember {
+            id,
+            residual_scale,
+            residual_code,
+        });
+    }
+    if cursor != raw.len() {
+        anyhow::bail!("posting members snapshot trailing bytes");
+    }
+    Ok(PostingMembersSnapshot {
+        schema_version,
         last_event_seq,
-        members: members.to_vec(),
-    };
-    bincode::serialize(&snapshot).context("encode posting members snapshot")
+        members,
+    })
 }
 
 pub(crate) fn posting_member_event_upsert_value_with_residual(
@@ -1030,8 +1117,8 @@ pub(crate) fn load_posting_members(
             format!("load posting members snapshot generation={generation} posting={posting_id}")
         })?
     {
-        let snapshot: PostingMembersSnapshot = bincode::deserialize(snapshot_raw.as_ref())
-            .with_context(|| {
+        let snapshot =
+            decode_posting_members_snapshot(snapshot_raw.as_ref()).with_context(|| {
                 format!(
                     "decode posting members snapshot generation={generation} posting={posting_id}"
                 )
@@ -1215,6 +1302,59 @@ mod tests {
     }
 
     #[test]
+    fn posting_members_snapshot_binary_codec_roundtrip() -> anyhow::Result<()> {
+        let members = vec![
+            PostingMember {
+                id: 10,
+                residual_scale: None,
+                residual_code: None,
+            },
+            PostingMember {
+                id: 11,
+                residual_scale: Some(1.25),
+                residual_code: Some(vec![-4, 0, 7]),
+            },
+            PostingMember {
+                id: 12,
+                residual_scale: None,
+                residual_code: Some(vec![]),
+            },
+        ];
+        let encoded = encode_posting_members_snapshot(55, members.as_slice())?;
+        assert!(encoded.starts_with(POSTING_MEMBERS_SNAPSHOT_BIN_TAG));
+        let decoded = decode_posting_members_snapshot(encoded.as_slice())?;
+        assert_eq!(
+            decoded,
+            PostingMembersSnapshot {
+                schema_version: POSTING_MEMBERS_SNAPSHOT_SCHEMA_VERSION,
+                last_event_seq: 55,
+                members,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn posting_members_snapshot_binary_decoder_rejects_unknown_flags() -> anyhow::Result<()> {
+        let members = vec![PostingMember {
+            id: 77,
+            residual_scale: None,
+            residual_code: None,
+        }];
+        let mut encoded = encode_posting_members_snapshot(3, members.as_slice())?;
+        let flags_offset =
+            POSTING_MEMBERS_SNAPSHOT_BIN_TAG.len() + 4 + 8 + 4 + std::mem::size_of::<u64>();
+        encoded[flags_offset] = 0x80;
+        let err = decode_posting_members_snapshot(encoded.as_slice())
+            .expect_err("unknown flags should fail decode");
+        assert!(
+            format!("{err:#}").contains("unknown flags"),
+            "unexpected error: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn ensure_wal_next_seq_recovers_from_corrupt_meta() -> anyhow::Result<()> {
         let dir = tempfile::TempDir::new()?;
         let db = Db::open(dir.path(), layerdb::DbOptions::default())?;
@@ -1275,6 +1415,26 @@ mod tests {
         assert_eq!(
             decode_u64_fixed(meta.as_ref(), "posting-event next seq")?,
             9
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_posting_members_rejects_corrupt_snapshot_payload() -> anyhow::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let db = Db::open(dir.path(), layerdb::DbOptions::default())?;
+        let generation = 7u64;
+        let posting_id = 3usize;
+        db.put(
+            posting_members_snapshot_key(generation, posting_id),
+            vec![0xde, 0xad, 0xbe, 0xef],
+            WriteOptions { sync: true },
+        )?;
+        let err = load_posting_members(&db, generation, posting_id)
+            .expect_err("corrupt snapshot payload should fail closed");
+        assert!(
+            format!("{err:#}").contains("decode posting members snapshot"),
+            "unexpected error: {err:#}"
         );
         Ok(())
     }

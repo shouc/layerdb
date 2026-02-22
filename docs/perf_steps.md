@@ -1029,3 +1029,40 @@ Change:
 
 Impact:
 - Locks in retrieval correctness guarantees by preventing boot on ambiguous/corrupt replay state.
+
+## Step 42 (`posting-snapshot-fixed-binary-codec`)
+
+Change:
+- Replaced posting-members snapshot `bincode` payload with a fixed binary codec:
+  - tag + schema + event-seq + member count
+  - per-member `id` + flags + optional scale + optional residual bytes
+- Added strict decode validation:
+  - reject unknown member flags
+  - reject truncated payloads and trailing bytes
+- Kept startup behavior fail-closed by surfacing snapshot decode errors through `load_posting_members`.
+- Added focused tests:
+  - `posting_members_snapshot_binary_codec_roundtrip`
+  - `posting_members_snapshot_binary_decoder_rejects_unknown_flags`
+  - `load_posting_members_rejects_corrupt_snapshot_payload`
+
+Impact:
+- Cuts snapshot (de)serialization overhead and allocation churn in posting-state rebuilds.
+- Makes snapshot corruption handling deterministic and correctness-first.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=223970.44`
+- `search_qps=2933.62`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=130700.80`
+- `search_qps=908.40`
+- `recall_at_k=0.4830`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.7136`
+- `search_qps_ratio=3.2294`

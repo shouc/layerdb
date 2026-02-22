@@ -343,3 +343,28 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.0693`
 - `search_qps_ratio=3.5643`
+
+## Step 15 (`probe-loop-centroid-check-elision`)
+
+Change:
+- Removed redundant per-posting centroid-presence check in diskmeta search probe loop; probe ids are
+  already produced from live posting metadata.
+- Keeps behavior unchanged while trimming one branch + lookup from hot search iteration.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step16-spfresh.json`, `target/vectordb-step16-lancedb.json`.
+
+SPFresh:
+- `update_qps=175470.66`
+- `search_qps=2625.92`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=203894.38`
+- `search_qps=753.60`
+- `recall_at_k=0.4805`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=0.8606`
+- `search_qps_ratio=3.4840`

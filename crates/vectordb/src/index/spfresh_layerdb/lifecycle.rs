@@ -119,9 +119,6 @@ impl VectorIndex for SpFreshLayerDbIndex {
             let mut worst_idx = None;
             let postings = index.choose_probe_postings(query, k);
             for posting_id in postings {
-                if index.posting_centroid(posting_id).is_none() {
-                    continue;
-                }
                 let members = self
                     .load_posting_members_for(generation, posting_id)
                     .unwrap_or_else(|err| panic!("offheap-diskmeta load members failed: {err:#}"));

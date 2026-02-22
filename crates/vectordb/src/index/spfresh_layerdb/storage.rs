@@ -63,6 +63,19 @@ fn read_f32(raw: &[u8], cursor: &mut usize) -> anyhow::Result<f32> {
     Ok(f32::from_bits(bits))
 }
 
+fn decode_u64_fixed(raw: &[u8], field: &str) -> anyhow::Result<u64> {
+    if raw.len() != 8 {
+        anyhow::bail!("{field} has invalid fixed-u64 length: {}", raw.len());
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(raw);
+    Ok(u64::from_le_bytes(arr))
+}
+
+pub(crate) fn encode_u64_fixed(value: u64) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
 pub(crate) fn encode_vector_row_value(row: &VectorRecord) -> anyhow::Result<Vec<u8>> {
     encode_vector_row_fields(row.id, row.version, row.deleted, &row.values, None)
 }
@@ -279,7 +292,7 @@ pub(crate) fn ensure_active_generation(db: &Db) -> anyhow::Result<u64> {
         .get(META_ACTIVE_GENERATION_KEY, ReadOptions::default())
         .context("read spfresh active generation")?
     {
-        Some(bytes) => bincode::deserialize(bytes.as_ref()).context("decode active generation"),
+        Some(bytes) => decode_u64_fixed(bytes.as_ref(), "active generation"),
         None => {
             set_active_generation(db, 0, true)?;
             Ok(0)
@@ -288,7 +301,7 @@ pub(crate) fn ensure_active_generation(db: &Db) -> anyhow::Result<u64> {
 }
 
 pub(crate) fn set_active_generation(db: &Db, generation: u64, sync: bool) -> anyhow::Result<()> {
-    let bytes = bincode::serialize(&generation).context("encode active generation")?;
+    let bytes = encode_u64_fixed(generation);
     db.put(META_ACTIVE_GENERATION_KEY, bytes, WriteOptions { sync })
         .context("persist active generation")
 }
@@ -298,7 +311,7 @@ pub(crate) fn ensure_wal_next_seq(db: &Db) -> anyhow::Result<u64> {
         .get(META_INDEX_WAL_NEXT_SEQ_KEY, ReadOptions::default())
         .context("read spfresh wal next seq")?
     {
-        Some(bytes) => bincode::deserialize(bytes.as_ref()).context("decode wal next seq"),
+        Some(bytes) => decode_u64_fixed(bytes.as_ref(), "wal next seq"),
         None => {
             set_wal_next_seq(db, 0, true)?;
             Ok(0)
@@ -307,7 +320,7 @@ pub(crate) fn ensure_wal_next_seq(db: &Db) -> anyhow::Result<u64> {
 }
 
 pub(crate) fn set_wal_next_seq(db: &Db, next_seq: u64, sync: bool) -> anyhow::Result<()> {
-    let bytes = bincode::serialize(&next_seq).context("encode wal next seq")?;
+    let bytes = encode_u64_fixed(next_seq);
     db.put(META_INDEX_WAL_NEXT_SEQ_KEY, bytes, WriteOptions { sync })
         .context("persist wal next seq")
 }
@@ -317,9 +330,7 @@ pub(crate) fn ensure_posting_event_next_seq(db: &Db) -> anyhow::Result<u64> {
         .get(META_POSTING_EVENT_NEXT_SEQ_KEY, ReadOptions::default())
         .context("read spfresh posting-event next seq")?
     {
-        Some(bytes) => {
-            bincode::deserialize(bytes.as_ref()).context("decode posting-event next seq")
-        }
+        Some(bytes) => decode_u64_fixed(bytes.as_ref(), "posting-event next seq"),
         None => {
             set_posting_event_next_seq(db, 0, true)?;
             Ok(0)
@@ -328,7 +339,7 @@ pub(crate) fn ensure_posting_event_next_seq(db: &Db) -> anyhow::Result<u64> {
 }
 
 pub(crate) fn set_posting_event_next_seq(db: &Db, next_seq: u64, sync: bool) -> anyhow::Result<()> {
-    let bytes = bincode::serialize(&next_seq).context("encode posting-event next seq")?;
+    let bytes = encode_u64_fixed(next_seq);
     db.put(
         META_POSTING_EVENT_NEXT_SEQ_KEY,
         bytes,
@@ -482,40 +493,57 @@ pub(crate) enum IndexWalEntry {
     TouchBatch { ids: Vec<u64> },
 }
 
-const WAL_BIN_TAG: &[u8] = b"wl2";
+const WAL_BIN_TAG: &[u8] = b"wl3";
 const WAL_KIND_TOUCH: u8 = 1;
 const WAL_KIND_TOUCH_BATCH: u8 = 2;
+const WAL_FRAME_HEADER_SIZE: usize = 4 + 4;
+
+fn wal_crc32(payload: &[u8]) -> u32 {
+    crc32fast::hash(payload)
+}
 
 #[cfg(test)]
 pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(WAL_BIN_TAG.len() + 1 + 8);
-    out.extend_from_slice(WAL_BIN_TAG);
+    let mut payload = Vec::with_capacity(1 + 8);
     match entry {
         IndexWalEntry::Touch { id } => {
-            out.push(WAL_KIND_TOUCH);
-            out.extend_from_slice(&id.to_le_bytes());
+            payload.push(WAL_KIND_TOUCH);
+            payload.extend_from_slice(&id.to_le_bytes());
         }
         IndexWalEntry::TouchBatch { ids } => {
-            out.push(WAL_KIND_TOUCH_BATCH);
+            payload.push(WAL_KIND_TOUCH_BATCH);
             let len = u32::try_from(ids.len()).context("wal touch-batch len does not fit u32")?;
-            out.extend_from_slice(&len.to_le_bytes());
+            payload.extend_from_slice(&len.to_le_bytes());
             for id in ids {
-                out.extend_from_slice(&id.to_le_bytes());
+                payload.extend_from_slice(&id.to_le_bytes());
             }
         }
     }
+    let payload_len = u32::try_from(payload.len()).context("wal payload len does not fit u32")?;
+    let crc = wal_crc32(payload.as_slice());
+    let mut out = Vec::with_capacity(WAL_BIN_TAG.len() + WAL_FRAME_HEADER_SIZE + payload.len());
+    out.extend_from_slice(WAL_BIN_TAG);
+    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(payload.as_slice());
     Ok(out)
 }
 
 pub(crate) fn encode_wal_touch_batch_ids(ids: &[u64]) -> anyhow::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(WAL_BIN_TAG.len() + 1 + 4 + ids.len().saturating_mul(8));
-    out.extend_from_slice(WAL_BIN_TAG);
-    out.push(WAL_KIND_TOUCH_BATCH);
+    let mut payload = Vec::with_capacity(1 + 4 + ids.len().saturating_mul(8));
+    payload.push(WAL_KIND_TOUCH_BATCH);
     let len = u32::try_from(ids.len()).context("wal touch-batch len does not fit u32")?;
-    out.extend_from_slice(&len.to_le_bytes());
+    payload.extend_from_slice(&len.to_le_bytes());
     for id in ids {
-        out.extend_from_slice(&id.to_le_bytes());
+        payload.extend_from_slice(&id.to_le_bytes());
     }
+    let payload_len = u32::try_from(payload.len()).context("wal payload len does not fit u32")?;
+    let crc = wal_crc32(payload.as_slice());
+    let mut out = Vec::with_capacity(WAL_BIN_TAG.len() + WAL_FRAME_HEADER_SIZE + payload.len());
+    out.extend_from_slice(WAL_BIN_TAG);
+    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(payload.as_slice());
     Ok(out)
 }
 
@@ -523,25 +551,41 @@ pub(crate) fn decode_wal_entry(raw: &[u8]) -> anyhow::Result<IndexWalEntry> {
     if !raw.starts_with(WAL_BIN_TAG) {
         anyhow::bail!("unsupported wal tag");
     }
-    let mut cursor = WAL_BIN_TAG.len();
-    let kind = read_u8(raw, &mut cursor)?;
+    let mut frame_cursor = WAL_BIN_TAG.len();
+    let payload_len =
+        usize::try_from(read_u32(raw, &mut frame_cursor)?).context("wal payload len overflow")?;
+    let expected_crc = read_u32(raw, &mut frame_cursor)?;
+    let payload_end = frame_cursor
+        .checked_add(payload_len)
+        .ok_or_else(|| anyhow::anyhow!("wal payload length overflow"))?;
+    let Some(payload) = raw.get(frame_cursor..payload_end) else {
+        anyhow::bail!("wal payload underflow");
+    };
+    if wal_crc32(payload) != expected_crc {
+        anyhow::bail!("wal payload checksum mismatch");
+    }
+    if payload_end != raw.len() {
+        anyhow::bail!("wal entry trailing bytes");
+    }
+    let mut cursor = 0usize;
+    let kind = read_u8(payload, &mut cursor)?;
     let entry = match kind {
         WAL_KIND_TOUCH => {
-            let id = read_u64(raw, &mut cursor)?;
+            let id = read_u64(payload, &mut cursor)?;
             IndexWalEntry::Touch { id }
         }
         WAL_KIND_TOUCH_BATCH => {
-            let len = usize::try_from(read_u32(raw, &mut cursor)?)
+            let len = usize::try_from(read_u32(payload, &mut cursor)?)
                 .context("wal touch-batch len overflow")?;
             let mut ids = Vec::with_capacity(len);
             for _ in 0..len {
-                ids.push(read_u64(raw, &mut cursor)?);
+                ids.push(read_u64(payload, &mut cursor)?);
             }
             IndexWalEntry::TouchBatch { ids }
         }
         _ => anyhow::bail!("unsupported wal kind {}", kind),
     };
-    if cursor != raw.len() {
+    if cursor != payload.len() {
         anyhow::bail!("wal entry trailing bytes");
     }
     Ok(entry)
@@ -621,7 +665,7 @@ pub(crate) fn posting_map_key(generation: u64, id: u64) -> String {
 #[cfg(test)]
 pub(crate) fn posting_assignment_value(posting_id: usize) -> anyhow::Result<Vec<u8>> {
     let pid = u64::try_from(posting_id).context("posting id does not fit u64")?;
-    bincode::serialize(&pid).context("encode posting assignment value")
+    Ok(pid.to_le_bytes().to_vec())
 }
 
 #[allow(dead_code)]
@@ -637,7 +681,7 @@ pub(crate) fn load_posting_assignment(
     let Some(raw) = raw else {
         return Ok(None);
     };
-    let posting_u64: u64 = bincode::deserialize(raw.as_ref())
+    let posting_u64 = decode_u64_fixed(raw.as_ref(), "posting assignment")
         .with_context(|| format!("decode posting assignment id={id} generation={generation}"))?;
     let posting = usize::try_from(posting_u64).context("posting assignment does not fit usize")?;
     Ok(Some(posting))
@@ -1015,6 +1059,29 @@ mod tests {
             }
             other => panic!("expected touch-batch entry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wal_decoder_rejects_checksum_corruption() {
+        let ids = vec![101u64, 103, 107, 109];
+        let mut encoded = encode_wal_touch_batch_ids(ids.as_slice()).expect("encode wal");
+        let payload_start = WAL_BIN_TAG.len() + WAL_FRAME_HEADER_SIZE;
+        encoded[payload_start + 2] ^= 0x5a;
+        let err =
+            decode_wal_entry(encoded.as_slice()).expect_err("checksum corruption should fail");
+        assert!(
+            format!("{err:#}").contains("checksum"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn fixed_u64_codec_roundtrip() -> anyhow::Result<()> {
+        let value = 0x1020_3040_5566_7788u64;
+        let encoded = encode_u64_fixed(value);
+        let decoded = decode_u64_fixed(encoded.as_slice(), "test_u64")?;
+        assert_eq!(decoded, value);
+        Ok(())
     }
 
     #[test]

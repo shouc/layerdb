@@ -37,9 +37,9 @@ use rebuilder::{rebuild_once, spawn_rebuilder, RebuilderRuntime};
 use stats::SpFreshLayerDbStatsInner;
 use storage::{
     decode_vector_row_value, decode_vector_row_with_posting, encode_posting_members_snapshot,
-    encode_vector_row_fields, encode_vector_row_value, encode_vector_row_value_with_posting,
-    encode_wal_touch_batch_ids, ensure_active_generation, ensure_metadata,
-    ensure_posting_event_next_seq, ensure_wal_exists, ensure_wal_next_seq,
+    encode_u64_fixed, encode_vector_row_fields, encode_vector_row_value,
+    encode_vector_row_value_with_posting, encode_wal_touch_batch_ids, ensure_active_generation,
+    ensure_metadata, ensure_posting_event_next_seq, ensure_wal_exists, ensure_wal_next_seq,
     load_index_checkpoint_bytes, load_metadata, load_posting_members, load_row, load_rows,
     load_rows_with_posting_assignments, load_startup_manifest_bytes, load_wal_entries_since,
     persist_index_checkpoint_bytes, persist_startup_manifest_bytes, posting_map_prefix,

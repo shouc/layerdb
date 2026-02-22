@@ -117,7 +117,7 @@ impl SpFreshLayerDbIndex {
         row_ops.reserve(trailer_ops.len().saturating_add(2));
         let wal_value = encode_wal_touch_batch_ids(ids)?;
         row_ops.push(layerdb::Op::put(wal_key(start_seq), wal_value));
-        let wal_next = bincode::serialize(&next_seq).context("encode spfresh wal next seq")?;
+        let wal_next = encode_u64_fixed(next_seq);
         row_ops.push(layerdb::Op::put(
             config::META_INDEX_WAL_NEXT_SEQ_KEY,
             wal_next,

@@ -474,8 +474,7 @@ impl SpFreshLayerDbIndex {
                 self.stats
                     .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
             } else {
-                let posting_event_next = bincode::serialize(&posting_event_next_seq)
-                    .context("encode posting-event next seq")?;
+                let posting_event_next = encode_u64_fixed(posting_event_next_seq);
                 let trailer_ops = vec![layerdb::Op::put(
                     config::META_POSTING_EVENT_NEXT_SEQ_KEY,
                     posting_event_next,
@@ -692,8 +691,7 @@ impl SpFreshLayerDbIndex {
                 self.stats
                     .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
             } else {
-                let posting_event_next = bincode::serialize(&posting_event_next_seq)
-                    .context("encode posting-event next seq")?;
+                let posting_event_next = encode_u64_fixed(posting_event_next_seq);
                 let trailer_ops = vec![layerdb::Op::put(
                     config::META_POSTING_EVENT_NEXT_SEQ_KEY,
                     posting_event_next,

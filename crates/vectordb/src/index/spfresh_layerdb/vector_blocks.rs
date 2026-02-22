@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use memmap2::Mmap;
+use rustc_hash::FxHashMap;
 
 const VECTOR_BLOCKS_DIR: &str = "vector_blocks";
 const VECTOR_BLOCK_FILE_EXT: &str = "vb";
@@ -34,7 +34,7 @@ pub(crate) struct VectorBlockStore {
     epoch: u64,
     file: std::fs::File,
     mmap: Option<Mmap>,
-    offsets: HashMap<u64, u64>,
+    offsets: FxHashMap<u64, u64>,
     pending_remap_records: usize,
 }
 
@@ -78,7 +78,7 @@ impl VectorBlockStore {
             epoch,
             file,
             mmap: None,
-            offsets: HashMap::new(),
+            offsets: FxHashMap::default(),
             pending_remap_records: 0,
         };
         store.validate_header()?;

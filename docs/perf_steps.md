@@ -532,3 +532,29 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7891`
 - `search_qps_ratio=3.2284`
+
+## Step 22 (`vector-block-offsets-fxhash`)
+
+Change:
+- Switched `VectorBlockStore.offsets` from std `HashMap<u64, u64>` to `FxHashMap<u64, u64>`.
+- This path is used in block-backed id lookups for `get_state(...)` and
+  `distances_for_ids(...)` in diskmeta search fallback.
+
+Benchmark note:
+- Same-dataset release rerun pair:
+  `target/vectordb-step23-spfresh.json`,
+  `target/vectordb-step23-lancedb.json`.
+
+SPFresh:
+- `update_qps=209071.07`
+- `search_qps=2752.91`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=130571.03`
+- `search_qps=929.67`
+- `recall_at_k=0.4835`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.6012`
+- `search_qps_ratio=2.9612`

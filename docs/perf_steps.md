@@ -1237,3 +1237,35 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.7991`
 - `search_qps_ratio=3.1464`
+
+## Step 48 (`commit-worker-group-commit`)
+
+Change:
+- Added grouped commit execution in the commit worker:
+  - drains ready write requests up to bounded request/op caps
+  - merges them into one ordered `write_batch`
+  - issues a single sync decision (`sync=true` if any grouped request requires durable mode)
+  - propagates result to each original request responder
+- Preserves write ordering semantics while reducing per-request commit overhead under concurrency.
+
+Impact:
+- Improves commit-path scalability under concurrent mutation writers by amortizing write-batch overhead.
+- Keeps durable semantics strict (`Durable` requests still force fsync on grouped batch).
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=180240.39`
+- `search_qps=2963.35`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=130841.53`
+- `search_qps=879.16`
+- `recall_at_k=0.4885`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.3775`
+- `search_qps_ratio=3.3707`

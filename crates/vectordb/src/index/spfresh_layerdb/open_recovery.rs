@@ -304,13 +304,60 @@ impl SpFreshLayerDbIndex {
 
         let commit_db = db.clone();
         let commit_worker = std::thread::spawn(move || {
+            const GROUP_COMMIT_MAX_REQUESTS: usize = 32;
+            const GROUP_COMMIT_MAX_OPS: usize = 16_384;
             while let Ok(req) = commit_rx.recv() {
                 match req {
                     CommitRequest::Write { ops, sync, resp } => {
+                        let mut grouped = Vec::with_capacity(GROUP_COMMIT_MAX_REQUESTS);
+                        grouped.push((ops, sync, resp));
+                        let mut saw_shutdown = false;
+
+                        loop {
+                            let grouped_reqs = grouped.len();
+                            let grouped_ops: usize =
+                                grouped.iter().map(|(ops, _, _)| ops.len()).sum();
+                            if grouped_reqs >= GROUP_COMMIT_MAX_REQUESTS
+                                || grouped_ops >= GROUP_COMMIT_MAX_OPS
+                            {
+                                break;
+                            }
+                            match commit_rx.try_recv() {
+                                Ok(CommitRequest::Write { ops, sync, resp }) => {
+                                    grouped.push((ops, sync, resp));
+                                }
+                                Ok(CommitRequest::Shutdown) => {
+                                    saw_shutdown = true;
+                                    break;
+                                }
+                                Err(mpsc::TryRecvError::Empty) => break,
+                                Err(mpsc::TryRecvError::Disconnected) => break,
+                            }
+                        }
+
+                        let need_sync = grouped.iter().any(|(_, sync, _)| *sync);
+                        let total_ops: usize = grouped.iter().map(|(ops, _, _)| ops.len()).sum();
+                        let mut merged_ops = Vec::with_capacity(total_ops);
+                        let mut responders = Vec::with_capacity(grouped.len());
+                        for (ops, _sync, resp) in grouped {
+                            merged_ops.extend(ops);
+                            responders.push(resp);
+                        }
+
                         let result = commit_db
-                            .write_batch(ops, WriteOptions { sync })
-                            .context("spfresh-layerdb commit worker write batch");
-                        let _ = resp.send(result);
+                            .write_batch(merged_ops, WriteOptions { sync: need_sync })
+                            .context("spfresh-layerdb commit worker grouped write batch");
+                        let err_text = result.err().map(|err| format!("{err:#}"));
+                        for resp in responders {
+                            let send_result = match err_text.as_ref() {
+                                Some(text) => Err(anyhow::anyhow!("{text}")),
+                                None => Ok(()),
+                            };
+                            let _ = resp.send(send_result);
+                        }
+                        if saw_shutdown {
+                            break;
+                        }
                     }
                     CommitRequest::Shutdown => break,
                 }

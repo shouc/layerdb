@@ -676,15 +676,99 @@ pub(crate) fn wal_key(seq: u64) -> String {
 pub(crate) enum IndexWalEntry {
     Touch { id: u64 },
     TouchBatch { ids: Vec<u64> },
+    DiskMetaUpsertBatch { rows: Vec<DiskMetaWalUpsertRow> },
+    DiskMetaDeleteBatch { rows: Vec<DiskMetaWalDeleteRow> },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DiskMetaWalUpsertRow {
+    pub id: u64,
+    pub old: Option<(usize, Vec<f32>)>,
+    pub new_posting: usize,
+    pub new_values: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DiskMetaWalDeleteRow {
+    pub id: u64,
+    pub old: Option<(usize, Vec<f32>)>,
 }
 
 const WAL_BIN_TAG: &[u8] = b"wl3";
 const WAL_KIND_TOUCH: u8 = 1;
 const WAL_KIND_TOUCH_BATCH: u8 = 2;
+const WAL_KIND_DISKMETA_UPSERT_BATCH: u8 = 3;
+const WAL_KIND_DISKMETA_DELETE_BATCH: u8 = 4;
+const WAL_DISKMETA_FLAG_HAS_OLD: u8 = 1 << 0;
 const WAL_FRAME_HEADER_SIZE: usize = 4 + 4;
 
 fn wal_crc32(payload: &[u8]) -> u32 {
     crc32fast::hash(payload)
+}
+
+fn encode_wal_frame(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let payload_len = u32::try_from(payload.len()).context("wal payload len does not fit u32")?;
+    let crc = wal_crc32(payload);
+    let mut out = Vec::with_capacity(WAL_BIN_TAG.len() + WAL_FRAME_HEADER_SIZE + payload.len());
+    out.extend_from_slice(WAL_BIN_TAG);
+    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+fn encode_wal_f32_vec(payload: &mut Vec<u8>, values: &[f32]) -> anyhow::Result<()> {
+    let len = u32::try_from(values.len()).context("wal f32 vector len does not fit u32")?;
+    payload.extend_from_slice(&len.to_le_bytes());
+    for value in values {
+        payload.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+    Ok(())
+}
+
+fn decode_wal_f32_vec(payload: &[u8], cursor: &mut usize) -> anyhow::Result<Vec<f32>> {
+    let len = usize::try_from(read_u32(payload, cursor)?).context("wal f32 vector len overflow")?;
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(read_f32(payload, cursor)?);
+    }
+    Ok(values)
+}
+
+fn encode_wal_diskmeta_old_state(
+    payload: &mut Vec<u8>,
+    old: Option<(usize, &[f32])>,
+) -> anyhow::Result<()> {
+    let mut flags = 0u8;
+    if old.is_some() {
+        flags |= WAL_DISKMETA_FLAG_HAS_OLD;
+    }
+    payload.push(flags);
+    if let Some((posting, values)) = old {
+        let posting_u64 = u64::try_from(posting).context("wal diskmeta old posting overflow")?;
+        payload.extend_from_slice(&posting_u64.to_le_bytes());
+        encode_wal_f32_vec(payload, values)?;
+    }
+    Ok(())
+}
+
+fn decode_wal_diskmeta_old_state(
+    payload: &[u8],
+    cursor: &mut usize,
+) -> anyhow::Result<Option<(usize, Vec<f32>)>> {
+    let flags = read_u8(payload, cursor)?;
+    let unknown_flags = flags & !WAL_DISKMETA_FLAG_HAS_OLD;
+    if unknown_flags != 0 {
+        anyhow::bail!("unsupported diskmeta wal old-state flags: {unknown_flags:#x}");
+    }
+    if (flags & WAL_DISKMETA_FLAG_HAS_OLD) == 0 {
+        return Ok(None);
+    }
+    let posting_u64 = read_u64(payload, cursor)?;
+    let posting =
+        usize::try_from(posting_u64).context("wal diskmeta old posting does not fit usize")?;
+    let values = decode_wal_f32_vec(payload, cursor)?;
+    Ok(Some((posting, values)))
 }
 
 #[cfg(test)]
@@ -703,15 +787,40 @@ pub(crate) fn encode_wal_entry(entry: &IndexWalEntry) -> anyhow::Result<Vec<u8>>
                 payload.extend_from_slice(&id.to_le_bytes());
             }
         }
+        IndexWalEntry::DiskMetaUpsertBatch { rows } => {
+            payload.push(WAL_KIND_DISKMETA_UPSERT_BATCH);
+            let len = u32::try_from(rows.len())
+                .context("wal diskmeta upsert-batch len does not fit u32")?;
+            payload.extend_from_slice(&len.to_le_bytes());
+            for row in rows {
+                payload.extend_from_slice(&row.id.to_le_bytes());
+                let old = row
+                    .old
+                    .as_ref()
+                    .map(|(posting, values)| (*posting, values.as_slice()));
+                encode_wal_diskmeta_old_state(&mut payload, old)?;
+                let new_posting =
+                    u64::try_from(row.new_posting).context("wal new posting does not fit u64")?;
+                payload.extend_from_slice(&new_posting.to_le_bytes());
+                encode_wal_f32_vec(&mut payload, row.new_values.as_slice())?;
+            }
+        }
+        IndexWalEntry::DiskMetaDeleteBatch { rows } => {
+            payload.push(WAL_KIND_DISKMETA_DELETE_BATCH);
+            let len = u32::try_from(rows.len())
+                .context("wal diskmeta delete-batch len does not fit u32")?;
+            payload.extend_from_slice(&len.to_le_bytes());
+            for row in rows {
+                payload.extend_from_slice(&row.id.to_le_bytes());
+                let old = row
+                    .old
+                    .as_ref()
+                    .map(|(posting, values)| (*posting, values.as_slice()));
+                encode_wal_diskmeta_old_state(&mut payload, old)?;
+            }
+        }
     }
-    let payload_len = u32::try_from(payload.len()).context("wal payload len does not fit u32")?;
-    let crc = wal_crc32(payload.as_slice());
-    let mut out = Vec::with_capacity(WAL_BIN_TAG.len() + WAL_FRAME_HEADER_SIZE + payload.len());
-    out.extend_from_slice(WAL_BIN_TAG);
-    out.extend_from_slice(&payload_len.to_le_bytes());
-    out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(payload.as_slice());
-    Ok(out)
+    encode_wal_frame(payload.as_slice())
 }
 
 pub(crate) fn encode_wal_touch_batch_ids(ids: &[u64]) -> anyhow::Result<Vec<u8>> {
@@ -722,14 +831,55 @@ pub(crate) fn encode_wal_touch_batch_ids(ids: &[u64]) -> anyhow::Result<Vec<u8>>
     for id in ids {
         payload.extend_from_slice(&id.to_le_bytes());
     }
-    let payload_len = u32::try_from(payload.len()).context("wal payload len does not fit u32")?;
-    let crc = wal_crc32(payload.as_slice());
-    let mut out = Vec::with_capacity(WAL_BIN_TAG.len() + WAL_FRAME_HEADER_SIZE + payload.len());
-    out.extend_from_slice(WAL_BIN_TAG);
-    out.extend_from_slice(&payload_len.to_le_bytes());
-    out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(payload.as_slice());
-    Ok(out)
+    encode_wal_frame(payload.as_slice())
+}
+
+pub(crate) fn encode_wal_diskmeta_upsert_batch(
+    rows: &[(u64, Vec<f32>)],
+    old_states: &FxHashMap<u64, Option<(usize, Vec<f32>)>>,
+    new_postings: &FxHashMap<u64, usize>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(1 + 4 + rows.len().saturating_mul(16));
+    payload.push(WAL_KIND_DISKMETA_UPSERT_BATCH);
+    let len =
+        u32::try_from(rows.len()).context("wal diskmeta upsert-batch len does not fit u32")?;
+    payload.extend_from_slice(&len.to_le_bytes());
+    for (id, new_values) in rows {
+        payload.extend_from_slice(&id.to_le_bytes());
+        let old = old_states
+            .get(id)
+            .and_then(|state| state.as_ref())
+            .map(|(posting, values)| (*posting, values.as_slice()));
+        encode_wal_diskmeta_old_state(&mut payload, old)?;
+        let new_posting = new_postings
+            .get(id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("missing new posting for diskmeta wal id={id}"))?;
+        let posting_u64 =
+            u64::try_from(new_posting).context("wal diskmeta new posting does not fit u64")?;
+        payload.extend_from_slice(&posting_u64.to_le_bytes());
+        encode_wal_f32_vec(&mut payload, new_values.as_slice())?;
+    }
+    encode_wal_frame(payload.as_slice())
+}
+
+pub(crate) fn encode_wal_diskmeta_delete_batch(
+    ids: &[u64],
+    old_states: &FxHashMap<u64, Option<(usize, Vec<f32>)>>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(1 + 4 + ids.len().saturating_mul(12));
+    payload.push(WAL_KIND_DISKMETA_DELETE_BATCH);
+    let len = u32::try_from(ids.len()).context("wal diskmeta delete-batch len does not fit u32")?;
+    payload.extend_from_slice(&len.to_le_bytes());
+    for id in ids {
+        payload.extend_from_slice(&id.to_le_bytes());
+        let old = old_states
+            .get(id)
+            .and_then(|state| state.as_ref())
+            .map(|(posting, values)| (*posting, values.as_slice()));
+        encode_wal_diskmeta_old_state(&mut payload, old)?;
+    }
+    encode_wal_frame(payload.as_slice())
 }
 
 pub(crate) fn decode_wal_entry(raw: &[u8]) -> anyhow::Result<IndexWalEntry> {
@@ -767,6 +917,37 @@ pub(crate) fn decode_wal_entry(raw: &[u8]) -> anyhow::Result<IndexWalEntry> {
                 ids.push(read_u64(payload, &mut cursor)?);
             }
             IndexWalEntry::TouchBatch { ids }
+        }
+        WAL_KIND_DISKMETA_UPSERT_BATCH => {
+            let len = usize::try_from(read_u32(payload, &mut cursor)?)
+                .context("wal diskmeta upsert-batch len overflow")?;
+            let mut rows = Vec::with_capacity(len);
+            for _ in 0..len {
+                let id = read_u64(payload, &mut cursor)?;
+                let old = decode_wal_diskmeta_old_state(payload, &mut cursor)?;
+                let new_posting_u64 = read_u64(payload, &mut cursor)?;
+                let new_posting = usize::try_from(new_posting_u64)
+                    .context("wal diskmeta new posting does not fit usize")?;
+                let new_values = decode_wal_f32_vec(payload, &mut cursor)?;
+                rows.push(DiskMetaWalUpsertRow {
+                    id,
+                    old,
+                    new_posting,
+                    new_values,
+                });
+            }
+            IndexWalEntry::DiskMetaUpsertBatch { rows }
+        }
+        WAL_KIND_DISKMETA_DELETE_BATCH => {
+            let len = usize::try_from(read_u32(payload, &mut cursor)?)
+                .context("wal diskmeta delete-batch len overflow")?;
+            let mut rows = Vec::with_capacity(len);
+            for _ in 0..len {
+                let id = read_u64(payload, &mut cursor)?;
+                let old = decode_wal_diskmeta_old_state(payload, &mut cursor)?;
+                rows.push(DiskMetaWalDeleteRow { id, old });
+            }
+            IndexWalEntry::DiskMetaDeleteBatch { rows }
         }
         _ => anyhow::bail!("unsupported wal kind {}", kind),
     };
@@ -1345,6 +1526,59 @@ mod tests {
             format!("{err:#}").contains("checksum"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn diskmeta_wal_upsert_batch_codec_roundtrip() -> anyhow::Result<()> {
+        let rows = vec![(7u64, vec![0.1f32, 0.2]), (11u64, vec![1.0f32, -1.5])];
+        let mut old_states = FxHashMap::default();
+        old_states.insert(7u64, Some((2usize, vec![0.05f32, 0.25])));
+        old_states.insert(11u64, None);
+        let mut new_postings = FxHashMap::default();
+        new_postings.insert(7u64, 3usize);
+        new_postings.insert(11u64, 4usize);
+
+        let encoded =
+            encode_wal_diskmeta_upsert_batch(rows.as_slice(), &old_states, &new_postings)?;
+        let decoded = decode_wal_entry(encoded.as_slice())?;
+        match decoded {
+            IndexWalEntry::DiskMetaUpsertBatch { rows: decoded_rows } => {
+                assert_eq!(decoded_rows.len(), 2);
+                assert_eq!(decoded_rows[0].id, 7);
+                assert_eq!(decoded_rows[0].old, Some((2usize, vec![0.05, 0.25])));
+                assert_eq!(decoded_rows[0].new_posting, 3usize);
+                assert_eq!(decoded_rows[0].new_values, vec![0.1, 0.2]);
+
+                assert_eq!(decoded_rows[1].id, 11);
+                assert_eq!(decoded_rows[1].old, None);
+                assert_eq!(decoded_rows[1].new_posting, 4usize);
+                assert_eq!(decoded_rows[1].new_values, vec![1.0, -1.5]);
+            }
+            other => panic!("expected diskmeta upsert-batch entry, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diskmeta_wal_delete_batch_codec_roundtrip() -> anyhow::Result<()> {
+        let ids = vec![31u64, 41u64];
+        let mut old_states = FxHashMap::default();
+        old_states.insert(31u64, Some((9usize, vec![0.3f32, -0.7])));
+        old_states.insert(41u64, None);
+
+        let encoded = encode_wal_diskmeta_delete_batch(ids.as_slice(), &old_states)?;
+        let decoded = decode_wal_entry(encoded.as_slice())?;
+        match decoded {
+            IndexWalEntry::DiskMetaDeleteBatch { rows: decoded_rows } => {
+                assert_eq!(decoded_rows.len(), 2);
+                assert_eq!(decoded_rows[0].id, 31);
+                assert_eq!(decoded_rows[0].old, Some((9usize, vec![0.3, -0.7])));
+                assert_eq!(decoded_rows[1].id, 41);
+                assert_eq!(decoded_rows[1].old, None);
+            }
+            other => panic!("expected diskmeta delete-batch entry, got {other:?}"),
+        }
+        Ok(())
     }
 
     #[test]

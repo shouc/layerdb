@@ -474,13 +474,16 @@ impl SpFreshLayerDbIndex {
                 self.stats
                     .add_persist_upsert_us(persist_started.elapsed().as_micros() as u64);
             } else {
+                let wal_payload =
+                    encode_wal_diskmeta_upsert_batch(mutations.as_slice(), &states, &new_postings)?;
                 let posting_event_next = encode_u64_fixed(posting_event_next_seq);
                 let trailer_ops = vec![layerdb::Op::put(
                     config::META_POSTING_EVENT_NEXT_SEQ_KEY,
                     posting_event_next,
                 )];
-                if let Err(err) = self.persist_with_wal_touch_batch_ids(
-                    ids.as_slice(),
+                if let Err(err) = self.persist_with_wal_payload(
+                    wal_payload,
+                    ids.len(),
                     batch_ops,
                     trailer_ops,
                     commit_mode,
@@ -662,11 +665,11 @@ impl SpFreshLayerDbIndex {
             let mut posting_delete_deltas = Vec::with_capacity(mutations.len());
             let mut posting_event_next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
             for id in &mutations {
-                let old = states.get(id).cloned().unwrap_or(None);
+                let old = states.get(id).and_then(|state| state.as_ref());
                 if !use_fast_path {
                     batch_ops.push(layerdb::Op::delete(vector_key(generation, *id)));
                 }
-                if let Some((old_posting, _)) = &old {
+                if let Some((old_posting, _)) = old {
                     dirty_postings.insert(*old_posting);
                     posting_delete_deltas.push((*id, *old_posting));
                     if !use_fast_path {
@@ -683,7 +686,9 @@ impl SpFreshLayerDbIndex {
                         ));
                     }
                 }
-                if shadow.apply_delete(old) {
+                if shadow
+                    .apply_delete_ref(old.map(|(posting, values)| (*posting, values.as_slice())))
+                {
                     deleted = deleted.saturating_add(1);
                 }
             }
@@ -691,13 +696,15 @@ impl SpFreshLayerDbIndex {
                 self.stats
                     .add_persist_delete_us(persist_started.elapsed().as_micros() as u64);
             } else {
+                let wal_payload = encode_wal_diskmeta_delete_batch(mutations.as_slice(), &states)?;
                 let posting_event_next = encode_u64_fixed(posting_event_next_seq);
                 let trailer_ops = vec![layerdb::Op::put(
                     config::META_POSTING_EVENT_NEXT_SEQ_KEY,
                     posting_event_next,
                 )];
-                if let Err(err) = self.persist_with_wal_touch_batch_ids(
-                    mutations.as_slice(),
+                if let Err(err) = self.persist_with_wal_payload(
+                    wal_payload,
+                    mutations.len(),
                     batch_ops,
                     trailer_ops,
                     commit_mode,

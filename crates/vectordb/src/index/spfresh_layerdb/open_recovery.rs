@@ -252,16 +252,24 @@ impl SpFreshLayerDbIndex {
         let replay_from = applied_wal_seq.map_or(0, |seq| seq.saturating_add(1));
         if replay_from < wal_next_seq {
             if matches!(index_state, RuntimeSpFreshIndex::OffHeapDiskMeta(_)) {
-                // WAL v2 for diskmeta only stores new-state payloads. To preserve exact centroid
-                // accounting, rebuild from authoritative rows whenever a tail exists.
-                let (rows, assignments) = load_rows_with_posting_assignments(&db, generation)?;
-                let (rebuilt, _assigned_now) =
-                    SpFreshDiskMetaIndex::build_from_rows_with_assignments(
-                        cfg.spfresh.clone(),
-                        &rows,
-                        Some(&assignments),
-                    );
-                index_state = RuntimeSpFreshIndex::OffHeapDiskMeta(rebuilt);
+                let replayed_exactly =
+                    if let RuntimeSpFreshIndex::OffHeapDiskMeta(index) = &mut index_state {
+                        Self::replay_wal_tail_diskmeta_exact(&db, index, replay_from)?
+                    } else {
+                        false
+                    };
+                if !replayed_exactly {
+                    // Legacy WAL tails without diskmeta deltas cannot preserve exact centroid
+                    // accounting; rebuild from authoritative rows in that case.
+                    let (rows, assignments) = load_rows_with_posting_assignments(&db, generation)?;
+                    let (rebuilt, _assigned_now) =
+                        SpFreshDiskMetaIndex::build_from_rows_with_assignments(
+                            cfg.spfresh.clone(),
+                            &rows,
+                            Some(&assignments),
+                        );
+                    index_state = RuntimeSpFreshIndex::OffHeapDiskMeta(rebuilt);
+                }
             } else {
                 Self::replay_wal_tail(
                     &db,
@@ -414,6 +422,35 @@ impl SpFreshLayerDbIndex {
         Ok((index, applied_wal_seq))
     }
 
+    fn replay_wal_tail_diskmeta_exact(
+        db: &Db,
+        index: &mut SpFreshDiskMetaIndex,
+        from_seq: u64,
+    ) -> anyhow::Result<bool> {
+        let entries = load_wal_entries_since(db, from_seq)?;
+        if entries.is_empty() {
+            return Ok(true);
+        }
+        for entry in entries {
+            match entry {
+                IndexWalEntry::DiskMetaUpsertBatch { rows } => {
+                    for row in rows {
+                        index.apply_upsert(row.old, row.new_posting, row.new_values);
+                    }
+                }
+                IndexWalEntry::DiskMetaDeleteBatch { rows } => {
+                    for row in rows {
+                        let _ = index.apply_delete(row.old);
+                    }
+                }
+                IndexWalEntry::Touch { .. } | IndexWalEntry::TouchBatch { .. } => {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) fn extract_diskmeta_snapshot(
         index: &RuntimeSpFreshIndex,
     ) -> Option<Arc<SpFreshDiskMetaIndex>> {
@@ -441,6 +478,8 @@ impl SpFreshLayerDbIndex {
             let add = match entry {
                 IndexWalEntry::Touch { .. } => 1usize,
                 IndexWalEntry::TouchBatch { ids } => ids.len(),
+                IndexWalEntry::DiskMetaUpsertBatch { rows } => rows.len(),
+                IndexWalEntry::DiskMetaDeleteBatch { rows } => rows.len(),
             };
             touched_capacity = touched_capacity.saturating_add(add);
         }
@@ -455,6 +494,12 @@ impl SpFreshLayerDbIndex {
                 }
                 IndexWalEntry::TouchBatch { ids } => {
                     touched.extend(ids);
+                }
+                IndexWalEntry::DiskMetaUpsertBatch { rows } => {
+                    touched.extend(rows.into_iter().map(|row| row.id));
+                }
+                IndexWalEntry::DiskMetaDeleteBatch { rows } => {
+                    touched.extend(rows.into_iter().map(|row| row.id));
                 }
             }
         }

@@ -103,9 +103,10 @@ impl SpFreshLayerDbIndex {
             self.poll_pending_commits()
         }
     }
-    pub(super) fn persist_with_wal_touch_batch_ids(
+    pub(super) fn persist_with_wal_payload(
         &self,
-        ids: &[u64],
+        wal_payload: Vec<u8>,
+        op_count_hint: usize,
         mut row_ops: Vec<layerdb::Op>,
         mut trailer_ops: Vec<layerdb::Op>,
         commit_mode: MutationCommitMode,
@@ -115,8 +116,7 @@ impl SpFreshLayerDbIndex {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("spfresh wal sequence overflow"))?;
         row_ops.reserve(trailer_ops.len().saturating_add(2));
-        let wal_value = encode_wal_touch_batch_ids(ids)?;
-        row_ops.push(layerdb::Op::put(wal_key(start_seq), wal_value));
+        row_ops.push(layerdb::Op::put(wal_key(start_seq), wal_payload));
         let wal_next = encode_u64_fixed(next_seq);
         row_ops.push(layerdb::Op::put(
             config::META_INDEX_WAL_NEXT_SEQ_KEY,
@@ -126,13 +126,22 @@ impl SpFreshLayerDbIndex {
         let sync = matches!(commit_mode, MutationCommitMode::Durable);
         self.submit_commit(row_ops, sync, true).with_context(|| {
             format!(
-                "persist vector+wal touch-batch seq={} next={} ids={}",
-                start_seq,
-                next_seq,
-                ids.len()
+                "persist vector+wal seq={} next={} ops={}",
+                start_seq, next_seq, op_count_hint
             )
         })?;
         self.wal_next_seq.store(next_seq, Ordering::Relaxed);
         Ok(())
+    }
+
+    pub(super) fn persist_with_wal_touch_batch_ids(
+        &self,
+        ids: &[u64],
+        row_ops: Vec<layerdb::Op>,
+        trailer_ops: Vec<layerdb::Op>,
+        commit_mode: MutationCommitMode,
+    ) -> anyhow::Result<()> {
+        let wal_value = encode_wal_touch_batch_ids(ids)?;
+        self.persist_with_wal_payload(wal_value, ids.len(), row_ops, trailer_ops, commit_mode)
     }
 }

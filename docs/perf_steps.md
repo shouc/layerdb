@@ -1169,3 +1169,40 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.8443`
 - `search_qps_ratio=3.3955`
+
+## Step 46 (`diskmeta-typed-wal-tail-replay`)
+
+Change:
+- Added typed diskmeta WAL payloads for deterministic replay:
+  - `DiskMetaUpsertBatch` carries per-row old state + new posting + new values.
+  - `DiskMetaDeleteBatch` carries per-row old state.
+- Switched diskmeta batch persistence to write typed WAL entries (instead of touch-only WAL).
+- Startup now attempts exact diskmeta tail replay from WAL deltas first.
+  - Falls back to rebuild-from-rows only for legacy touch-only WAL tails.
+- Added WAL codec tests:
+  - `diskmeta_wal_upsert_batch_codec_roundtrip`
+  - `diskmeta_wal_delete_batch_codec_roundtrip`
+- Added startup regression:
+  - `offheap_diskmeta_replays_typed_wal_tail_without_vector_rows`
+
+Impact:
+- Removes the mandatory full row scan/rebuild for typed diskmeta WAL tails on restart.
+- Preserves exact centroid accounting during tail replay.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=208279.98`
+- `search_qps=2787.33`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=129032.95`
+- `search_qps=936.62`
+- `recall_at_k=0.4690`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.6142`
+- `search_qps_ratio=2.9759`

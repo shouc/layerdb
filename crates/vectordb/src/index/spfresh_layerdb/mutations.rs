@@ -1,5 +1,5 @@
 use super::*;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 impl SpFreshLayerDbIndex {
     pub fn bulk_load(&mut self, rows: &[VectorRecord]) -> anyhow::Result<()> {
@@ -410,12 +410,9 @@ impl SpFreshLayerDbIndex {
             };
             let mut posting_event_next_seq = self.posting_event_next_seq.load(Ordering::Relaxed);
             let mut batch_ops = Vec::with_capacity(mutations.len().saturating_mul(3));
-            let touched_ids = if use_fast_path {
-                Vec::new()
-            } else {
-                ids.clone()
-            };
-            let mut new_postings = HashMap::with_capacity(mutations.len());
+            let touched_ids = if use_fast_path { Vec::new() } else { ids };
+            let mut new_postings =
+                FxHashMap::with_capacity_and_hasher(mutations.len(), Default::default());
             let mut dirty_postings = FxHashSet::with_capacity_and_hasher(
                 mutations.len().saturating_mul(2),
                 Default::default(),

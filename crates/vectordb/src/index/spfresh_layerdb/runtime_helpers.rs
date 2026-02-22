@@ -249,7 +249,7 @@ impl SpFreshLayerDbIndex {
     pub(super) fn apply_ephemeral_row_upserts(
         &self,
         mutations: &[(u64, Vec<f32>)],
-        new_postings: &HashMap<u64, usize>,
+        new_postings: &FxHashMap<u64, usize>,
     ) {
         let mut guard = lock_mutex(&self.ephemeral_row_states);
         let Some(states) = guard.as_mut() else {

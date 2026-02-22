@@ -449,3 +449,30 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=2.2593`
 - `search_qps_ratio=4.0109`
+
+## Step 19 (`diskmeta-upsert-id-clone-elision-and-fx-new-postings`)
+
+Change:
+- Removed one full `Vec<u64>` clone in diskmeta upsert persistence (`touched_ids` now reuses the
+  already-built `ids` vector).
+- Switched the hot `new_postings` map in diskmeta upsert from std `HashMap` to `FxHashMap`.
+- Updated `apply_ephemeral_row_upserts(...)` to accept the `FxHashMap` directly.
+
+Benchmark note:
+- Same dataset rerun pair:
+  `target/vectordb-step20-spfresh.json`,
+  `target/vectordb-step20-lancedb.json`.
+
+SPFresh:
+- `update_qps=193346.46`
+- `search_qps=2816.22`
+- `recall_at_k=0.6030`
+
+LanceDB:
+- `update_qps=72678.49`
+- `search_qps=489.65`
+- `recall_at_k=0.4770`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=2.6603`
+- `search_qps_ratio=5.7515`

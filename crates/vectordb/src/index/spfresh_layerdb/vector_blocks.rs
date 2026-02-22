@@ -16,6 +16,7 @@ const VECTOR_BLOCK_LIVE: u8 = 0;
 const VECTOR_BLOCK_HAS_POSTING: u8 = 1 << 1;
 const REMAP_INTERVAL_RECORDS: usize = 1_024;
 const INDEX_RECORD_SIZE: usize = 8 + 1 + 8;
+const DISTANCE_SCAN_PREFETCH_DISTANCE: usize = 16;
 
 fn record_size(dim: usize) -> usize {
     8 + 1 + 8 + dim.saturating_mul(4)
@@ -58,6 +59,38 @@ pub(crate) struct VectorBlockState {
 }
 
 impl VectorBlockStore {
+    #[inline]
+    fn prefetch_record(mmap: &Mmap, offset: u64, rec_size: usize) {
+        let Some(start) = usize::try_from(offset).ok() else {
+            return;
+        };
+        let Some(end) = start.checked_add(rec_size) else {
+            return;
+        };
+        if end > mmap.len() {
+            return;
+        }
+        let ptr = mmap.as_ptr();
+        // SAFETY: start/end bounds are validated above.
+        let addr = unsafe { ptr.add(start) };
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        unsafe {
+            #[cfg(target_arch = "x86")]
+            use std::arch::x86::{_mm_prefetch, _MM_HINT_T0};
+            #[cfg(target_arch = "x86_64")]
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(addr.cast::<i8>(), _MM_HINT_T0);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!(
+                "prfm pldl1keep, [{addr}]",
+                addr = in(reg) addr,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+    }
+
     fn open_vector_file(root: &Path, epoch: u64, dim: usize) -> anyhow::Result<std::fs::File> {
         let path = file_path_for_epoch(root, epoch);
         let mut file = OpenOptions::new()
@@ -378,7 +411,13 @@ impl VectorBlockStore {
             }
             // Group large scans by file locality to reduce page-fault churn on cold scans.
             ordered_offsets.sort_unstable_by_key(|(_, offset)| *offset);
-            for (id, offset) in ordered_offsets {
+            for idx in 0..ordered_offsets.len() {
+                if let Some((_, prefetch_offset)) =
+                    ordered_offsets.get(idx.saturating_add(DISTANCE_SCAN_PREFETCH_DISTANCE))
+                {
+                    Self::prefetch_record(mmap, *prefetch_offset, rec_size);
+                }
+                let (id, offset) = ordered_offsets[idx];
                 iterate(id, offset, &mut found, &mut missing);
             }
         } else {

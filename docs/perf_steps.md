@@ -962,3 +962,45 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.5303`
 - `search_qps_ratio=2.5853`
+
+## Step 38 (`startup-seq-metadata-corruption-recovery`)
+
+Change:
+- Added deterministic recovery for corrupted/missing sequence metadata:
+  - `META_INDEX_WAL_NEXT_SEQ_KEY`
+  - `META_POSTING_EVENT_NEXT_SEQ_KEY`
+- Recovery scans existing on-disk keys and rebuilds `next_seq = max_seen + 1`, then
+  persists repaired metadata.
+- Added focused tests:
+  - `ensure_wal_next_seq_recovers_from_corrupt_meta`
+  - `ensure_posting_event_next_seq_recovers_from_corrupt_meta`
+
+Impact:
+- Startup is resilient to partial metadata corruption and avoids sequence rewinds.
+
+## Step 39 (`vector-block-large-scan-prefetch`)
+
+Change:
+- Added explicit prefetching in large (`>=2048`) ordered-offset vector-block distance scans.
+- Prefetch support:
+  - x86/x86_64 via `_mm_prefetch(..., _MM_HINT_T0)`
+  - aarch64 via `prfm pldl1keep`
+- Kept existing correctness behavior and sidecar-offset tests unchanged.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=195701.09`
+- `search_qps=2764.25`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=130623.97`
+- `search_qps=923.02`
+- `recall_at_k=0.4765`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.4982`
+- `search_qps_ratio=2.9948`

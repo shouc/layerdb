@@ -1305,3 +1305,34 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.4933`
 - `search_qps_ratio=3.0427`
+
+## Step 50 (`restart-differential-crash-test`)
+
+Change:
+- Added deterministic crash/restart differential test:
+  - `randomized_crash_restart_matches_reference_model`
+- Test executes 1,000 mixed upsert/delete operations with periodic reopen cycles and checks:
+  - persisted index state equals reference model after each reopen
+  - retrieval remains logically consistent with all live IDs
+
+Impact:
+- Strengthens restart correctness guarantees with model-based regression coverage.
+- Detects subtle replay/commit/order bugs under repeated reopen pressure.
+
+Benchmark note (post-step gate run):
+- Summary file:
+  `target/vectordb-gate/summary.json`
+
+SPFresh:
+- `update_qps=231755.30`
+- `search_qps=2540.06`
+- `recall_at_k=1.0000`
+
+LanceDB:
+- `update_qps=126259.97`
+- `search_qps=921.72`
+- `recall_at_k=0.4735`
+
+SPFresh/LanceDB ratio:
+- `update_qps_ratio=1.8355`
+- `search_qps_ratio=2.7558`

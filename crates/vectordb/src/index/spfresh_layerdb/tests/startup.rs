@@ -1,4 +1,7 @@
 use super::*;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use std::collections::HashMap;
 
 #[test]
 fn startup_can_boot_from_checkpoint_without_vector_rows() -> anyhow::Result<()> {
@@ -429,5 +432,48 @@ fn posting_member_residual_round_trip_omits_values_payload() -> anyhow::Result<(
         members[0].residual_code.as_ref().map(Vec::len),
         Some(cfg.spfresh.dim)
     );
+    Ok(())
+}
+
+#[test]
+fn randomized_crash_restart_matches_reference_model() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let cfg = SpFreshLayerDbConfig {
+        memory_mode: SpFreshMemoryMode::OffHeapDiskMeta,
+        spfresh: crate::index::SpFreshConfig {
+            dim: 32,
+            initial_postings: 8,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut rng = StdRng::seed_from_u64(0x51a8_77c2_d42f_1031);
+    let mut expected = HashMap::<u64, Vec<f32>>::new();
+    let mut idx = SpFreshLayerDbIndex::open(dir.path(), cfg.clone())?;
+
+    for step in 0..1_000usize {
+        let id = rng.gen_range(0..512u64);
+        if rng.gen_ratio(2, 3) {
+            let mut values = vec![0.0f32; cfg.spfresh.dim];
+            for value in &mut values {
+                *value = rng.gen_range(-1.0f32..1.0f32);
+            }
+            idx.try_upsert(id, values.clone())?;
+            expected.insert(id, values);
+        } else {
+            let _ = idx.try_delete(id)?;
+            expected.remove(&id);
+        }
+
+        if step % 97 == 0 {
+            drop(idx);
+            idx = SpFreshLayerDbIndex::open_existing(dir.path(), cfg.db_options.clone())?;
+            super::assert_index_matches_model(&idx, &expected)?;
+        }
+    }
+
+    drop(idx);
+    let idx = SpFreshLayerDbIndex::open_existing(dir.path(), cfg.db_options.clone())?;
+    super::assert_index_matches_model(&idx, &expected)?;
     Ok(())
 }

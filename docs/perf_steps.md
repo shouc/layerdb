@@ -931,3 +931,16 @@ LanceDB:
 SPFresh/LanceDB ratio:
 - `update_qps_ratio=1.6318`
 - `search_qps_ratio=2.9327`
+
+## Step 37 (`sharded-thread-local-topk-reduce`)
+
+Change:
+- Reworked sharded query fanout merge to use lock-free parallel reduction:
+  - each shard computes sorted local top-k,
+  - reducer merges two sorted top-k lists at a time (`merge_two_sorted_neighbors`),
+  - avoids materializing a full `Vec<Vec<Neighbor>>` before global merge.
+- Added deterministic equivalence test:
+  `merge_two_sorted_neighbors_matches_kway_merge`.
+
+Impact:
+- Cuts intermediate allocation pressure and keeps per-thread top-k state local in the search path.
